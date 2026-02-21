@@ -72,10 +72,10 @@ pub fn resolve_alias(input: &str, agents: &[AgentConfig]) -> String {
         if a.name.to_lowercase() == lower {
             return a.name.clone();
         }
-        if let Some(d) = &a.display {
-            if d.to_lowercase() == lower {
-                return a.name.clone();
-            }
+        if let Some(d) = &a.display
+            && d.to_lowercase() == lower
+        {
+            return a.name.clone();
         }
     }
     // Partial match (starts with)
@@ -85,4 +85,33 @@ pub fn resolve_alias(input: &str, agents: &[AgentConfig]) -> String {
         }
     }
     lower
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_alias, AgentConfig};
+
+    fn agent(name: &str, display: Option<&str>) -> AgentConfig {
+        AgentConfig {
+            name: name.to_string(),
+            display: display.map(ToString::to_string),
+            emoji: None,
+            location: None,
+            ssh_user: None,
+        }
+    }
+
+    #[test]
+    fn resolve_alias_prefers_exact_name_and_display() {
+        let agents = vec![agent("webserver", Some("Web Server")), agent("gpu-node", Some("GPU Node"))];
+        assert_eq!(resolve_alias("webserver", &agents), "webserver");
+        assert_eq!(resolve_alias("web server", &agents), "webserver");
+    }
+
+    #[test]
+    fn resolve_alias_supports_prefix_and_unknown_fallback() {
+        let agents = vec![agent("gpu-node", Some("GPU Node"))];
+        assert_eq!(resolve_alias("gpu", &agents), "gpu-node");
+        assert_eq!(resolve_alias("UNLISTED", &agents), "unlisted");
+    }
 }
