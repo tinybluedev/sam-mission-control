@@ -12,6 +12,12 @@ pub fn sanitize_error(msg: &str) -> String {
 use mysql_async::Pool;
 use std::env;
 
+/// Build a MySQL URL from individual components
+pub fn build_db_url(host: &str, port: &str, user: &str, pass: &str, db: &str) -> String {
+    let encoded_pass = pass.replace("$", "%24").replace("@", "%40").replace("#", "%23");
+    format!("mysql://{}:{}@{}:{}/{}", user, encoded_pass, host, port, db)
+}
+
 pub fn get_pool() -> Pool {
     let url = env::var("SAM_DB_URL")
         .unwrap_or_else(|_| {
@@ -20,8 +26,7 @@ pub fn get_pool() -> Pool {
             let user = env::var("SAM_DB_USER").unwrap_or_else(|_| "root".into());
             let pass = env::var("SAM_DB_PASS").unwrap_or_else(|_| String::new());
             let db = env::var("SAM_DB_NAME").unwrap_or_else(|_| "quantum_memory".into());
-            let encoded_pass = pass.replace("$", "%24").replace("@", "%40").replace("#", "%23");
-            format!("mysql://{}:{}@{}:{}/{}", user, encoded_pass, host, port, db)
+            build_db_url(&host, &port, &user, &pass, &db)
         });
     Pool::new(url.as_str())
 }
@@ -172,4 +177,62 @@ pub async fn respond_to_chat(pool: &Pool, msg_id: i64, response: &str) -> Result
         (response, msg_id),
     ).await?;
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_url_basic() {
+        let url = build_db_url("10.0.0.1", "3306", "root", "secret", "mydb");
+        assert_eq!(url, "mysql://root:secret@10.0.0.1:3306/mydb");
+    }
+
+    #[test]
+    fn build_url_encodes_dollar() {
+        let url = build_db_url("host", "3306", "user", "pa$$word", "db");
+        assert_eq!(url, "mysql://user:pa%24%24word@host:3306/db");
+    }
+
+    #[test]
+    fn build_url_encodes_at() {
+        let url = build_db_url("host", "3306", "user", "p@ss", "db");
+        assert_eq!(url, "mysql://user:p%40ss@host:3306/db");
+    }
+
+    #[test]
+    fn build_url_encodes_hash() {
+        let url = build_db_url("host", "3306", "user", "p#ss", "db");
+        assert_eq!(url, "mysql://user:p%23ss@host:3306/db");
+    }
+
+    #[test]
+    fn build_url_empty_password() {
+        let url = build_db_url("localhost", "3306", "root", "", "test");
+        assert_eq!(url, "mysql://root:@localhost:3306/test");
+    }
+
+    #[test]
+    fn sanitize_masks_url_password() {
+        let msg = "Connection failed: mysql://root:MyS3cret@10.0.0.1:3306/db";
+        let sanitized = sanitize_error(msg);
+        assert!(!sanitized.contains("MyS3cret"));
+        assert!(sanitized.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_masks_password_field() {
+        let msg = "Error: password=hunter2 invalid";
+        let sanitized = sanitize_error(msg);
+        assert!(!sanitized.contains("hunter2"));
+        assert!(sanitized.contains("password=***"));
+    }
+
+    #[test]
+    fn sanitize_preserves_clean_text() {
+        let msg = "Connection timeout after 5s";
+        assert_eq!(sanitize_error(msg), msg);
+    }
 }
