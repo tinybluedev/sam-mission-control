@@ -34,7 +34,7 @@
                                         │ › check memory usage▌             │
                                         ╰───────────────────────────────────╯
 ╭───────────────────────────────────────────────────────────────────────────╮
-│  v0.9 │ 18/20 online │ theme:standard/dark │ r=refresh b=bg c=color ?=help │
+│  v1.0 │ 18/20 online │ theme:standard/dark │ r=refresh b=bg c=color ?=help │
 ╰───────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -69,6 +69,30 @@ Select any agent and press Enter to open their dedicated view with private chat:
 ╰───────────────────────────────────────────────────────────────────────────╯
 ```
 
+
+### Task Board
+
+Press `t` from the dashboard to manage fleet tasks:
+
+```
+╭───────────────────────────────────────────────────────────────────────────╮
+│  📋 TASK BOARD    3 queued  1 active  12 done    16 total                  │
+╰───────────────────────────────────────────────────────────────────────────╯
+╭─ Tasks ──────────────────────────────────╮╭─ Detail ──────────────────────╮
+│    #  P  Status        Agent  Description││  ID          #42              │
+│  ▶ 42  2  ⏳ queued     —     Deploy v2  ││  Priority    2                │
+│    41  3  🔄 running   cyber  Run backup ││  Status      queued           │
+│    40  5  📨 assigned  r720   Check logs ││  Agent       unassigned       │
+│    39  5  ✅ completed  nix   Update DNS ││  Created     02-21 17:30      │
+│    38  8  ✅ completed  r410  Disk clean ││                               │
+│    ...                                   ││  Description:                 │
+│                                          ││  Deploy v2 to all SM agents   │
+╰──────────────────────────────────────────╯╰───────────────────────────────╯
+╭─ n=new task  d=done  Esc=back ───────────────────────────────────────────╮
+│ ›                                                                         │
+╰───────────────────────────────────────────────────────────────────────────╯
+```
+
 ### Theme Gallery
 
 Cycle themes with `c`, backgrounds with `b`. All 8 themes adapt to light and dark modes:
@@ -86,13 +110,20 @@ Cycle themes with `c`, backgrounds with `b`. All 8 themes adapt to light and dar
 
 ## Features
 
-- **20-agent fleet monitoring** — SSH-probed status for up to 20 agents in your fleet
-- **Separated chat streams** — global broadcasts (dashboard) + private direct chat (agent detail)
-- **Agent detail view** — dedicated chat and full system info per agent (OS, kernel, version, capabilities)
-- **8 color themes + 5 background densities** — fully themeable TUI; cycle with `c` / `b`
-- **MySQL-backed persistent state** — fleet status and chat history survive restarts
-- **Non-blocking concurrent SSH probing** — all agents probed in parallel via Tokio tasks
-- **Zero network exposure** — no web interface, no open ports; SSH and database only
+- **Fleet dashboard** — real-time status of 20+ agents with SSH probing
+- **Separated chat** — global broadcasts (dashboard) + private direct messages (agent detail)
+- **Task board** — create, assign, and track tasks with priority color-coding
+- **Agent provisioning wizard** — 7-step modal to add new agents with SSH testing
+- **CLI subcommands** — `sam status`, `sam chat`, `sam setup` for scriptable access
+- **8 color themes × 5 backgrounds** — persistent theme preferences (`c`/`b` to cycle)
+- **Mouse support** — click panels, select agents, scroll wheel in chat
+- **Fleet sorting** — sort by name, status, location, or version (`s`)
+- **Responsive layout** — adapts from 60-col narrow to 160+ ultra-wide
+- **Config file** — `~/.config/sam/config.toml` with setup wizard
+- **Panic recovery** — terminal always restored on crash
+- **Security hardened** — no secrets in source, CI audit, 0600 config permissions
+- **Non-blocking** — all SSH probes and DB writes run in background
+- **Zero network exposure** — no HTTP server, no open ports
 
 ## Architecture
 
@@ -230,25 +261,57 @@ sam
 
 ## Keybindings
 
-| Key | Context | Action |
-|-----|---------|--------|
-| `Tab` | Dashboard | Switch focus: Fleet ↔ Chat |
-| `↑` / `k` | Fleet focused | Move selection up |
-| `↓` / `j` | Fleet focused | Move selection down |
-| `Enter` | Fleet focused | Open agent detail view |
-| `r` | Fleet focused | Refresh all agents (SSH probe) |
-| `c` | Dashboard | Cycle color theme |
-| `b` | Dashboard | Cycle background density |
-| `?` | Dashboard | Open help screen |
-| `q` | Dashboard | Quit |
-| `Enter` | Agent Detail | Tab into agent's private chat |
-| `msg` | Chat focused | Broadcast message to all agents |
-| `msg` | Agent Chat | Send direct message to focused agent |
-| `Enter` | Chat focused | Send message |
-| `PgUp` / `PgDn` | Chat focused | Scroll chat history |
-| `Esc` | Chat / Detail | Back / unfocus |
+### Dashboard
+| Key | Action |
+|-----|--------|
+| `Tab` | Switch focus: Fleet ↔ Chat |
+| `↑`/`k` `↓`/`j` | Navigate fleet list |
+| `Enter` | Open agent detail |
+| `r` | Refresh all agents (SSH) |
+| `s` | Cycle sort: name → status → location → version |
+| `t` | Open task board |
+| `a` | Open new agent wizard |
+| `c` | Cycle color theme |
+| `b` | Cycle background density |
+| `?` | Help screen |
+| `q` | Quit |
+| 🖱️ Click | Focus panel / select agent |
+| 🖱️ Scroll | Scroll chat |
+
+### Agent Detail
+| Key | Action |
+|-----|--------|
+| `Tab` | Switch: Info ↔ Agent Chat |
+| Type + `Enter` | Send direct message to agent |
+| `Esc` | Back to dashboard |
+
+### Task Board
+| Key | Action |
+|-----|--------|
+| `j`/`k` | Navigate tasks |
+| `n` | Create new task |
+| `d` | Mark selected task done |
+| `Esc` | Back to dashboard |
+
+### Agent Wizard
+| Key | Action |
+|-----|--------|
+| `Enter` | Next step / confirm |
+| `Tab` | Skip / test SSH (on confirm) |
+| `Esc` | Back / cancel |
 
 Agent names resolve by exact match, display name, or prefix — `@ag` matches `agent-01`.
+
+## CLI
+
+```bash
+sam              # Launch TUI (default)
+sam status       # Print fleet status table
+sam chat cyber "check disk space"  # Message agent, wait for response
+sam setup        # Interactive config wizard
+sam version      # Print version
+sam --config /path/to/config.toml  # Use specific config
+```
 
 ## Themes
 
