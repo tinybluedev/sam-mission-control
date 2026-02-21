@@ -1,4 +1,14 @@
 use mysql_async::prelude::*;
+
+/// Sanitize error messages to remove passwords/credentials
+pub fn sanitize_error(msg: &str) -> String {
+    // Mask password in mysql:// URLs
+    let re_url = regex_lite::Regex::new(r"mysql://[^:]+:([^@]+)@").unwrap();
+    let sanitized = re_url.replace_all(msg, "mysql://***:***@").to_string();
+    // Mask any password= patterns
+    let re_pass = regex_lite::Regex::new(r"(?i)(password|pass|pwd)\s*=\s*\S+").unwrap();
+    re_pass.replace_all(&sanitized, "$1=***").to_string()
+}
 use mysql_async::Pool;
 use std::env;
 

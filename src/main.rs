@@ -323,7 +323,14 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, Str
     }
     let tgt = format!("{}@{}", user, host);
     let script = r#"OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC""#;
-    let result = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"bash","-c",script]).output().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        Command::new("ssh").args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"bash","-c",script]).output()
+    ).await;
+    let result = match result {
+        Ok(r) => r,
+        Err(_) => return (AgentStatus::Offline, String::new(), String::new(), String::new()),
+    };
     match result {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
@@ -699,6 +706,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(c) => c,
         Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
     };
+
+    // Install panic hook that restores terminal before printing panic
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(crossterm::event::DisableMouseCapture);
+        let _ = stdout().execute(LeaveAlternateScreen);
+        // Write crash log
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+            .open("/tmp/sam-crash.log") {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] PANIC: {}", now_str(), info);
+        }
+        original_hook(info);
+    }));
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
