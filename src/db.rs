@@ -5,7 +5,6 @@ use std::env;
 pub fn get_pool() -> Pool {
     let url = env::var("SAM_DB_URL")
         .unwrap_or_else(|_| {
-            // Check for individual components
             let host = env::var("SAM_DB_HOST").unwrap_or_else(|_| "127.0.0.1".into());
             let port = env::var("SAM_DB_PORT").unwrap_or_else(|_| "3306".into());
             let user = env::var("SAM_DB_USER").unwrap_or_else(|_| "root".into());
@@ -63,39 +62,94 @@ pub struct ChatMessage {
     pub message: String,
     pub response: Option<String>,
     pub status: String,
+    pub kind: String,
     pub created_at: String,
     pub responded_at: Option<String>,
 }
 
-pub async fn send_chat(pool: &Pool, sender: &str, target: Option<&str>, message: &str) -> Result<i64, mysql_async::Error> {
+/// Send a direct message to a specific agent
+pub async fn send_direct(pool: &Pool, sender: &str, target: &str, message: &str) -> Result<i64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     conn.exec_drop(
-        "INSERT INTO mc_chat (sender, target, message, status) VALUES (?, ?, ?, 'pending')",
+        "INSERT INTO mc_chat (sender, target, message, status, kind) VALUES (?, ?, ?, 'pending', 'direct')",
         (sender, target, message),
     ).await?;
     let id: Option<i64> = conn.query_first("SELECT LAST_INSERT_ID()").await?;
     Ok(id.unwrap_or(0))
 }
 
-pub async fn load_chat_history(pool: &Pool, limit: u32) -> Result<Vec<ChatMessage>, mysql_async::Error> {
+/// Send a global broadcast (one row per agent)
+pub async fn send_broadcast(pool: &Pool, sender: &str, message: &str, agents: &[String]) -> Result<Vec<i64>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let mut ids = vec![];
+    for agent in agents {
+        conn.exec_drop(
+            "INSERT INTO mc_chat (sender, target, message, status, kind) VALUES (?, ?, ?, 'pending', 'global')",
+            (sender, agent, message),
+        ).await?;
+        let id: Option<i64> = conn.query_first("SELECT LAST_INSERT_ID()").await?;
+        ids.push(id.unwrap_or(0));
+    }
+    Ok(ids)
+}
+
+/// Load global chat (broadcasts only) for dashboard
+pub async fn load_global_chat(pool: &Pool, limit: u32) -> Result<Vec<ChatMessage>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let messages: Vec<ChatMessage> = conn.exec_map(
-        "SELECT id, sender, target, message, response, status, DATE_FORMAT(created_at, '%H:%i:%s') as created_at, DATE_FORMAT(responded_at, '%H:%i:%s') as responded_at FROM mc_chat ORDER BY id DESC LIMIT ?",
+        "SELECT id, sender, target, message, response, status, kind, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s') FROM mc_chat WHERE kind='global' ORDER BY id DESC LIMIT ?",
         (limit,),
-        |(id, sender, target, message, response, status, created_at, responded_at)| {
-            ChatMessage { id, sender, target, message, response, status, created_at, responded_at }
+        |(id, sender, target, message, response, status, kind, created_at, responded_at)| {
+            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at }
         },
     ).await?;
     Ok(messages.into_iter().rev().collect())
 }
 
+/// Load direct messages for a specific agent
+pub async fn load_agent_chat(pool: &Pool, agent: &str, limit: u32) -> Result<Vec<ChatMessage>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let messages: Vec<ChatMessage> = conn.exec_map(
+        "SELECT id, sender, target, message, response, status, kind, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s') FROM mc_chat WHERE kind='direct' AND target=? ORDER BY id DESC LIMIT ?",
+        (agent, limit),
+        |(id, sender, target, message, response, status, kind, created_at, responded_at)| {
+            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at }
+        },
+    ).await?;
+    Ok(messages.into_iter().rev().collect())
+}
+
+/// Legacy: load all chat (for backward compat)
+pub async fn load_chat_history(pool: &Pool, limit: u32) -> Result<Vec<ChatMessage>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let messages: Vec<ChatMessage> = conn.exec_map(
+        "SELECT id, sender, target, message, response, status, COALESCE(kind,'global'), DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s') FROM mc_chat ORDER BY id DESC LIMIT ?",
+        (limit,),
+        |(id, sender, target, message, response, status, kind, created_at, responded_at)| {
+            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at }
+        },
+    ).await?;
+    Ok(messages.into_iter().rev().collect())
+}
+
+pub async fn send_chat(pool: &Pool, sender: &str, target: Option<&str>, message: &str) -> Result<i64, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let kind = if target.is_some() { "direct" } else { "global" };
+    conn.exec_drop(
+        "INSERT INTO mc_chat (sender, target, message, status, kind) VALUES (?, ?, ?, 'pending', ?)",
+        (sender, target, message, kind),
+    ).await?;
+    let id: Option<i64> = conn.query_first("SELECT LAST_INSERT_ID()").await?;
+    Ok(id.unwrap_or(0))
+}
+
 pub async fn get_pending_for_agent(pool: &Pool, agent_name: &str) -> Result<Vec<ChatMessage>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let messages: Vec<ChatMessage> = conn.exec_map(
-        "SELECT id, sender, target, message, response, status, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s') FROM mc_chat WHERE target=? AND status='pending' ORDER BY id",
+        "SELECT id, sender, target, message, response, status, kind, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s') FROM mc_chat WHERE target=? AND status='pending' ORDER BY id",
         (agent_name,),
-        |(id, sender, target, message, response, status, created_at, responded_at)| {
-            ChatMessage { id, sender, target, message, response, status, created_at, responded_at }
+        |(id, sender, target, message, response, status, kind, created_at, responded_at)| {
+            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at }
         },
     ).await?;
     Ok(messages)
