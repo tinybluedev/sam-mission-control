@@ -506,7 +506,12 @@ fn render_help(frame: &mut Frame) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = dotenvy::dotenv();
+    // Load .env from current dir, then ~/.config/sam/
+    if dotenvy::dotenv().is_err() {
+        if let Ok(home) = std::env::var("HOME") {
+            let _ = dotenvy::from_path(std::path::Path::new(&home).join(".config/sam/.env"));
+        }
+    }
 
     // Load fleet config
     let fleet_config = match config::load_fleet_config() {
