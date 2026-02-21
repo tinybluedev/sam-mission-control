@@ -236,3 +236,51 @@ mod tests {
         assert_eq!(sanitize_error(msg), msg);
     }
 }
+
+// ---- Task Board ----
+
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: i32,
+    pub description: String,
+    pub assigned_agent: Option<String>,
+    pub status: String,
+    pub priority: i32,
+    pub created_by: String,
+    pub created_at: String,
+    pub result: Option<String>,
+}
+
+pub async fn load_tasks(pool: &Pool, limit: u32) -> Result<Vec<Task>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let tasks: Vec<Task> = conn.exec_map(
+        "SELECT id, task_description, assigned_agent, status, priority, COALESCE(created_by,'?'), DATE_FORMAT(created_at, '%m-%d %H:%i'), result FROM mc_task_routing ORDER BY priority ASC, id DESC LIMIT ?",
+        (limit,),
+        |(id, description, assigned_agent, status, priority, created_by, created_at, result)| {
+            Task { id, description, assigned_agent, status, priority, created_by, created_at, result }
+        },
+    ).await?;
+    Ok(tasks)
+}
+
+pub async fn create_task(pool: &Pool, description: &str, priority: i32, created_by: &str, assigned_agent: Option<&str>) -> Result<i64, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "INSERT INTO mc_task_routing (task_description, priority, created_by, assigned_agent, status) VALUES (?, ?, ?, ?, IF(? IS NOT NULL, 'assigned', 'queued'))",
+        (description, priority, created_by, assigned_agent, assigned_agent),
+    ).await?;
+    let id: Option<i64> = conn.query_first("SELECT LAST_INSERT_ID()").await?;
+    Ok(id.unwrap_or(0))
+}
+
+pub async fn update_task_status(pool: &Pool, task_id: i32, status: &str) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let extra = match status {
+        "completed" | "failed" => ", completed_at=NOW()",
+        "assigned" | "running" => ", assigned_at=NOW()",
+        _ => "",
+    };
+    let sql = format!("UPDATE mc_task_routing SET status=?{} WHERE id=?", extra);
+    conn.exec_drop(sql, (status, task_id)).await?;
+    Ok(())
+}
