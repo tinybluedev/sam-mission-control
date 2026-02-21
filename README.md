@@ -10,34 +10,86 @@
   <img src="docs/screenshot-dashboard.svg" alt="S.A.M Mission Control Dashboard" width="100%">
 </p>
 
+### Dashboard View
+
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  🛰️  S.A.M MISSION CONTROL    12/20 agents    ● live    ▌Fleet▐     │
-├───────────────────────────────────┬─────────────────────────────────┤
-│  Fleet                            │  Chat                           │
-│  ┌────────────────────────────┐   │  ┌───────────────────────────┐  │
-│  │     Agent   Location  Status│   │  │ 14:22 myuser →@agent-01  │  │
-│  │  🖥️  agent-01  Home    ● on │   │  │      check disk space    │  │
-│  │  🐘  agent-02  Cloud   ● on │   │  │      ↳ /dev/sda1 72% used│  │
-│  │  🔥  agent-03  Home    ◉ busy│  │  │                          │  │
-│  │  🌐  agent-04  VPS     ○ off│   │  │ 14:23 myuser →@agent-02  │  │
-│  │  📱  agent-05  Mobile  ● on │   │  │      git pull            │  │
-│  │  ...          ...      ...  │   │  │      ⏳ awaiting...      │  │
-│  └────────────────────────────┘   │  └───────────────────────────┘  │
-│                                   │  ┌───────────────────────────┐  │
-│                                   │  │ › @agent-01 check logs▌   │  │
-│                                   │  └───────────────────────────┘  │
-├───────────────────────────────────┴─────────────────────────────────┤
-│  v0.8 │ Tab=switch focus │ r=refresh │ ?=help │ q=quit              │
-└─────────────────────────────────────────────────────────────────────┘
+╭───────────────────────────────────────────────────────────────────────────╮
+│  🛰️  S.A.M MISSION CONTROL   18/20 agents   ● live   ⟳ refreshing  ▌Fleet▐ │
+╰───────────────────────────────────────────────────────────────────────────╯
+╭─ Fleet ──────────────────────────────╮╭─ Chat ────────────────────────────╮
+│     Agent         Location  Status   ││  16:22:14 nick →all               │
+│  🖥️  agent-01      Home   ●  online  ││     system health check           │
+│  🐘  agent-02      Cloud  ●  online  ││     ↳ All 20 agents reporting in  │
+│  🔥  agent-03      Home   ◉  busy    ││                                   │
+│  🌐  agent-04      VPS    ○  offline ││  16:24:01 nick →all               │
+│  📱  agent-05      Mobile ●  online  ││     check disk space              │
+│  ⚡  agent-06      SM     ●  online  ││     🔄 processing...              │
+│  🐝  agent-07      Home   ●  online  ││                                   │
+│  🗡️  agent-08      Home   ●  online  ││  16:25:33 nick →all               │
+│  🎬  agent-09      Home   ●  online  ││     uptime report                 │
+│  🐜  agent-10      Home   ?  unknown ││     ⏳ pending...                 │
+│  ...               ...    ...        ││                                   │
+╰──────────────────────────────────────╯╰───────────────────────────────────╯
+                                        ╭─ broadcast to all ⏎ ─────────────╮
+                                        │ › check memory usage▌             │
+                                        ╰───────────────────────────────────╯
+╭───────────────────────────────────────────────────────────────────────────╮
+│  v0.9 │ 18/20 online │ theme:standard/dark │ r=refresh b=bg c=color ?=help │
+╰───────────────────────────────────────────────────────────────────────────╯
+```
+
+### Agent Detail View
+
+Select any agent and press Enter to open their dedicated view with private chat:
+
+```
+╭───────────────────────────────────────────────────────────────────────────╮
+│  🐘 agent-02  —  ●  online    ▌Chat▐                                      │
+╰───────────────────────────────────────────────────────────────────────────╯
+╭─ Info ───────────────────────╮╭─ 🐘 agent-02 Chat ───────────────────────╮
+│                              ││  16:30:01 nick →@agent-02                 │
+│  Host           10.0.0.2     ││     check disk space                      │
+│  Location       Cloud        ││     ↳ Disk: 142G/500G (28% used)         │
+│  Status         ●  online    ││                                           │
+│  OS             Ubuntu 24.04 ││  16:31:15 nick →@agent-02                 │
+│  Kernel         6.18.7       ││     show running services                 │
+│  OC Version     2026.2.21-2  ││     💭 thinking...                        │
+│  SSH User       myuser       ││                                           │
+│  Capabilities   gpu, docker  ││  16:32:44 nick →@agent-02                 │
+│  Tokens Today   1,247        ││     tail the gateway logs                 │
+│  Last Seen      16:35:27     ││     ⏳ pending...                         │
+│  Task           none         ││                                           │
+│                              ││                                           │
+╰──────────────────────────────╯╰───────────────────────────────────────────╯
+                                ╭─ @agent-02 › ────────────────────────────╮
+                                │ › restart the gateway▌                    │
+                                ╰───────────────────────────────────────────╯
+╭───────────────────────────────────────────────────────────────────────────╮
+│  Esc=back │ Tab=switch │ r=refresh agent-02 │ q=quit                       │
+╰───────────────────────────────────────────────────────────────────────────╯
+```
+
+### Theme Gallery
+
+Cycle themes with `c`, backgrounds with `b`. All 8 themes adapt to light and dark modes:
+
+```
+  standard ──── Clean cyan/blue (default)
+  noir ──────── White/grey monochrome
+  paper ─────── Black on white (light mode)
+  1977 ──────── Warm amber/orange CRT feel
+  2077 ──────── Neon cyberpunk pink/cyan
+  matrix ────── Green phosphor terminal
+  sunset ────── Warm orange/red/purple
+  arctic ────── Cool blue/white/silver
 ```
 
 ## Features
 
 - **20-agent fleet monitoring** — SSH-probed status for up to 20 agents in your fleet
-- **Real-time chat** — global broadcast and per-agent targeted messaging (`@agent message`)
+- **Separated chat streams** — global broadcasts (dashboard) + private direct chat (agent detail)
 - **Agent detail view** — dedicated chat and full system info per agent (OS, kernel, version, capabilities)
-- **8 color themes + 5 background densities** — fully themeable TUI; cycle with `t` / `b`
+- **8 color themes + 5 background densities** — fully themeable TUI; cycle with `c` / `b`
 - **MySQL-backed persistent state** — fleet status and chat history survive restarts
 - **Non-blocking concurrent SSH probing** — all agents probed in parallel via Tokio tasks
 - **Zero network exposure** — no web interface, no open ports; SSH and database only
@@ -185,12 +237,13 @@ sam
 | `↓` / `j` | Fleet focused | Move selection down |
 | `Enter` | Fleet focused | Open agent detail view |
 | `r` | Fleet focused | Refresh all agents (SSH probe) |
-| `t` | Dashboard | Cycle color theme |
+| `c` | Dashboard | Cycle color theme |
 | `b` | Dashboard | Cycle background density |
 | `?` | Dashboard | Open help screen |
 | `q` | Dashboard | Quit |
-| `@name msg` | Chat focused | Send message to a specific agent |
+| `Enter` | Agent Detail | Tab into agent's private chat |
 | `msg` | Chat focused | Broadcast message to all agents |
+| `msg` | Agent Chat | Send direct message to focused agent |
 | `Enter` | Chat focused | Send message |
 | `PgUp` / `PgDn` | Chat focused | Scroll chat history |
 | `Esc` | Chat / Detail | Back / unfocus |
