@@ -1,0 +1,22 @@
+## Fleet Configuration Example
+## Copy to fleet.toml and customize for your fleet
+## fleet.toml is gitignored — your config stays private
+
+[[agent]]
+name = "server1"
+display = "Server 1"
+emoji = "🖥️"
+location = "Home"
+ssh_user = "admin"
+
+[[agent]]
+name = "server2"
+display = "Server 2"
+emoji = "🐘"
+location = "Cloud"
+ssh_user = "admin"
+
+## Locations are freeform labels — use whatever makes sense:
+## "Home", "Office", "Cloud", "VPS", "Mobile", etc.
+## They get color-coded in the TUI:
+##   Home=green, SM=yellow, VPS=magenta, Mobile=cyan
