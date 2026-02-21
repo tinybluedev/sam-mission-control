@@ -81,7 +81,7 @@ struct ChatLine {
 enum Focus { Fleet, Chat, AgentChat }
 
 #[derive(PartialEq)]
-enum Screen { Dashboard, AgentDetail, Help }
+enum Screen { Dashboard, AgentDetail, TaskBoard, Help }
 
 #[derive(PartialEq, Clone, Copy)]
 enum SortMode { Name, Status, Location, Version }
@@ -131,6 +131,12 @@ struct App {
     refresh_rx: Option<mpsc::UnboundedReceiver<ProbeResult>>,
     refreshing: bool,
     self_ip: String,
+    // Task board
+    tasks: Vec<db::Task>,
+    task_selected: usize,
+    task_input: String,
+    task_input_active: bool,
+    last_task_poll: Instant,
     // UI state
     spinner_frame: usize,
     sort_mode: SortMode,
@@ -200,6 +206,8 @@ impl App {
             chat_input: String::new(), chat_history, chat_scroll: 0,
             agent_chat_input: String::new(), agent_chat_history: vec![], agent_chat_scroll: 0,
             refresh_rx: None, refreshing: false, self_ip,
+            tasks: vec![], task_selected: 0, task_input: String::new(), task_input_active: false,
+            last_task_poll: Instant::now(),
             spinner_frame: 0, sort_mode: SortMode::Name,
             fleet_area: Rect::default(), chat_area: Rect::default(),
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
@@ -691,6 +699,184 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     render_footer(frame, app, chunks[2]);
 }
 
+fn render_task_board(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3), Constraint::Length(3)])
+        .split(frame.area());
+
+    // BG
+    let bg_block = Block::default().style(Style::default().bg(app.bg_density.bg()));
+    frame.render_widget(bg_block, frame.area());
+
+    // Header
+    let queued = app.tasks.iter().filter(|t| t.status == "queued").count();
+    let running = app.tasks.iter().filter(|t| t.status == "running" || t.status == "assigned").count();
+    let done = app.tasks.iter().filter(|t| t.status == "completed").count();
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("📋 TASK BOARD", Style::default().fg(t.header_title).bold()),
+        Span::raw("    "),
+        Span::styled(format!("{} queued", queued), Style::default().fg(t.sender_self)),
+        Span::raw("  "),
+        Span::styled(format!("{} active", running), Style::default().fg(t.status_busy)),
+        Span::raw("  "),
+        Span::styled(format!("{} done", done), Style::default().fg(t.status_online)),
+        Span::raw("    "),
+        Span::styled(format!("{} total", app.tasks.len()), Style::default().fg(t.text_dim)),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(header, outer[0]);
+
+    // Task body — split into list (left) and detail (right)
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(outer[1]);
+
+    // Task list
+    let hcells = ["  #", "P", "Status", "Agent", "Description"]
+        .iter().map(|h| Cell::from(*h).style(Style::default().fg(t.text_bold).bold()));
+    let hrow = Row::new(hcells).height(1).bottom_margin(1);
+
+    let rows: Vec<Row> = app.tasks.iter().enumerate().map(|(i, task)| {
+        let sel = i == app.task_selected;
+        let bg = if sel { t.selected_bg } else { app.bg_density.bg() };
+        let cursor = if sel { "▶" } else { " " };
+
+        let st_color = match task.status.as_str() {
+            "queued" => t.pending,
+            "assigned" => t.sender_self,
+            "running" => t.status_busy,
+            "completed" => t.status_online,
+            "failed" => t.status_offline,
+            _ => t.text_dim,
+        };
+
+        let st_icon = match task.status.as_str() {
+            "queued" => "⏳",
+            "assigned" => "📨",
+            "running" => "🔄",
+            "completed" => "✅",
+            "failed" => "❌",
+            _ => "?",
+        };
+
+        let pri_color = match task.priority {
+            1..=3 => t.status_offline,
+            4..=6 => t.status_busy,
+            _ => t.status_online,
+        };
+
+        let desc: String = task.description.chars().take(30).collect();
+
+        Row::new(vec![
+            Cell::from(format!("{}{}", cursor, task.id)),
+            Cell::from(format!("{}", task.priority)).style(Style::default().fg(pri_color).bold()),
+            Cell::from(format!("{} {}", st_icon, task.status)).style(Style::default().fg(st_color)),
+            Cell::from(task.assigned_agent.as_deref().unwrap_or("—").to_string()).style(Style::default().fg(t.accent2)),
+            Cell::from(desc).style(Style::default().fg(t.text)),
+        ]).style(Style::default().bg(bg)).height(1)
+    }).collect();
+
+    let table = Table::new(rows, [
+        Constraint::Length(5), Constraint::Length(3), Constraint::Length(14),
+        Constraint::Length(14), Constraint::Min(15),
+    ]).header(hrow)
+    .block(Block::default().title(Span::styled(" Tasks ", Style::default().fg(t.border_active).bold()))
+        .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(t.border_active))
+        .style(Style::default().bg(app.bg_density.bg()))
+        .padding(Padding::new(1, 1, 0, 0)));
+    frame.render_widget(table, body[0]);
+
+    // Task detail (right side)
+    let detail_lines = if let Some(task) = app.tasks.get(app.task_selected) {
+        let st_color = match task.status.as_str() {
+            "completed" => t.status_online, "failed" => t.status_offline,
+            "running" => t.status_busy, _ => t.text,
+        };
+        vec![
+            Line::from(vec![
+                Span::styled("  ID          ", Style::default().fg(t.text_bold).bold()),
+                Span::styled(format!("#{}", task.id), Style::default().fg(t.accent)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Priority    ", Style::default().fg(t.text_bold).bold()),
+                Span::styled(format!("{}", task.priority), Style::default().fg(t.text)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Status      ", Style::default().fg(t.text_bold).bold()),
+                Span::styled(&task.status, Style::default().fg(st_color)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Agent       ", Style::default().fg(t.text_bold).bold()),
+                Span::styled(task.assigned_agent.as_deref().unwrap_or("unassigned"), Style::default().fg(t.accent2)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Created     ", Style::default().fg(t.text_bold).bold()),
+                Span::styled(format!("{} by {}", task.created_at, task.created_by), Style::default().fg(t.text_dim)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("  Description:", Style::default().fg(t.text_bold).bold())),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(&task.description, Style::default().fg(t.text)),
+            ]),
+            Line::from(""),
+            if let Some(result) = &task.result {
+                Line::from(vec![
+                    Span::styled("  Result: ", Style::default().fg(t.text_bold).bold()),
+                    Span::styled(result.as_str(), Style::default().fg(t.response)),
+                ])
+            } else {
+                Line::from(Span::styled("  No result yet", Style::default().fg(t.text_dim)))
+            },
+        ]
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("  No tasks yet", Style::default().fg(t.text_dim))),
+            Line::from(Span::styled("  Press 'n' to create one", Style::default().fg(t.text_dim))),
+        ]
+    };
+
+    let detail = Paragraph::new(detail_lines)
+        .block(Block::default().title(Span::styled(" Detail ", Style::default().fg(t.border).bold()))
+            .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(t.border))
+            .style(Style::default().bg(app.bg_density.bg()))
+            .padding(Padding::new(0, 1, 1, 0)));
+    frame.render_widget(detail, body[1]);
+
+    // New task input
+    let input_active = app.task_input_active;
+    let ib = if input_active { t.border_active } else { t.border };
+    let prompt = if input_active { " new task description ⏎ " } else { " n=new task  d=done  Esc=back " };
+    let input = Paragraph::new(Line::from(vec![
+        Span::styled(" › ", Style::default().fg(t.accent)),
+        Span::styled(&app.task_input, Style::default().fg(t.text)),
+        if input_active { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
+    ])).block(Block::default().title(prompt)
+        .borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ib))
+        .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(input, outer[2]);
+
+    // Footer
+    let footer_msg = format!("v0.9 │ t=tasks │ n=new │ d=done │ j/k=navigate │ Esc=back │ {}/{}",
+        app.theme_name.label(), app.bg_density.label());
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(footer_msg, Style::default().fg(t.text_dim)),
+    ])).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(footer, outer[3]);
+}
+
+
 fn render_help(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let sections = vec![
@@ -830,6 +1016,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.draw(|f| match app.screen {
             Screen::Dashboard => render_dashboard(f, &mut app),
             Screen::AgentDetail => render_detail(f, &mut app),
+            Screen::TaskBoard => render_task_board(f, &app),
             Screen::Help => render_help(f, &app),
         })?;
 
@@ -920,6 +1107,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 _ => {}
                             },
                         },
+                        Screen::TaskBoard => {
+                            if app.task_input_active {
+                                match key.code {
+                                    KeyCode::Esc => app.task_input_active = false,
+                                    KeyCode::Enter => {
+                                        if !app.task_input.trim().is_empty() {
+                                            let desc = app.task_input.clone();
+                                            app.task_input.clear();
+                                            app.task_input_active = false;
+                                            if let Some(pool) = &app.db_pool {
+                                                let _ = db::create_task(pool, &desc, 5, &app.user(), None).await;
+                                                if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Backspace => { app.task_input.pop(); }
+                                    KeyCode::Char(ch) => app.task_input.push(ch),
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Esc => { app.screen = Screen::Dashboard; app.focus = Focus::Fleet; }
+                                    KeyCode::Char('q') => app.should_quit = true,
+                                    KeyCode::Up | KeyCode::Char('k') => { if app.task_selected > 0 { app.task_selected -= 1; } }
+                                    KeyCode::Down | KeyCode::Char('j') => { if app.task_selected < app.tasks.len().saturating_sub(1) { app.task_selected += 1; } }
+                                    KeyCode::Char('n') => app.task_input_active = true,
+                                    KeyCode::Char('d') => {
+                                        if let Some(task) = app.tasks.get(app.task_selected) {
+                                            let tid = task.id;
+                                            if let Some(pool) = &app.db_pool {
+                                                let _ = db::update_task_status(pool, tid, "completed").await;
+                                                if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('b') => app.cycle_bg(),
+                                    KeyCode::Char('c') => app.cycle_theme(),
+                                    _ => {}
+                                }
+                            }
+                        }
                         Screen::Dashboard => match app.focus {
                             Focus::Fleet => match key.code {
                                 KeyCode::Char('q') => app.should_quit = true,
@@ -940,6 +1168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('c') => app.cycle_theme(),
                                 KeyCode::Char('s') => app.cycle_sort(),
+                                KeyCode::Char('t') => {
+                                    app.screen = Screen::TaskBoard;
+                                    app.last_task_poll = Instant::now() - Duration::from_secs(10);
+                                }
                                 _ => {}
                             },
                             Focus::Chat => match key.code {
@@ -961,6 +1193,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Auto-refresh every 30s (non-blocking)
         if app.last_refresh.elapsed() > Duration::from_secs(30) && !app.refreshing {
             app.start_refresh();
+        }
+
+        // Poll tasks every 5s when on task board
+        if app.screen == Screen::TaskBoard && app.last_task_poll.elapsed() > Duration::from_secs(5) {
+            if let Some(pool) = &app.db_pool {
+                if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
+            }
+            app.last_task_poll = Instant::now();
         }
 
         // Poll chat every 3s — spawn so it doesn't block
