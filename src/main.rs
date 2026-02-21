@@ -72,6 +72,7 @@ struct ChatLine {
     response: Option<String>,
     time: String,
     status: String,
+    kind: String,
 }
 
 #[derive(PartialEq, Clone)]
@@ -103,6 +104,7 @@ struct App {
     chat_history: Vec<ChatLine>,
     chat_scroll: u16,
     agent_chat_input: String,
+    agent_chat_history: Vec<ChatLine>,  // Direct messages to focused agent
     agent_chat_scroll: u16,
     refresh_rx: Option<mpsc::UnboundedReceiver<ProbeResult>>,
     refreshing: bool,
@@ -145,11 +147,12 @@ impl App {
             Err(e) => eprintln!("DB: {}", e),
         }
 
-        let chat_history = match db::load_chat_history(&pool, 100).await {
+        let chat_history = match db::load_global_chat(&pool, 100).await {
             Ok(msgs) => msgs.iter().map(|m| ChatLine {
                 sender: m.sender.clone(), target: m.target.clone(),
                 message: m.message.clone(), response: m.response.clone(),
                 time: m.created_at.clone(), status: m.status.clone(),
+                kind: m.kind.clone(),
             }).collect(),
             Err(_) => vec![],
         };
@@ -164,7 +167,7 @@ impl App {
             status_message: String::new(),
             db_pool: Some(pool),
             chat_input: String::new(), chat_history, chat_scroll: 0,
-            agent_chat_input: String::new(), agent_chat_scroll: 0,
+            agent_chat_input: String::new(), agent_chat_history: vec![], agent_chat_scroll: 0,
             refresh_rx: None, refreshing: false, self_ip,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd),
         }
@@ -185,33 +188,25 @@ impl App {
         self.theme = Theme::resolve(self.theme_name, self.bg_density);
     }
 
-    fn agent_chat_lines(&self) -> Vec<ChatLine> {
-        let db_name = &self.agents[self.selected].db_name;
-        self.chat_history.iter().filter(|m| {
-            m.target.as_deref() == Some(db_name.as_str()) || m.sender == *db_name
-        }).cloned().collect()
+    fn agent_chat_lines(&self) -> &Vec<ChatLine> {
+        &self.agent_chat_history
     }
 
     async fn send_message(&mut self) {
         if self.chat_input.trim().is_empty() { return; }
-        let input = self.chat_input.clone();
+        let message = self.chat_input.clone();
         self.chat_input.clear();
 
-        let (target, message) = if input.trim().starts_with('@') {
-            if let Some(pos) = input.trim().find(' ') {
-                let raw = &input.trim()[1..pos];
-                let resolved = config::resolve_alias(raw, &self.fleet_config);
-                (Some(resolved), input.trim()[pos+1..].trim().to_string())
-            } else { (None, input.trim().to_string()) }
-        } else { (None, input.trim().to_string()) };
-
+        // Dashboard chat = broadcast to all agents
+        let agent_names: Vec<String> = self.agents.iter().map(|a| a.db_name.clone()).collect();
         self.chat_history.push(ChatLine {
-            sender: self.user(), target: target.clone(), message: message.clone(),
+            sender: self.user(), target: None, message: message.clone(),
             response: None, time: now_str(), status: "pending".into(),
+            kind: "global".into(),
         });
 
         if let Some(pool) = &self.db_pool {
-            let _ = db::send_chat(pool, &self.user(), target.as_deref(), &message).await;
+            let _ = db::send_broadcast(pool, &self.user(), &message, &agent_names).await;
         }
         self.chat_scroll = 0;
     }
@@ -222,9 +217,10 @@ impl App {
         self.agent_chat_input.clear();
         let target = self.agents[self.selected].db_name.clone();
 
-        self.chat_history.push(ChatLine {
+        self.agent_chat_history.push(ChatLine {
             sender: self.user(), target: Some(target.clone()), message: message.clone(),
             response: None, time: now_str(), status: "pending".into(),
+            kind: "direct".into(),
         });
 
         if let Some(pool) = &self.db_pool {
@@ -235,12 +231,26 @@ impl App {
 
     async fn poll_chat(&mut self) {
         if let Some(pool) = &self.db_pool {
-            if let Ok(msgs) = db::load_chat_history(pool, 100).await {
+            // Global chat for dashboard
+            if let Ok(msgs) = db::load_global_chat(pool, 100).await {
                 self.chat_history = msgs.iter().map(|m| ChatLine {
                     sender: m.sender.clone(), target: m.target.clone(),
                     message: m.message.clone(), response: m.response.clone(),
                     time: m.created_at.clone(), status: m.status.clone(),
+                    kind: m.kind.clone(),
                 }).collect();
+            }
+            // Agent-specific chat (if on detail screen)
+            if self.screen == Screen::AgentDetail && self.selected < self.agents.len() {
+                let agent = &self.agents[self.selected].db_name;
+                if let Ok(msgs) = db::load_agent_chat(pool, agent, 100).await {
+                    self.agent_chat_history = msgs.iter().map(|m| ChatLine {
+                        sender: m.sender.clone(), target: m.target.clone(),
+                        message: m.message.clone(), response: m.response.clone(),
+                        time: m.created_at.clone(), status: m.status.clone(),
+                        kind: m.kind.clone(),
+                    }).collect();
+                }
             }
         }
     }
@@ -372,11 +382,20 @@ fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme) -> Vec<Line<'s
                     Span::styled(cur, Style::default().fg(t.response)),
                 ]));
             }
-        } else if msg.status == "pending" {
-            lines.push(Line::from(vec![
-                Span::raw("     "),
-                Span::styled("⏳ awaiting response...".to_string(), Style::default().fg(t.pending)),
-            ]));
+        } else {
+            let status_text = match msg.status.as_str() {
+                "pending" => "⏳ pending...",
+                "processing" => "🔄 processing...",
+                "thinking" => "💭 thinking...",
+                "received" => "📨 received",
+                _ => "",
+            };
+            if !status_text.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(status_text.to_string(), Style::default().fg(t.pending)),
+                ]));
+            }
         }
         lines.push(Line::from(""));
     }
@@ -477,7 +496,7 @@ fn render_chat_panel(frame: &mut Frame, app: &App, area: Rect, active: bool, age
 
     let (messages, scroll, input_text) = if agent_mode {
         let msgs = app.agent_chat_lines();
-        let lines = build_chat_lines(&msgs, &app.user(), t);
+        let lines = build_chat_lines(msgs, &app.user(), t);
         (lines, app.agent_chat_scroll, &app.agent_chat_input)
     } else {
         let lines = build_chat_lines(&app.chat_history, &app.user(), t);
@@ -503,7 +522,7 @@ fn render_chat_panel(frame: &mut Frame, app: &App, area: Rect, active: bool, age
     let prompt = if agent_mode {
         format!(" @{} › ", app.agents[app.selected].db_name)
     } else if active {
-        " @agent message ⏎ ".to_string()
+        " broadcast to all ⏎ ".to_string()
     } else {
         " Tab to chat ".to_string()
     };
@@ -737,7 +756,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.screen = Screen::AgentDetail;
                                     app.focus = Focus::Fleet;
                                     app.agent_chat_input.clear();
+                                    app.agent_chat_history.clear();
                                     app.agent_chat_scroll = 0;
+                                    // Trigger immediate agent chat load
+                                    app.last_chat_poll = Instant::now() - Duration::from_secs(10);
                                 }
                                 KeyCode::Char('?') => app.screen = Screen::Help,
                                 KeyCode::Char('r') => app.start_refresh(),
