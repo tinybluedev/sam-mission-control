@@ -81,6 +81,26 @@ enum Focus { Fleet, Chat, AgentChat }
 #[derive(PartialEq)]
 enum Screen { Dashboard, AgentDetail, Help }
 
+#[derive(PartialEq, Clone, Copy)]
+enum SortMode { Name, Status, Location, Version }
+
+impl SortMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Status,
+            Self::Status => Self::Location,
+            Self::Location => Self::Version,
+            Self::Version => Self::Name,
+        }
+    }
+    fn label(&self) -> &str {
+        match self {
+            Self::Name => "name", Self::Status => "status",
+            Self::Location => "location", Self::Version => "version",
+        }
+    }
+}
+
 struct ProbeResult {
     index: usize,
     status: AgentStatus,
@@ -109,6 +129,9 @@ struct App {
     refresh_rx: Option<mpsc::UnboundedReceiver<ProbeResult>>,
     refreshing: bool,
     self_ip: String,
+    // UI state
+    spinner_frame: usize,
+    sort_mode: SortMode,
     // Layout hit zones (updated each frame)
     fleet_area: Rect,
     chat_area: Rect,
@@ -175,6 +198,7 @@ impl App {
             chat_input: String::new(), chat_history, chat_scroll: 0,
             agent_chat_input: String::new(), agent_chat_history: vec![], agent_chat_scroll: 0,
             refresh_rx: None, refreshing: false, self_ip,
+            spinner_frame: 0, sort_mode: SortMode::Name,
             fleet_area: Rect::default(), chat_area: Rect::default(),
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
@@ -190,6 +214,23 @@ impl App {
     fn cycle_theme(&mut self) {
         self.theme_name = self.theme_name.next();
         self.theme = Theme::resolve(self.theme_name, self.bg_density);
+    }
+
+    fn cycle_sort(&mut self) {
+        self.sort_mode = self.sort_mode.next();
+        let sm = self.sort_mode;
+        self.agents.sort_by(|a, b| match sm {
+            SortMode::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            SortMode::Status => {
+                let rank = |s: &AgentStatus| match s {
+                    AgentStatus::Online => 0, AgentStatus::Busy => 1,
+                    AgentStatus::Unknown => 2, AgentStatus::Probing => 3, AgentStatus::Offline => 4,
+                };
+                rank(&a.status).cmp(&rank(&b.status))
+            }
+            SortMode::Location => a.location.cmp(&b.location),
+            SortMode::Version => b.oc_version.cmp(&a.oc_version),
+        });
     }
 
     fn cycle_bg(&mut self) {
@@ -304,10 +345,16 @@ impl App {
     fn update_status_bar(&mut self) {
         let on = self.agents.iter().filter(|a| a.status == AgentStatus::Online).count();
         let total = self.agents.len();
-        let refresh = if self.refreshing { " ⟳" } else { "" };
+        let spinner_chars = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+        let refresh = if self.refreshing {
+            self.spinner_frame = (self.spinner_frame + 1) % spinner_chars.len();
+            format!(" {} ", spinner_chars[self.spinner_frame])
+        } else { String::new() };
+        let chat_count = self.chat_history.len();
         self.status_message = format!(
-            "v0.8 │ {}/{} online{} │ theme:{}/{} │ r=refresh b=bg c=color ?=help",
-            on, total, refresh, self.theme_name.label(), self.bg_density.label()
+            "v0.9 │ {}/{} online{} │ sort:{} │ chat({}) │ {}/{} │ r b c s ?=help",
+            on, total, refresh, self.sort_mode.label(), chat_count,
+            self.theme_name.label(), self.bg_density.label()
         );
     }
 }
@@ -484,8 +531,9 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             AgentStatus::Online => t.status_online, AgentStatus::Busy => t.status_busy,
             AgentStatus::Offline => t.status_offline, _ => t.text_dim,
         };
+        let cursor = if sel { "▶" } else { " " };
         Row::new(vec![
-            Cell::from(format!(" {}", a.emoji)),
+            Cell::from(format!("{}{}", cursor, a.emoji)),
             Cell::from(a.name.clone()).style(Style::default().fg(t.text_bold).bold()),
             Cell::from(a.location.clone()).style(Style::default().fg(loc_color)),
             Cell::from(a.status.to_string()).style(Style::default().fg(st_color)),
@@ -530,7 +578,8 @@ fn render_chat_panel(frame: &mut Frame, app: &App, area: Rect, active: bool, age
     let title = if agent_mode {
         format!(" {} {} Chat ", app.agents[app.selected].emoji, app.agents[app.selected].name)
     } else {
-        " Chat ".to_string()
+        let count = app.chat_history.len();
+        if count > 0 { format!(" Chat ({}) ", count) } else { " Chat ".to_string() }
     };
 
     let chat = Paragraph::new(messages).scroll((scroll_pos, 0))
@@ -866,6 +915,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('c') => app.cycle_theme(),
+                                KeyCode::Char('s') => app.cycle_sort(),
                                 _ => {}
                             },
                             Focus::Chat => match key.code {
