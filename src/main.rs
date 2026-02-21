@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod wizard;
 mod db;
 mod theme;
 
@@ -131,6 +132,8 @@ struct App {
     refresh_rx: Option<mpsc::UnboundedReceiver<ProbeResult>>,
     refreshing: bool,
     self_ip: String,
+    // Wizard
+    wizard: wizard::AgentWizard,
     // Task board
     tasks: Vec<db::Task>,
     task_selected: usize,
@@ -206,6 +209,7 @@ impl App {
             chat_input: String::new(), chat_history, chat_scroll: 0,
             agent_chat_input: String::new(), agent_chat_history: vec![], agent_chat_scroll: 0,
             refresh_rx: None, refreshing: false, self_ip,
+            wizard: wizard::AgentWizard::new(),
             tasks: vec![], task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
             spinner_frame: 0, sort_mode: SortMode::Name,
@@ -1013,11 +1017,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.update_status_bar();
         }
 
-        terminal.draw(|f| match app.screen {
-            Screen::Dashboard => render_dashboard(f, &mut app),
-            Screen::AgentDetail => render_detail(f, &mut app),
-            Screen::TaskBoard => render_task_board(f, &app),
-            Screen::Help => render_help(f, &app),
+        terminal.draw(|f| {
+            match app.screen {
+                Screen::Dashboard => render_dashboard(f, &mut app),
+                Screen::AgentDetail => render_detail(f, &mut app),
+                Screen::TaskBoard => render_task_board(f, &app),
+                Screen::Help => render_help(f, &app),
+            }
+            if app.wizard.active {
+                wizard::render_wizard(f, &app.wizard, &app.theme, app.bg_density.bg());
+            }
         })?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -1084,6 +1093,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Event::Key(key) = ev {
                 if key.kind == KeyEventKind::Press {
+                    // Wizard overlay intercepts all input when active
+                    if app.wizard.active {
+                        match key.code {
+                            KeyCode::Esc => {
+                                if app.wizard.go_back() {
+                                    app.wizard.active = false;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let ready = app.wizard.advance();
+                                if ready {
+                                    // Create the agent
+                                    if let Some(pool) = &app.db_pool {
+                                        let w = &app.wizard;
+                                        let caps = format!(r#"["{}"]"#, w.location_str().to_lowercase());
+                                        let _ = pool.get_conn().await.map(|mut conn| {
+                                            let name = w.agent_name.clone();
+                                            let host = w.host.clone();
+                                            let loc = w.location_str().to_string();
+                                            let ssh = w.ssh_user.clone();
+                                            let emoji = w.emoji.clone();
+                                            let display = w.display_name.clone();
+                                            tokio::spawn(async move {
+                                                use mysql_async::prelude::*;
+                                                let _ = conn.exec_drop(
+                                                    "INSERT IGNORE INTO mc_fleet_status (agent_name, tailscale_ip, status, capabilities) VALUES (?, ?, 'offline', ?)",
+                                                    (&name, &host, &caps),
+                                                ).await;
+                                            });
+                                        });
+                                    }
+                                    // Add to fleet config in memory
+                                    app.fleet_config.push(config::AgentConfig {
+                                        name: app.wizard.agent_name.clone(),
+                                        display: Some(app.wizard.display_name.clone()),
+                                        emoji: Some(app.wizard.emoji.clone()),
+                                        location: Some(app.wizard.location_str().to_string()),
+                                        ssh_user: Some(app.wizard.ssh_user.clone()),
+                                    });
+                                    // Add to agents vec
+                                    app.agents.push(Agent {
+                                        name: app.wizard.display_name.clone(),
+                                        db_name: app.wizard.agent_name.clone(),
+                                        emoji: app.wizard.emoji.clone(),
+                                        host: app.wizard.host.clone(),
+                                        location: app.wizard.location_str().to_string(),
+                                        status: AgentStatus::Unknown,
+                                        os: String::new(), kernel: String::new(),
+                                        oc_version: String::new(), last_seen: String::new(),
+                                        current_task: None,
+                                        ssh_user: app.wizard.ssh_user.clone(),
+                                        capabilities: vec![],
+                                        token_burn: 0,
+                                    });
+                                    app.wizard.active = false;
+                                    app.status_message = format!("✅ Agent '{}' created", app.wizard.agent_name);
+                                }
+                            }
+                            KeyCode::Tab => {
+                                // Test SSH on confirm step
+                                if app.wizard.step == wizard::WizardStep::Confirm {
+                                    let host = app.wizard.host.clone();
+                                    let user = app.wizard.ssh_user.clone();
+                                    app.wizard.testing_ssh = true;
+                                    app.wizard.ssh_result = Some("Testing...".into());
+                                    let result = tokio::process::Command::new("ssh")
+                                        .args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                            &format!("{}@{}", user, host), "hostname && openclaw --version 2>/dev/null || echo 'OC not found'"])
+                                        .output().await;
+                                    app.wizard.testing_ssh = false;
+                                    match result {
+                                        Ok(o) if o.status.success() => {
+                                            app.wizard.ssh_result = Some(format!("✅ {}", String::from_utf8_lossy(&o.stdout).trim()));
+                                        }
+                                        Ok(o) => {
+                                            app.wizard.ssh_result = Some(format!("❌ {}", String::from_utf8_lossy(&o.stderr).trim().chars().take(60).collect::<String>()));
+                                        }
+                                        Err(e) => {
+                                            app.wizard.ssh_result = Some(format!("❌ {}", e));
+                                        }
+                                    }
+                                } else {
+                                    // Tab = skip/advance
+                                    app.wizard.advance();
+                                }
+                            }
+                            KeyCode::Backspace => app.wizard.pop_char(),
+                            KeyCode::Char(ch) => app.wizard.push_char(ch),
+                            _ => {}
+                        }
+                    } else {
                     match app.screen {
                         Screen::Help => { app.screen = Screen::Dashboard; }
                         Screen::AgentDetail => match app.focus {
@@ -1168,6 +1268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('c') => app.cycle_theme(),
                                 KeyCode::Char('s') => app.cycle_sort(),
+                                KeyCode::Char('a') => { app.wizard.open(); }
                                 KeyCode::Char('t') => {
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
@@ -1187,6 +1288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                     }
                 }
+                    }
             }
         }
 
