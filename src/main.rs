@@ -1,7 +1,9 @@
+mod cli;
 mod config;
 mod db;
 mod theme;
 
+use clap::Parser;
 use dotenvy;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, MouseEvent, MouseEventKind, MouseButton},
@@ -745,10 +747,32 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = cli::Cli::parse();
+
+    // Load config (config.toml → .env → defaults)
+    let sam_config = cli::SamConfig::load(args.config.as_ref());
+    sam_config.apply_to_env();
+
+    // .env as fallback
     if dotenvy::dotenv().is_err() {
         if let Ok(home) = std::env::var("HOME") {
             let _ = dotenvy::from_path(std::path::Path::new(&home).join(".config/sam/.env"));
         }
+    }
+
+    // Handle subcommands
+    match args.command {
+        Some(cli::Commands::Setup) => { return cli::run_setup().map_err(|e| e.into()); }
+        Some(cli::Commands::Status) => { return cli::print_status().await.map_err(|e| e.into()); }
+        Some(cli::Commands::Chat { agent, message }) => {
+            let msg = message.join(" ");
+            return cli::send_chat(&agent, &msg).await.map_err(|e| e.into());
+        }
+        Some(cli::Commands::Version) => {
+            println!("sam v{}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        None => {} // Launch TUI
     }
 
     let fleet_config = match config::load_fleet_config() {
