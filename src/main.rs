@@ -4,7 +4,7 @@ mod theme;
 
 use dotenvy;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, MouseEvent, MouseEventKind, MouseButton},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -109,6 +109,12 @@ struct App {
     refresh_rx: Option<mpsc::UnboundedReceiver<ProbeResult>>,
     refreshing: bool,
     self_ip: String,
+    // Layout hit zones (updated each frame)
+    fleet_area: Rect,
+    chat_area: Rect,
+    detail_info_area: Rect,
+    detail_chat_area: Rect,
+    fleet_row_start_y: u16,  // Y offset where first agent row starts
     // Theme
     theme_name: ThemeName,
     bg_density: BgDensity,
@@ -169,6 +175,9 @@ impl App {
             chat_input: String::new(), chat_history, chat_scroll: 0,
             agent_chat_input: String::new(), agent_chat_history: vec![], agent_chat_scroll: 0,
             refresh_rx: None, refreshing: false, self_ip,
+            fleet_area: Rect::default(), chat_area: Rect::default(),
+            detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
+            fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd),
         }
     }
@@ -404,7 +413,7 @@ fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme) -> Vec<Line<'s
 
 // ---- Rendering ----
 
-fn render_dashboard(frame: &mut Frame, app: &App) {
+fn render_dashboard(frame: &mut Frame, app: &mut App) {
     let t = &app.theme;
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -443,12 +452,14 @@ fn render_dashboard(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(outer[1]);
 
+    app.fleet_area = body[0];
+    app.chat_area = body[1];
     render_fleet_table(frame, app, body[0], app.focus == Focus::Fleet);
     render_chat_panel(frame, app, body[1], app.focus == Focus::Chat, false);
     render_footer(frame, app, outer[2]);
 }
 
-fn render_fleet_table(frame: &mut Frame, app: &App, area: Rect, active: bool) {
+fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool) {
     let t = &app.theme;
     let fb = if active { t.border_active } else { t.border };
 
@@ -474,6 +485,8 @@ fn render_fleet_table(frame: &mut Frame, app: &App, area: Rect, active: bool) {
             Cell::from(a.oc_version.clone()).style(Style::default().fg(t.version)),
         ]).style(Style::default().bg(bg)).height(1)
     }).collect();
+
+    app.fleet_row_start_y = area.y + 1; // +1 for border, +1 for header handled in click calc
 
     let table = Table::new(rows, [
         Constraint::Length(4), Constraint::Length(14), Constraint::Length(9),
@@ -538,7 +551,7 @@ fn render_chat_panel(frame: &mut Frame, app: &App, area: Rect, active: bool, age
     frame.render_widget(input, cl[1]);
 }
 
-fn render_detail(frame: &mut Frame, app: &App) {
+fn render_detail(frame: &mut Frame, app: &mut App) {
     let t = &app.theme;
     let a = &app.agents[app.selected];
     let chunks = Layout::default().direction(Direction::Vertical)
@@ -608,6 +621,10 @@ fn render_detail(frame: &mut Frame, app: &App) {
         .style(Style::default().bg(app.bg_density.bg()))
         .padding(Padding::new(1, 1, 1, 0)));
     frame.render_widget(detail, body[0]);
+
+    // Store hit zones
+    app.detail_info_area = body[0];
+    app.detail_chat_area = body[1];
 
     // Agent chat
     render_chat_panel(frame, app, body[1], app.focus == Focus::AgentChat, true);
@@ -685,6 +702,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    stdout().execute(crossterm::event::EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut app = App::new(fleet_config).await;
@@ -715,13 +733,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         terminal.draw(|f| match app.screen {
-            Screen::Dashboard => render_dashboard(f, &app),
-            Screen::AgentDetail => render_detail(f, &app),
+            Screen::Dashboard => render_dashboard(f, &mut app),
+            Screen::AgentDetail => render_detail(f, &mut app),
             Screen::Help => render_help(f, &app),
         })?;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+
+            // Mouse events
+            if let Event::Mouse(mouse) = &ev {
+                if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                    let (mx, my) = (mouse.column, mouse.row);
+                    match app.screen {
+                        Screen::Dashboard => {
+                            // Click on fleet panel
+                            if mx >= app.fleet_area.x && mx < app.fleet_area.x + app.fleet_area.width
+                                && my >= app.fleet_area.y && my < app.fleet_area.y + app.fleet_area.height
+                            {
+                                app.focus = Focus::Fleet;
+                                // Calculate which agent row was clicked
+                                if my > app.fleet_row_start_y && app.fleet_row_start_y > 0 {
+                                    let row = (my - app.fleet_row_start_y - 1) as usize; // -1 for header
+                                    if row < app.agents.len() {
+                                        app.selected = row;
+                                    }
+                                }
+                            }
+                            // Click on chat panel
+                            else if mx >= app.chat_area.x && mx < app.chat_area.x + app.chat_area.width
+                                && my >= app.chat_area.y && my < app.chat_area.y + app.chat_area.height
+                            {
+                                app.focus = Focus::Chat;
+                            }
+                        }
+                        Screen::AgentDetail => {
+                            if mx >= app.detail_info_area.x && mx < app.detail_info_area.x + app.detail_info_area.width
+                                && my >= app.detail_info_area.y && my < app.detail_info_area.y + app.detail_info_area.height
+                            {
+                                app.focus = Focus::Fleet;
+                            }
+                            else if mx >= app.detail_chat_area.x && mx < app.detail_chat_area.x + app.detail_chat_area.width
+                                && my >= app.detail_chat_area.y && my < app.detail_chat_area.y + app.detail_chat_area.height
+                            {
+                                app.focus = Focus::AgentChat;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Scroll wheel in chat
+                if let MouseEventKind::ScrollUp = mouse.kind {
+                    match app.focus {
+                        Focus::Chat => app.chat_scroll = app.chat_scroll.saturating_add(3),
+                        Focus::AgentChat => app.agent_chat_scroll = app.agent_chat_scroll.saturating_add(3),
+                        _ => {}
+                    }
+                }
+                if let MouseEventKind::ScrollDown = mouse.kind {
+                    match app.focus {
+                        Focus::Chat => app.chat_scroll = app.chat_scroll.saturating_sub(3),
+                        Focus::AgentChat => app.agent_chat_scroll = app.agent_chat_scroll.saturating_sub(3),
+                        _ => {}
+                    }
+                }
+            }
+
+            if let Event::Key(key) = ev {
                 if key.kind == KeyEventKind::Press {
                     match app.screen {
                         Screen::Help => { app.screen = Screen::Dashboard; }
@@ -799,6 +878,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(pool) = app.db_pool.take() { pool.disconnect().await?; }
     disable_raw_mode()?;
+    stdout().execute(crossterm::event::DisableMouseCapture)?;
     stdout().execute(LeaveAlternateScreen)?;
     Ok(())
 }
