@@ -139,7 +139,7 @@ impl App {
             fleet_config: fleet_config.agent,
             agents, selected: 0, screen: Screen::Dashboard, focus: Focus::Fleet,
             should_quit: false, last_refresh: Instant::now(), last_chat_poll: Instant::now(),
-            status_message: "v0.6 │ Tab=switch focus │ ?=help".into(),
+            status_message: "v0.7 │ Tab=switch focus │ ?=help".into(),
             db_pool: Some(pool), chat_input: String::new(), chat_history, chat_scroll: 0,
             self_ip,
         }
@@ -527,15 +527,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut app = App::new(fleet_config).await;
-    for a in &mut app.agents { a.status = AgentStatus::Probing; }
-    app.status_message = "Probing fleet...".into();
-    terminal.draw(|f| render_dashboard(f, &app))?;
-
-    let sip = app.self_ip.clone();
-    refresh_fleet(&mut app.agents, &app.db_pool, &sip).await;
-    app.last_refresh = Instant::now();
+    // Show DB status immediately — no blocking probe on launch
     let on = app.agents.iter().filter(|a| a.status == AgentStatus::Online).count();
-    app.status_message = format!("v0.6 │ {}/{} online │ Tab=focus ?=help", on, app.agents.len());
+    app.status_message = format!("v0.7 │ {}/{} from DB │ r=refresh │ Tab=focus │ ?=help", on, app.agents.len());
+    app.last_refresh = Instant::now();
 
     loop {
         terminal.draw(|f| match app.screen {
@@ -569,7 +564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     refresh_fleet(&mut app.agents, &app.db_pool, &sip).await;
                                     app.last_refresh = Instant::now();
                                     let on = app.agents.iter().filter(|a| a.status == AgentStatus::Online).count();
-                                    app.status_message = format!("v0.6 │ {}/{} online │ Tab=focus ?=help", on, app.agents.len());
+                                    app.status_message = format!("v0.7 │ {}/{} online │ Tab=focus ?=help", on, app.agents.len());
                                 }
                                 _ => {}
                             },
@@ -593,7 +588,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             refresh_fleet(&mut app.agents, &app.db_pool, &sip).await;
             app.last_refresh = Instant::now();
             let on = app.agents.iter().filter(|a| a.status == AgentStatus::Online).count();
-            app.status_message = format!("v0.6 │ {}/{} online │ Tab=focus ?=help", on, app.agents.len());
+            app.status_message = format!("v0.7 │ {}/{} online │ Tab=focus ?=help", on, app.agents.len());
         }
 
         if app.last_chat_poll.elapsed() > Duration::from_secs(3) {
