@@ -481,7 +481,43 @@ fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme) -> Vec<Line<'s
 
 // ---- Rendering ----
 
+
+// ---- Responsive Layout Helpers ----
+
+fn is_narrow(area: &Rect) -> bool { area.width < 80 }
+fn is_wide(area: &Rect) -> bool { area.width > 160 }
+
+fn dashboard_split(area: &Rect) -> (Constraint, Constraint) {
+    if is_narrow(area) { (Constraint::Percentage(100), Constraint::Percentage(0)) }
+    else if is_wide(area) { (Constraint::Percentage(40), Constraint::Percentage(60)) }
+    else { (Constraint::Percentage(50), Constraint::Percentage(50)) }
+}
+
+fn detail_split(area: &Rect) -> (Constraint, Constraint) {
+    if is_narrow(area) { (Constraint::Percentage(100), Constraint::Percentage(0)) }
+    else if is_wide(area) { (Constraint::Percentage(35), Constraint::Percentage(65)) }
+    else { (Constraint::Percentage(40), Constraint::Percentage(60)) }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_string() }
+    else { format!("{}…", s.chars().take(max - 1).collect::<String>()) }
+}
+
+fn render_too_small(frame: &mut Frame) {
+    let area = frame.area();
+    let msg = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled("Terminal too small", Style::default().fg(Color::Red).bold())),
+        Line::from(Span::styled(format!("Need 60x20, got {}x{}", area.width, area.height), Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("Resize your terminal", Style::default().fg(Color::DarkGray))),
+    ]).alignment(Alignment::Center)
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded));
+    frame.render_widget(msg, area);
+}
+
 fn render_dashboard(frame: &mut Frame, app: &mut App) {
+    if frame.area().width < 60 || frame.area().height < 20 { render_too_small(frame); return; }
     let t = &app.theme;
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -515,15 +551,18 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(header, outer[0]);
 
+    let (fleet_pct, chat_pct) = dashboard_split(&outer[1]);
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([fleet_pct, chat_pct])
         .split(outer[1]);
 
     app.fleet_area = body[0];
     app.chat_area = body[1];
     render_fleet_table(frame, app, body[0], app.focus == Focus::Fleet);
-    render_chat_panel(frame, app, body[1], app.focus == Focus::Chat, false);
+    if !is_narrow(&outer[1]) {
+        render_chat_panel(frame, app, body[1], app.focus == Focus::Chat, false);
+    }
     render_footer(frame, app, outer[2]);
 }
 
@@ -557,10 +596,13 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
 
     app.fleet_row_start_y = area.y + 1; // +1 for border, +1 for header handled in click calc
 
-    let table = Table::new(rows, [
-        Constraint::Length(4), Constraint::Length(14), Constraint::Length(9),
-        Constraint::Length(12), Constraint::Min(12),
-    ]).header(hrow)
+    let show_version = area.width > 55;
+    let widths = if show_version {
+        vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Length(12), Constraint::Min(12)]
+    } else {
+        vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Min(12), Constraint::Length(0)]
+    };
+    let table = Table::new(rows, widths).header(hrow)
     .block(Block::default().title(Span::styled(" Fleet ", Style::default().fg(fb).bold()))
         .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(fb))
         .style(Style::default().bg(app.bg_density.bg()))
@@ -652,10 +694,11 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(header, chunks[0]);
 
-    // Body: info left, chat right
+    // Body: info left, chat right (responsive)
+    let (info_pct, chat_pct) = detail_split(&chunks[1]);
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([info_pct, chat_pct])
         .split(chunks[1]);
 
     // Info panel
