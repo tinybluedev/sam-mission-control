@@ -82,7 +82,7 @@ struct ChatLine {
 enum Focus { Fleet, Chat, AgentChat }
 
 #[derive(PartialEq)]
-enum Screen { Dashboard, AgentDetail, TaskBoard, Help }
+enum Screen { Dashboard, AgentDetail, TaskBoard, VpnStatus, Help }
 
 #[derive(PartialEq, Clone, Copy)]
 enum SortMode { Name, Status, Location, Version }
@@ -746,6 +746,73 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     render_footer(frame, app, chunks[2]);
 }
 
+fn render_vpn_status(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
+        .split(frame.area());
+
+    let bg_block = Block::default().style(Style::default().bg(app.bg_density.bg()));
+    frame.render_widget(bg_block, frame.area());
+
+    let online = app.agents.iter().filter(|a| a.status == AgentStatus::Online).count();
+    let header = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("🔒 VPN MESH STATUS", Style::default().fg(t.header_title).bold()),
+        Span::raw("    "),
+        Span::styled(format!("{}/{} nodes reachable", online, app.agents.len()), Style::default().fg(t.status_online)),
+        Span::raw("    "),
+        Span::styled("Headscale (self-hosted)", Style::default().fg(t.text_dim)),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(header, outer[0]);
+
+    // Node table
+    let hcells = ["  ", "Agent", "Tailscale IP", "Status", "Location", "OC Version"]
+        .iter().map(|h| Cell::from(*h).style(Style::default().fg(t.text_bold).bold()));
+    let hrow = Row::new(hcells).height(1).bottom_margin(1);
+
+    let rows: Vec<Row> = app.agents.iter().map(|a| {
+        let st_color = match a.status {
+            AgentStatus::Online => t.status_online,
+            AgentStatus::Busy => t.status_busy,
+            AgentStatus::Offline => t.status_offline,
+            _ => t.text_dim,
+        };
+        let loc_c = match a.location.as_str() {
+            "Home" => t.loc_home, "SM" => t.loc_sm, "VPS" => t.loc_vps, "Mobile" => t.loc_mobile, _ => t.text,
+        };
+        Row::new(vec![
+            Cell::from(format!(" {}", a.emoji)),
+            Cell::from(a.name.clone()).style(Style::default().fg(t.text_bold).bold()),
+            Cell::from(a.host.clone()).style(Style::default().fg(t.accent2)),
+            Cell::from(format!("{}", a.status)).style(Style::default().fg(st_color)),
+            Cell::from(a.location.clone()).style(Style::default().fg(loc_c)),
+            Cell::from(a.oc_version.clone()).style(Style::default().fg(t.version)),
+        ]).style(Style::default().bg(app.bg_density.bg())).height(1)
+    }).collect();
+
+    let table = Table::new(rows, [
+        Constraint::Length(4), Constraint::Length(16), Constraint::Length(15),
+        Constraint::Length(14), Constraint::Length(9), Constraint::Min(12),
+    ]).header(hrow)
+    .block(Block::default().title(Span::styled(" Mesh Nodes ", Style::default().fg(t.border_active).bold()))
+        .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(t.border_active))
+        .style(Style::default().bg(app.bg_density.bg()))
+        .padding(Padding::new(1, 1, 0, 0)));
+    frame.render_widget(table, outer[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Esc=back │ Headscale at vpn.tinyblue.dev │ v=VPN │ q=quit", Style::default().fg(t.text_dim)),
+    ])).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(footer, outer[2]);
+}
+
+
 fn render_task_board(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let outer = Layout::default()
@@ -1065,6 +1132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Screen::Dashboard => render_dashboard(f, &mut app),
                 Screen::AgentDetail => render_detail(f, &mut app),
                 Screen::TaskBoard => render_task_board(f, &app),
+                Screen::VpnStatus => render_vpn_status(f, &app),
                 Screen::Help => render_help(f, &app),
             }
             if app.wizard.active {
@@ -1250,6 +1318,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 _ => {}
                             },
                         },
+                        Screen::VpnStatus => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => { app.screen = Screen::Dashboard; app.focus = Focus::Fleet; }
+                            KeyCode::Char('b') => app.cycle_bg(),
+                            KeyCode::Char('c') => app.cycle_theme(),
+                            _ => {}
+                        },
                         Screen::TaskBoard => {
                             if app.task_input_active {
                                 match key.code {
@@ -1312,6 +1386,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('c') => app.cycle_theme(),
                                 KeyCode::Char('s') => app.cycle_sort(),
                                 KeyCode::Char('a') => { app.wizard.open(); }
+                                KeyCode::Char('o') => {
+                                    // OpenClaw fleet operations menu
+                                    app.status_message = "⏳ Running OC audit...".into();
+                                    let mut outdated = vec![];
+                                    let latest = "2026.2.21-2";
+                                    for agent in &app.agents {
+                                        if !agent.oc_version.is_empty() && agent.oc_version != latest && agent.oc_version != "?" {
+                                            outdated.push(format!("{} ({})", agent.name, agent.oc_version));
+                                        }
+                                    }
+                                    if outdated.is_empty() {
+                                        app.status_message = format!("✅ All agents on {}", latest);
+                                    } else {
+                                        app.status_message = format!("⚠️  {} outdated: {}", outdated.len(), outdated.join(", "));
+                                    }
+                                }
+                                KeyCode::Char('u') => {
+                                    // Bulk update OC on all agents
+                                    app.status_message = "🔄 Updating OpenClaw fleet-wide...".into();
+                                    for (i, agent) in app.agents.iter().enumerate() {
+                                        if agent.host == "localhost" || agent.host == app.self_ip { continue; }
+                                        let host = agent.host.clone();
+                                        let user = agent.ssh_user.clone();
+                                        let is_mac = agent.os.to_lowercase().contains("mac");
+                                        tokio::spawn(async move {
+                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                            let cmd = format!("{}sudo npm install -g openclaw@latest 2>&1 | tail -1", pfx);
+                                            let _ = tokio::time::timeout(
+                                                std::time::Duration::from_secs(60),
+                                                tokio::process::Command::new("ssh")
+                                                    .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                        &format!("{}@{}", user, host), &cmd])
+                                                    .output()
+                                            ).await;
+                                        });
+                                    }
+                                    app.status_message = "🔄 OC update dispatched to all agents (background)".into();
+                                }
+                                KeyCode::Char('g') => {
+                                    // Restart gateway on focused agent
+                                    if let Some(agent) = app.agents.get(app.selected) {
+                                        let host = agent.host.clone();
+                                        let user = agent.ssh_user.clone();
+                                        let name = agent.name.clone();
+                                        let is_mac = agent.os.to_lowercase().contains("mac");
+                                        app.status_message = format!("🔄 Restarting gateway on {}...", name);
+                                        tokio::spawn(async move {
+                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                            let cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
+                                            let _ = tokio::process::Command::new("ssh")
+                                                .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                    &format!("{}@{}", user, host), &cmd])
+                                                .output().await;
+                                        });
+                                    }
+                                }
+                                KeyCode::Char('v') => {
+                                    app.screen = Screen::VpnStatus;
+                                }
                                 KeyCode::Char('t') => {
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
