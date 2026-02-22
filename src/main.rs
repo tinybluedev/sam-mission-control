@@ -107,7 +107,7 @@ struct ChatLine {
 enum Focus { Fleet, Chat, AgentChat, Command }
 
 #[derive(PartialEq)]
-enum Screen { Dashboard, AgentDetail, TaskBoard, VpnStatus, Alerts, Help }
+enum Screen { Dashboard, AgentDetail, TaskBoard, SpawnManager, VpnStatus, Alerts, Help }
 
 #[derive(PartialEq, Clone, Copy)]
 enum SortMode { Name, Status, Location, Version, Latency }
@@ -248,6 +248,7 @@ struct App {
     detail_chat_area: Rect,
     fleet_row_start_y: u16,  // Y offset where first agent row starts
     // Splash
+    spawned_agents: Vec<db::SpawnedAgent>,
     show_splash: bool,
     splash_start: Instant,
     // Alerts
@@ -329,7 +330,7 @@ impl App {
             wizard: wizard::AgentWizard::new(),
             tasks: vec![], task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
-            show_splash: true, splash_start: Instant::now(),
+            spawned_agents: vec![], show_splash: true, splash_start: Instant::now(),
             config_text: None, config_scroll: 0,
             filter_active: false, filter_text: String::new(),
             alerts: vec![], alert_flash: None,
@@ -1701,6 +1702,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Screen::VpnStatus => render_vpn_status(f, &app),
                 Screen::Alerts => render_alerts(f, &app),
                 Screen::Help => render_help(f, &app),
+                Screen::SpawnManager => render_help(f, &app), // TODO: spawn manager screen
             }
             }
             // Config viewer overlay
@@ -1895,7 +1897,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     } else {
                     match app.screen {
-                        Screen::Help => { app.screen = Screen::Dashboard; }
+                        Screen::SpawnManager => { if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc { app.screen = Screen::Dashboard; } },
+                    Screen::Help => { app.screen = Screen::Dashboard; }
                         Screen::AgentDetail if app.config_text.is_some() => match key.code {
                             KeyCode::Esc => { app.config_text = None; }
                             KeyCode::PageUp | KeyCode::Up => { app.config_scroll = app.config_scroll.saturating_add(3); }
@@ -2231,6 +2234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('v') => {
                                     app.screen = Screen::VpnStatus;
                                 }
+                                KeyCode::Char('x') => app.screen = Screen::SpawnManager,
                                 KeyCode::Char('t') => {
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
