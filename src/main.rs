@@ -300,6 +300,8 @@ struct App {
     theme_name: ThemeName,
     bg_density: BgDensity,
     theme: Theme,
+    // Routing
+    routed_msg_ids: std::collections::HashSet<i64>,
     // Autocomplete
     ac_visible: bool,
     ac_matches: Vec<String>,
@@ -380,7 +382,7 @@ impl App {
             fleet_area: Rect::default(), chat_area: Rect::default(),
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
-            theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
+            theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(), ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
         }
     }
 
@@ -388,6 +390,43 @@ impl App {
     fn previous(&mut self) { if self.selected > 0 { self.selected -= 1; } }
 
     fn user(&self) -> String { std::env::var("SAM_USER").unwrap_or_else(|_| "operator".into()) }
+
+    /// Build a system prompt that gives agents awareness of the fleet and how to communicate
+    fn build_system_prompt(&self, target_agent: Option<&str>) -> String {
+        let agent_list: Vec<String> = self.agents.iter()
+            .map(|a| {
+                let status = format!("{}", a.status);
+                format!("  - @{} ({}{})", a.db_name, a.location,
+                    if status == "online" { "" } else { ", offline" })
+            })
+            .collect();
+
+        let context = if let Some(target) = target_agent {
+            format!("You are @{}. This is a direct message from the operator.", target)
+        } else {
+            "This is a broadcast message to all agents.".to_string()
+        };
+
+        format!(
+            "You are an AI agent in S.A.M Mission Control — a fleet management TUI.
+            {}
+
+            ## Fleet Agents
+{}
+
+            ## Communication
+            - To tag another agent in your response, use @agent-name (e.g. @nix, @cyber)
+            - Tagged agents will automatically receive your message
+            - Use this for delegation, questions, or coordination
+            - Keep responses concise — this is a terminal UI with limited width
+            - The operator\'s name is: {}
+",
+            context,
+            agent_list.join("
+"),
+            self.user()
+        )
+    }
 
     fn cycle_theme(&mut self) {
         self.theme_name = self.theme_name.next();
@@ -519,6 +558,7 @@ impl App {
 
         if let Some(pool) = &self.db_pool {
             let ids = db::send_broadcast(pool, &self.user(), &message, &agent_names).await.unwrap_or_default();
+            let sys_prompt = self.build_system_prompt(None);
             // Fire streaming AI requests to targeted agents (or all if broadcast)
             for (i, agent) in self.agents.iter().enumerate() {
                 if targeted && !agent_names.contains(&agent.db_name) { continue; }
@@ -531,6 +571,7 @@ impl App {
                     let bcast_host = agent.host.clone();
                     let bcast_user = agent.ssh_user.clone();
                     let bcast_port = agent.gateway_port;
+                    let sys_prompt = sys_prompt.clone();
                     tokio::spawn(async move {
                         let client = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(120))
@@ -539,7 +580,10 @@ impl App {
                         let body = serde_json::json!({
                             "model": "openclaw:main",
                             "stream": true,
-                            "messages": [{"role": "user", "content": msg}]
+                            "messages": [
+                                {"role": "system", "content": sys_prompt},
+                                {"role": "user", "content": msg}
+                            ]
                         });
                         let result = client.post(&url)
                             .header("Authorization", format!("Bearer {}", tok))
@@ -593,7 +637,10 @@ impl App {
                                 // SSH fallback (non-streaming)
                                 let body_nostream = serde_json::json!({
                                     "model": "openclaw:main",
-                                    "messages": [{"role": "user", "content": msg}]
+                                    "messages": [
+                                        {"role": "system", "content": sys_prompt},
+                                        {"role": "user", "content": msg}
+                                    ]
                                 });
                                 let ssh_cmd = format!(
                                     "curl -sS --connect-timeout 10 -m 55 http://localhost:{}/v1/chat/completions -H 'Authorization: Bearer {}' -H 'Content-Type: application/json' -d {}",
@@ -651,6 +698,7 @@ impl App {
         // Fire AI request via OpenClaw HTTP API (streaming)
         if let Some(tok) = token {
             let pool = self.db_pool.clone();
+            let sys_prompt = self.build_system_prompt(Some(&target));
             tokio::spawn(async move {
                 let url = format!("http://{}:{}/v1/chat/completions", host, port);
                 let client = reqwest::Client::builder()
@@ -663,7 +711,10 @@ impl App {
                 let body = serde_json::json!({
                     "model": "openclaw:main",
                     "stream": true,
-                    "messages": [{"role": "user", "content": message}]
+                    "messages": [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": message}
+                    ]
                 });
                 let result = client.post(&url)
                     .header("Authorization", format!("Bearer {}", tok))
@@ -757,10 +808,132 @@ impl App {
         self.agent_chat_scroll = 0;
     }
 
+    /// Check agent responses for @mentions and route them as new messages
+    async fn route_agent_mentions(&mut self, sender_agent: &str, response: &str) {
+        let mut mentioned: Vec<String> = Vec::new();
+        for word in response.split_whitespace() {
+            if let Some(name) = word.strip_prefix('@') {
+                // Clean trailing punctuation
+                let clean = name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
+                let clean_lower = clean.to_lowercase();
+                if clean_lower != sender_agent.to_lowercase()
+                    && self.agents.iter().any(|a| a.db_name.to_lowercase() == clean_lower)
+                    && !mentioned.contains(&clean_lower)
+                {
+                    mentioned.push(clean_lower);
+                }
+            }
+        }
+
+        if mentioned.is_empty() { return; }
+
+        // For each mentioned agent, forward the message
+        for target_name in &mentioned {
+            if let Some(agent) = self.agents.iter().find(|a| a.db_name.to_lowercase() == *target_name) {
+                if let Some(tok) = &agent.gateway_token {
+                    let pool = self.db_pool.clone();
+                    let url = format!("http://{}:{}/v1/chat/completions", agent.host, agent.gateway_port);
+                    let tok = tok.clone();
+                    let from = sender_agent.to_string();
+                    let msg = format!("[Message from @{}]: {}", sender_agent, response);
+                    let sys = self.build_system_prompt(Some(&agent.db_name));
+                    let target = agent.db_name.clone();
+
+                    // Write to chat history
+                    self.chat_history.push(ChatLine {
+                        sender: from.clone(), target: Some(target.clone()),
+                        message: format!("→ @{}", target), response: None,
+                        time: now_str(), status: "routing".into(), kind: "direct".into(),
+                    });
+
+                    let msg_id = if let Some(ref p) = pool {
+                        db::send_chat(p, &from, Some(&target), &format!("(routed from @{})", from)).await.unwrap_or(0)
+                    } else { 0 };
+
+                    tokio::spawn(async move {
+                        let client = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(120))
+                            .build().unwrap_or_default();
+                        if let Some(ref p) = pool { let _ = db::update_chat_status(p, msg_id, "connecting").await; }
+                        let body = serde_json::json!({
+                            "model": "openclaw:main",
+                            "stream": true,
+                            "messages": [
+                                {"role": "system", "content": sys},
+                                {"role": "user", "content": msg}
+                            ]
+                        });
+                        let result = client.post(&url)
+                            .header("Authorization", format!("Bearer {}", tok))
+                            .header("Content-Type", "application/json")
+                            .json(&body).send().await;
+                        match result {
+                            Ok(resp) => {
+                                use reqwest::header::CONTENT_TYPE;
+                                let ct = resp.headers().get(CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                                if ct.contains("text/event-stream") || ct.contains("text/plain") {
+                                    if let Some(ref p) = pool { let _ = db::update_chat_status(p, msg_id, "thinking").await; }
+                                    use futures_util::StreamExt;
+                                    let mut stream = resp.bytes_stream();
+                                    let mut full = String::new();
+                                    let mut last_write = std::time::Instant::now();
+                                    let mut got = false;
+                                    while let Some(chunk) = stream.next().await {
+                                        let chunk = match chunk { Ok(c) => c, Err(_) => break };
+                                        let text = String::from_utf8_lossy(&chunk);
+                                        for line in text.lines() {
+                                            let line = line.trim();
+                                            if line == "data: [DONE]" || !line.starts_with("data: ") { continue; }
+                                            if let Ok(j) = serde_json::from_str::<serde_json::Value>(&line[6..]) {
+                                                if let Some(c) = j["choices"][0]["delta"]["content"].as_str() {
+                                                    full.push_str(c); got = true;
+                                                }
+                                            }
+                                        }
+                                        if got && last_write.elapsed() > std::time::Duration::from_millis(300) {
+                                            if let Some(ref p) = pool { let _ = db::update_chat_partial(p, msg_id, &full).await; }
+                                            last_write = std::time::Instant::now();
+                                        }
+                                    }
+                                    if full.is_empty() { full = "(empty response)".into(); }
+                                    if let Some(ref p) = pool { let _ = db::respond_to_chat(p, msg_id, &full).await; }
+                                } else {
+                                    if let Some(ref p) = pool { let _ = db::update_chat_status(p, msg_id, "thinking").await; }
+                                    match resp.json::<serde_json::Value>().await {
+                                        Ok(j) => {
+                                            let r = j["choices"][0]["message"]["content"].as_str().unwrap_or("(no content)").to_string();
+                                            if let Some(ref p) = pool { let _ = db::respond_to_chat(p, msg_id, &r).await; }
+                                        }
+                                        Err(e) => { if let Some(ref p) = pool { let _ = db::respond_to_chat(p, msg_id, &format!("error: {}", e)).await; } }
+                                    }
+                                }
+                            }
+                            Err(e) => { if let Some(ref p) = pool { let _ = db::respond_to_chat(p, msg_id, &format!("unreachable: {}", e)).await; } }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     async fn poll_chat(&mut self) {
+        let mut to_route: Vec<(String, String)> = Vec::new();
         if let Some(pool) = &self.db_pool {
             // Global chat for dashboard
             if let Ok(msgs) = db::load_global_chat(pool, 100).await {
+                for m in &msgs {
+                    if m.status == "responded" && m.sender != self.user()
+                        && !self.routed_msg_ids.contains(&m.id)
+                    {
+                        if let Some(ref resp) = m.response {
+                            if resp.contains('@') {
+                                self.routed_msg_ids.insert(m.id);
+                                to_route.push((m.sender.clone(), resp.clone()));
+                            }
+                        }
+                    }
+                }
                 self.chat_history = msgs.iter().map(|m| ChatLine {
                     sender: m.sender.clone(), target: m.target.clone(),
                     message: m.message.clone(), response: m.response.clone(),
@@ -772,6 +945,18 @@ impl App {
             if self.screen == Screen::AgentDetail && self.selected < self.agents.len() {
                 let agent = &self.agents[self.selected].db_name;
                 if let Ok(msgs) = db::load_agent_chat(pool, agent, 100).await {
+                    for m in &msgs {
+                        if m.status == "responded" && m.sender != self.user()
+                            && !self.routed_msg_ids.contains(&m.id)
+                        {
+                            if let Some(ref resp) = m.response {
+                                if resp.contains('@') {
+                                    self.routed_msg_ids.insert(m.id);
+                                    to_route.push((m.sender.clone(), resp.clone()));
+                                }
+                            }
+                        }
+                    }
                     self.agent_chat_history = msgs.iter().map(|m| ChatLine {
                         sender: m.sender.clone(), target: m.target.clone(),
                         message: m.message.clone(), response: m.response.clone(),
@@ -780,6 +965,10 @@ impl App {
                     }).collect();
                 }
             }
+        }
+        // Route agent @mentions (outside db_pool borrow)
+        for (sender, response) in to_route {
+            self.route_agent_mentions(&sender, &response).await;
         }
     }
 
