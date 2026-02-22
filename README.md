@@ -28,6 +28,9 @@ A terminal-based fleet orchestration tool for managing distributed AI agents ove
 ### Keybindings
 ![Help](docs/screenshots/help.png)
 
+### Fleet Doctor
+![Doctor](docs/screenshots/doctor.png)
+
 ### CLI Status
 ![Status](docs/screenshots/status-cli.png)
 
