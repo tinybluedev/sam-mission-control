@@ -4714,8 +4714,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let msg = message.join(" ");
             return cli::send_chat(&agent, &msg).await.map_err(|e| e.into());
         }
-        Some(cli::Commands::Doctor { fix, agent }) => {
-            return cli::run_doctor(fix, agent.as_deref()).await.map_err(|e| e.into());
+        Some(cli::Commands::Doctor { fix, agent, fleet, json, quiet, timeout }) => {
+            if fleet {
+                let code = cli::run_doctor_fleet(fix, agent.as_deref(), json, quiet, timeout).await?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            } else {
+                cli::run_doctor(fix, agent.as_deref()).await?;
+            }
+            return Ok(());
         }
         Some(cli::Commands::Init { db_host, db_port, db_user, db_pass, db_name, self_ip }) => {
             return cli::run_init(db_host.as_deref(), db_port, db_user.as_deref(), db_pass.as_deref(), db_name.as_deref(), self_ip.as_deref()).await.map_err(|e| e.into());

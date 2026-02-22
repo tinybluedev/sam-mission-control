@@ -652,6 +652,12 @@ pub async fn complete_operation(pool: &Pool, id: i64, status: &str, output: Opti
     Ok(())
 }
 
+/// Record a completed fleet doctor run in `mc_operations`.
+pub async fn record_fleet_doctor_run(pool: &Pool, status: &str, output: &str) -> Result<(), mysql_async::Error> {
+    let id = create_operation(pool, "fleet", "doctor_fleet").await?;
+    complete_operation(pool, id, status, Some(output)).await
+}
+
 /// Mark all `running` operations that started more than 5 minutes ago as `interrupted`.
 /// Returns the number of rows updated.
 pub async fn mark_stale_operations_interrupted(pool: &Pool) -> Result<u64, mysql_async::Error> {
