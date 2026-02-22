@@ -339,6 +339,8 @@ struct App {
     theme_name: ThemeName,
     bg_density: BgDensity,
     theme: Theme,
+    // OC version tracking
+    latest_oc_version: String,
     // Routing
     routed_msg_ids: std::collections::HashSet<i64>,
     // Background chat poll
@@ -433,6 +435,7 @@ impl App {
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
+            latest_oc_version: String::new(),
         }
     }
 
@@ -2668,7 +2671,16 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             cells.push(Cell::from(mini_bar(a.ram_pct, 4)).style(Style::default().fg(mini_bar_color(a.ram_pct, t, 70.0, 85.0))));
             cells.push(Cell::from(mini_bar(a.disk_pct, 4)).style(Style::default().fg(mini_bar_color(a.disk_pct, t, 80.0, 90.0))));
         }
-        cells.push(Cell::from(a.oc_version.clone()).style(Style::default().fg(t.version)));
+        let ver_color = if a.oc_version.is_empty() || a.oc_version == "?" || a.oc_version == "unknown" {
+            t.text_dim
+        } else if !app.latest_oc_version.is_empty() && a.oc_version.contains(&app.latest_oc_version) {
+            t.status_online  // current
+        } else if !app.latest_oc_version.is_empty() {
+            Color::Yellow  // outdated
+        } else {
+            t.version
+        };
+        cells.push(Cell::from(a.oc_version.clone()).style(Style::default().fg(ver_color)));
         Row::new(cells).style(Style::default().bg(bg)).height(1)
     }).collect();
 
@@ -4685,31 +4697,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('u') => {
-                                    // Bulk update OC on all agents
-                                    app.status_message = "🔄 Updating OpenClaw fleet-wide...".into();
-                                    let targets: Vec<&Agent> = if app.multi_selected.is_empty() {
-                                        app.agents.iter().collect()
+                                    // Bulk update OC on outdated agents (or selected)
+                                    let latest = app.latest_oc_version.clone();
+                                    let targets: Vec<(String, String, String, bool, String)> = if app.multi_selected.is_empty() {
+                                        app.agents.iter()
+                                            .filter(|a| a.status == AgentStatus::Online)
+                                            .filter(|a| latest.is_empty() || !a.oc_version.contains(&latest))
+                                            .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"), a.oc_version.clone()))
+                                            .collect()
                                     } else {
-                                        app.multi_selected.iter().filter_map(|&i| app.agents.get(i)).collect()
+                                        app.multi_selected.iter()
+                                            .filter_map(|&i| app.agents.get(i))
+                                            .filter(|a| a.status == AgentStatus::Online)
+                                            .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"), a.oc_version.clone()))
+                                            .collect()
                                     };
-                                    for agent in targets {
-                                        if agent.host == "localhost" || agent.host == app.self_ip { continue; }
-                                        let host = agent.host.clone();
-                                        let user = agent.ssh_user.clone();
-                                        let is_mac = agent.os.to_lowercase().contains("mac");
-                                        tokio::spawn(async move {
-                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-                                            let cmd = format!("{}sudo npm install -g openclaw@latest 2>&1 | tail -1", pfx);
-                                            let _ = tokio::time::timeout(
-                                                std::time::Duration::from_secs(60),
-                                                tokio::process::Command::new("ssh")
-                                                    .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                                        &format!("{}@{}", user, host), &cmd])
-                                                    .output()
-                                            ).await;
-                                        });
+                                    if targets.is_empty() {
+                                        app.toast("✓ All agents already on latest version");
+                                    } else {
+                                        let count = targets.len();
+                                        app.toast(&format!("🔄 Updating {} agents to {}...", count, if latest.is_empty() { "latest".into() } else { latest.clone() }));
+                                        for (db_name, host, ssh_user, is_mac, old_ver) in targets {
+                                            if let Some(pool) = &app.db_pool {
+                                                let pool = pool.clone();
+                                                let sender = app.user();
+                                                let self_ip = app.self_ip.clone();
+                                                let latest = latest.clone();
+                                                tokio::spawn(async move {
+                                                    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                                    let cmd = format!("{}openclaw --version 2>/dev/null && sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1", pfx);
+                                                    let output = if host == "localhost" || host == self_ip {
+                                                        tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                                                    } else {
+                                                        tokio::time::timeout(
+                                                            std::time::Duration::from_secs(120),
+                                                            tokio::process::Command::new("ssh")
+                                                                .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                                    &format!("{}@{}", ssh_user, host), &cmd])
+                                                                .output()
+                                                        ).await.ok().and_then(|r| r.ok())
+                                                    };
+                                                    let response = output.map(|o| {
+                                                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                                        if s.is_empty() { "(no output)".into() } else { s.chars().take(500).collect::<String>() }
+                                                    }).unwrap_or_else(|| "Timeout".into());
+                                                    let msg = format!("🔄 update {} → {}", old_ver, latest);
+                                                    let _ = crate::db::send_direct(&pool, &sender, &db_name, &msg).await;
+                                                    if let Ok(mut conn) = pool.get_conn().await {
+                                                        use mysql_async::prelude::*;
+                                                        let _ = conn.exec_drop(
+                                                            "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                                                            (&response, &sender, &db_name),
+                                                        ).await;
+                                                    }
+                                                });
+                                            }
+                                        }
                                     }
-                                    app.status_message = "🔄 OC update dispatched to all agents (background)".into();
                                 }
                                 KeyCode::Char('U') => {
                                     // Update OC on single highlighted agent with feedback
@@ -4953,7 +4997,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Auto-refresh every 30s (non-blocking)
         if app.last_refresh.elapsed() > Duration::from_secs(30) && !app.refreshing {
-            app.start_refresh();
+            // Fetch latest OC version from npm
+        if let Ok(out) = tokio::process::Command::new("npm").args(["view", "openclaw", "version"]).output().await {
+            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !ver.is_empty() {
+                app.status_message = format!("Latest OpenClaw: {}", ver);
+                app.latest_oc_version = ver;
+            }
+        }
+        app.start_refresh();
         }
 
         // Poll tasks every 5s when on task board
