@@ -83,7 +83,7 @@ impl AgentWizard {
             display_name: String::new(),
             emoji: "🤖".into(),
             host: String::new(),
-            ssh_user: "papasmurf".into(),
+            ssh_user: "admin".into(),
             location: 0,
             error: None,
             ssh_result: None,

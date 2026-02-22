@@ -280,7 +280,7 @@ impl App {
     fn next(&mut self) { if self.selected < self.agents.len() - 1 { self.selected += 1; } }
     fn previous(&mut self) { if self.selected > 0 { self.selected -= 1; } }
 
-    fn user(&self) -> String { std::env::var("SAM_USER").unwrap_or_else(|_| "nick".into()) }
+    fn user(&self) -> String { std::env::var("SAM_USER").unwrap_or_else(|_| "operator".into()) }
 
     fn cycle_theme(&mut self) {
         self.theme_name = self.theme_name.next();
@@ -1188,7 +1188,7 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
 
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
-        Span::styled("Esc=back │ Headscale at vpn.tinyblue.dev │ v=VPN │ q=quit", Style::default().fg(t.text_dim)),
+        Span::styled("Esc=back │ Headscale at vpn.example.com │ v=VPN │ q=quit", Style::default().fg(t.text_dim)),
     ])).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(footer, outer[2]);
@@ -1881,7 +1881,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 let output = if host == "localhost" || host == self_ip {
                                                     tokio::process::Command::new("bash").args(["-c", cmd]).output().await.ok()
                                                 } else {
-                                                    let is_mac = host.contains("10.64.0.1") && !host.ends_with(".1");
+                                                    let is_mac = host.contains("mac") || host.contains("darwin");
                                                     let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
                                                     tokio::time::timeout(
                                                         std::time::Duration::from_secs(8),
