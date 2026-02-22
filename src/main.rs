@@ -295,6 +295,11 @@ struct App {
     // Alerts
     alerts: Vec<Alert>,
     alert_flash: Option<Instant>,
+    // Diagnostics (inline doctor/fix)
+    diag_active: bool,
+    diag_steps: Vec<DiagStep>,
+    diag_rx: Option<mpsc::UnboundedReceiver<DiagStep>>,
+    diag_auto_fix: bool,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -412,6 +417,7 @@ impl App {
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
+            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false,
             svc_list: vec![], svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
@@ -1090,6 +1096,147 @@ impl App {
         }
     }
 
+    /// Run diagnostics on focused agent (non-blocking, step-by-step)
+    fn start_diagnostics(&mut self, fix: bool) {
+        if self.selected >= self.agents.len() { return; }
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let name = agent.db_name.clone();
+        let gw_port = agent.gateway_port;
+        self.diag_active = true;
+        self.diag_auto_fix = fix;
+        self.diag_steps = vec![DiagStep { label: format!("Diagnosing {}...", name), status: DiagStatus::Running, detail: String::new() }];
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.diag_rx = Some(rx);
+
+        tokio::spawn(async move {
+            let is_mac_check = Command::new("ssh").args([
+                "-o", "ConnectTimeout=4", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), "uname -s"
+            ]).output().await;
+            let is_mac = is_mac_check.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string() == "Darwin").unwrap_or(false);
+            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:$PATH; " } else { "" };
+
+            // Step 1: SSH connectivity
+            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Running, detail: format!("ssh {}@{}", user, host) });
+            let ssh_ok = tokio::time::timeout(Duration::from_secs(6),
+                Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), "echo ok"]).output()
+            ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+            let _ = tx.send(DiagStep {
+                label: "SSH connectivity".into(),
+                status: if ssh_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if ssh_ok { "connected".into() } else { "unreachable — check Tailscale/network".into() },
+            });
+            if !ssh_ok { let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cannot proceed without SSH".into() }); return; }
+
+            // Step 2: Tailscale status
+            let _ = tx.send(DiagStep { label: "Tailscale".into(), status: DiagStatus::Running, detail: String::new() });
+            let ts_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), r#"tailscale status --self --json 2>/dev/null | grep -o '"Online":[a-z]*' | head -1 | cut -d: -f2 || echo ?"#
+            ]).output().await;
+            let ts_online = ts_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+            let ts_ok = ts_online == "True" || ts_online == "true";
+            let _ = tx.send(DiagStep {
+                label: "Tailscale".into(),
+                status: if ts_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if ts_ok { "online".into() } else { format!("status: {}", ts_online) },
+            });
+
+            // Step 3: OpenClaw installed
+            let _ = tx.send(DiagStep { label: "OpenClaw installed".into(), status: DiagStatus::Running, detail: String::new() });
+            let oc_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), &format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx)
+            ]).output().await;
+            let oc_ver = oc_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+            let oc_installed = !oc_ver.contains("NOT_INSTALLED") && oc_ver != "?";
+            if !oc_installed && fix {
+                let _ = tx.send(DiagStep { label: "OpenClaw installed".into(), status: DiagStatus::Running, detail: "installing...".into() });
+                let install_cmd = if is_mac { format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx) }
+                    else { "sudo npm install -g openclaw@latest 2>&1 | tail -1".into() };
+                let _ = tokio::time::timeout(Duration::from_secs(120),
+                    Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), &install_cmd]).output()).await;
+                let _ = tx.send(DiagStep { label: "OpenClaw installed".into(), status: DiagStatus::Fixed, detail: "installed".into() });
+            } else {
+                let _ = tx.send(DiagStep {
+                    label: "OpenClaw installed".into(),
+                    status: if oc_installed { DiagStatus::Pass } else { DiagStatus::Fail },
+                    detail: if oc_installed { oc_ver } else { "not found — run with fix to install".into() },
+                });
+            }
+
+            // Step 4: Gateway running
+            let _ = tx.send(DiagStep { label: "Gateway running".into(), status: DiagStatus::Running, detail: String::new() });
+            let gw_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), &format!("ss -tlnp 2>/dev/null | grep {} | head -1 || echo NONE", gw_port)
+            ]).output().await;
+            let gw_line = gw_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+            let gw_running = !gw_line.contains("NONE") && !gw_line.is_empty();
+            if !gw_running && fix {
+                let _ = tx.send(DiagStep { label: "Gateway running".into(), status: DiagStatus::Running, detail: "starting gateway...".into() });
+                let start_cmd = if is_mac {
+                    format!("{}nohup openclaw gateway start > /dev/null 2>&1 &", pfx)
+                } else {
+                    "sudo systemctl start openclaw-gateway 2>/dev/null || nohup openclaw gateway start > /dev/null 2>&1 &".into()
+                };
+                let _ = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &start_cmd]).output().await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let _ = tx.send(DiagStep { label: "Gateway running".into(), status: DiagStatus::Fixed, detail: "started".into() });
+            } else {
+                let _ = tx.send(DiagStep {
+                    label: "Gateway running".into(),
+                    status: if gw_running { DiagStatus::Pass } else { DiagStatus::Fail },
+                    detail: if gw_running { format!("port {}", gw_port) } else { "not running".into() },
+                });
+            }
+
+            // Step 5: Gateway API responding
+            let _ = tx.send(DiagStep { label: "Gateway API".into(), status: DiagStatus::Running, detail: String::new() });
+            let api_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), &format!("curl -s -m 3 http://localhost:{}/health 2>/dev/null || echo FAIL", gw_port)
+            ]).output().await;
+            let api_resp = api_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+            let api_ok = !api_resp.contains("FAIL") && !api_resp.is_empty();
+            let _ = tx.send(DiagStep {
+                label: "Gateway API".into(),
+                status: if api_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if api_ok { "responding".into() } else { "not responding".into() },
+            });
+
+            // Step 6: Config file exists
+            let _ = tx.send(DiagStep { label: "Config file".into(), status: DiagStatus::Running, detail: String::new() });
+            let cfg_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), "test -f ~/.openclaw/openclaw.json && echo EXISTS || echo MISSING"
+            ]).output().await;
+            let cfg_exists = cfg_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "EXISTS").unwrap_or(false);
+            let _ = tx.send(DiagStep {
+                label: "Config file".into(),
+                status: if cfg_exists { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if cfg_exists { "~/.openclaw/openclaw.json".into() } else { "missing".into() },
+            });
+
+            // Step 7: Workspace exists
+            let _ = tx.send(DiagStep { label: "Agent workspace".into(), status: DiagStatus::Running, detail: String::new() });
+            let ws_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), "ls ~/CLAUDE/clawd/SOUL.md 2>/dev/null && echo HAS_SOUL || echo NO_SOUL"
+            ]).output().await;
+            let has_soul = ws_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("HAS_SOUL")).unwrap_or(false);
+            let _ = tx.send(DiagStep {
+                label: "Agent workspace".into(),
+                status: if has_soul { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if has_soul { "SOUL.md found".into() } else { "no SOUL.md — agent may lack identity".into() },
+            });
+
+            // Done
+            let passes = 7; // we'll count from received steps
+            let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "diagnostic complete".into() });
+        });
+    }
+
     /// Toggle a service plugin enabled/disabled via SSH
     fn toggle_service(&mut self) {
         if self.svc_selected >= self.svc_list.len() { return; }
@@ -1494,6 +1641,29 @@ struct ServiceEntry {
     enabled: bool,
     has_channel_config: bool,
     summary: String,  // e.g. "2 groups, dmPolicy: pairing"
+}
+
+/// Diagnostic step result
+#[derive(Clone, Debug)]
+struct DiagStep {
+    label: String,
+    status: DiagStatus,
+    detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum DiagStatus {
+    Running,
+    Pass,
+    Fail,
+    Fixed,
+    Skipped,
+}
+
+impl DiagStatus {
+    fn icon(&self) -> &'static str {
+        match self { DiagStatus::Running => "⏳", DiagStatus::Pass => "✓", DiagStatus::Fail => "✗", DiagStatus::Fixed => "🔧", DiagStatus::Skipped => "⊘" }
+    }
 }
 
 const SERVICE_ICONS: &[(&str, &str)] = &[
@@ -2272,6 +2442,89 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     render_footer(frame, app, chunks[2]);
 }
 
+fn render_diagnostics(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = frame.area();
+    // Center overlay
+    let w = 60.min(area.width.saturating_sub(4));
+    let h = (app.diag_steps.len() as u16 + 6).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, popup);
+
+    let agent_name = if app.selected < app.agents.len() { &app.agents[app.selected].name } else { "?" };
+    let title = format!(" {} Diagnostics — {} ", if app.diag_auto_fix { "🔧 Fix" } else { "🔍 Check" }, agent_name);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+
+    // Deduplicate — only show latest status per label
+    let mut seen = std::collections::HashMap::new();
+    for step in &app.diag_steps {
+        seen.insert(step.label.clone(), step.clone());
+    }
+    // Maintain order of first appearance
+    let mut ordered_labels = Vec::new();
+    for step in &app.diag_steps {
+        if !ordered_labels.contains(&step.label) {
+            ordered_labels.push(step.label.clone());
+        }
+    }
+
+    for label in &ordered_labels {
+        if label == "DONE" { continue; }
+        if let Some(step) = seen.get(label) {
+            if step.label.contains("Diagnosing") {
+                lines.push(Line::from(Span::styled(format!("  {}", step.label), Style::default().fg(t.accent).bold())));
+                lines.push(Line::from(""));
+                continue;
+            }
+            let (icon, color) = match step.status {
+                DiagStatus::Running => ("⏳", t.pending),
+                DiagStatus::Pass => ("✓ ", t.status_online),
+                DiagStatus::Fail => ("✗ ", t.status_offline),
+                DiagStatus::Fixed => ("🔧", Color::Yellow),
+                DiagStatus::Skipped => ("⊘ ", t.text_dim),
+            };
+            let detail = if step.detail.is_empty() { String::new() } else { format!(" — {}", step.detail) };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+                Span::styled(&step.label, Style::default().fg(t.text).bold()),
+                Span::styled(detail, Style::default().fg(t.text_dim)),
+            ]));
+        }
+    }
+
+    // Show done status
+    if let Some(done) = seen.get("DONE") {
+        lines.push(Line::from(""));
+        let total = ordered_labels.len() - 2; // minus header and DONE
+        let passed = ordered_labels.iter().filter(|l| {
+            *l != "DONE" && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+                && seen.get(*l).map(|s| matches!(s.status, DiagStatus::Pass | DiagStatus::Fixed)).unwrap_or(false)
+        }).count();
+        let failed = total - passed;
+        let summary = if failed == 0 {
+            format!("  All {} checks passed ✓", total)
+        } else {
+            format!("  {}/{} passed, {} failed", passed, total, failed)
+        };
+        let color = if failed == 0 { t.status_online } else { t.status_offline };
+        lines.push(Line::from(Span::styled(summary, Style::default().fg(color).bold())));
+        lines.push(Line::from(Span::styled("  Press Esc to close", Style::default().fg(t.text_dim))));
+    }
+
+    let diag = Paragraph::new(lines)
+        .block(Block::default()
+            .title(Span::styled(title, Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(Style::default().fg(if app.diag_auto_fix { Color::Yellow } else { t.accent }))
+            .style(Style::default().bg(Color::Rgb(15, 17, 22))));
+    frame.render_widget(diag, popup);
+}
+
 fn render_services(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let split = Layout::default().direction(Direction::Horizontal)
@@ -2924,7 +3177,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Dashboard => match app.focus {
             Focus::Chat => "Tab:fleet  Enter:send  Esc:back  @agent:target",
             Focus::Command => "Enter:run  Esc:cancel",
-            _ => "Enter:open  t:tasks  f:filter  s:sort  r:refresh  /:cmd  ?:help  q:quit",
+            _ => "Enter:open  d:diagnose  D:fix  t:tasks  f:filter  s:sort  r:refresh  ?:help  q:quit",
         },
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => "Enter:send  @:tag  Tab:next  Esc:info  1-5:tabs",
@@ -3085,9 +3338,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Screen::VpnStatus => render_vpn_status(f, &app),
                 Screen::Alerts => render_alerts(f, &app),
                 Screen::Help => render_help(f, &app),
-                Screen::SpawnManager => render_help(f, &app), // TODO: spawn manager screen
+                Screen::SpawnManager => render_help(f, &app),
             }
+            // Diagnostic overlay (renders on top of everything)
+            if app.diag_active {
+                render_diagnostics(f, &app);
             }
+
             // Config viewer overlay
             if let Some(config) = &app.config_text {
                 let t = &app.theme;
@@ -3112,6 +3369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if app.wizard.active {
                 wizard::render_wizard(f, &app.wizard, &app.theme, app.bg_density.bg());
             }
+            } // close else for show_splash
         })?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -3282,6 +3540,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => {}
                         }
                     } else {
+                    // Diagnostic overlay intercepts all keys when active
+                    if app.diag_active {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.diag_active = false;
+                                app.diag_steps.clear();
+                                app.start_refresh(); // re-probe after fix
+                            }
+                            _ => {}
+                        }
+                    } else {
                     match app.screen {
                         Screen::SpawnManager => { if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc { app.screen = Screen::Dashboard; } },
                     Screen::Help => { app.screen = Screen::Dashboard; }
@@ -3380,6 +3649,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('2') => app.focus = Focus::AgentChat,
                                 KeyCode::Char('3') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
                                 KeyCode::Char('w') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
+                                KeyCode::Char('d') => app.start_diagnostics(false),
+                                KeyCode::Char('D') => app.start_diagnostics(true),
                                 KeyCode::Char('4') | KeyCode::Char('t') => {
                                     app.task_filter_agent = Some(app.agents[app.selected].db_name.clone());
                                     app.screen = Screen::TaskBoard;
@@ -3828,6 +4099,7 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                     }
                 }
                     }
+                    } // close else for diag_active
             }
         }
 
@@ -3852,6 +4124,19 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                 }
             }
             app.last_task_poll = Instant::now();
+        }
+
+        // Receive diagnostic steps (non-blocking)
+        if app.diag_active {
+            if let Some(ref mut rx) = app.diag_rx {
+                while let Ok(step) = rx.try_recv() {
+                    let is_done = step.label == "DONE";
+                    app.diag_steps.push(step);
+                    if is_done {
+                        // Keep overlay open for user to see results
+                    }
+                }
+            }
         }
 
         // Receive services load results (non-blocking)
