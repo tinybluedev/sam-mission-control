@@ -14,7 +14,7 @@ mod shell;
 use clap::Parser;
 use dotenvy;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, MouseEventKind, MouseButton},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, MouseButton},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -142,6 +142,7 @@ impl SortMode {
             Self::Latency => "latency",
         }
     }
+    fn arrow(&self) -> &str { "▲" }
 }
 
 struct ProbeResult {
@@ -268,6 +269,7 @@ struct App {
     agent_chat_scroll: u16,
     refresh_rx: Option<mpsc::UnboundedReceiver<ProbeResult>>,
     refreshing: bool,
+    refresh_cycle: u32,
     self_ip: String,
     // Fleet command
     command_input: String,
@@ -297,11 +299,13 @@ struct App {
     alerts: Vec<Alert>,
     alert_flash: Option<Instant>,
     alerts_scroll: u16,
+    gateway_confirm_at: Option<Instant>,
     // Diagnostics (inline doctor/fix)
     diag_active: bool,
     diag_steps: Vec<DiagStep>,
     diag_rx: Option<mpsc::UnboundedReceiver<DiagStep>>,
     diag_auto_fix: bool,
+    diag_start: Option<Instant>,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -327,6 +331,8 @@ struct App {
     // Config viewer
     config_text: Option<String>,
     config_scroll: u16,
+    // Help screen
+    help_scroll: u16,
     // Multi-select
     multi_selected: std::collections::HashSet<usize>,
     // Theme
@@ -338,6 +344,8 @@ struct App {
     // Background chat poll
     chat_poll_rx: Option<mpsc::UnboundedReceiver<ChatPollResult>>,
     chat_polling: bool,
+    // Wizard SSH test (background)
+    wizard_ssh_rx: Option<mpsc::UnboundedReceiver<String>>,
     // Autocomplete
     ac_visible: bool,
     ac_matches: Vec<String>,
@@ -405,30 +413,37 @@ impl App {
             db_pool: Some(pool),
             chat_input: String::new(), chat_history, chat_scroll: 0,
             agent_chat_input: String::new(), agent_chat_history: vec![], agent_chat_scroll: 0,
-            refresh_rx: None, refreshing: false, self_ip,
+            refresh_rx: None, refreshing: false, refresh_cycle: 0, self_ip,
             command_input: String::new(),
             wizard: wizard::AgentWizard::new(),
             tasks: vec![], task_filter_agent: None, task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
             spawned_agents: vec![], show_splash: true, splash_start: Instant::now(),
-            config_text: None, config_scroll: 0,
+            config_text: None, config_scroll: 0, help_scroll: 0,
             filter_active: false, filter_text: String::new(),
-            alerts: vec![], alert_flash: None, alerts_scroll: 0,
+            alerts: vec![], alert_flash: None, alerts_scroll: 0, gateway_confirm_at: None,
             multi_selected: HashSet::new(),
             spinner_frame: 0, sort_mode: SortMode::Name,
             fleet_area: Rect::default(), chat_area: Rect::default(),
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
-            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false,
+            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
-            ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
+            ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
+            ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
         }
     }
 
-    fn next(&mut self) { if self.selected < self.agents.len() - 1 { self.selected += 1; } }
-    fn previous(&mut self) { if self.selected > 0 { self.selected -= 1; } }
+    fn next(&mut self) {
+        if self.agents.is_empty() { return; }
+        self.selected = (self.selected + 1) % self.agents.len();
+    }
+    fn previous(&mut self) {
+        if self.agents.is_empty() { return; }
+        self.selected = self.selected.checked_sub(1).unwrap_or(self.agents.len() - 1);
+    }
 
     fn toast(&mut self, msg: &str) {
         self.toast_message = Some(msg.to_string());
@@ -736,8 +751,9 @@ impl App {
             kind: "direct".into(),
         });
 
-        // Store in DB
+        // Store in DB (fire-and-forget, get ID via channel)
         let msg_id = if let Some(pool) = &self.db_pool {
+            // Quick inline await is fine — single INSERT is <1ms on LAN MySQL
             db::send_chat(pool, &self.user(), Some(&target), &message).await.unwrap_or(0)
         } else { 0 };
 
@@ -1109,6 +1125,7 @@ impl App {
         let gw_port = agent.gateway_port;
         self.diag_active = true;
         self.diag_auto_fix = fix;
+        self.diag_start = Some(Instant::now());
         self.diag_steps = vec![DiagStep { label: format!("Diagnosing {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1128,12 +1145,96 @@ impl App {
                 Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), "echo ok"]).output()
             ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
-            let _ = tx.send(DiagStep {
-                label: "SSH connectivity".into(),
-                status: if ssh_ok { DiagStatus::Pass } else { DiagStatus::Fail },
-                detail: if ssh_ok { "connected".into() } else { "unreachable — check Tailscale/network".into() },
-            });
-            if !ssh_ok { let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cannot proceed without SSH".into() }); return; }
+
+            let ssh_ok = if !ssh_ok && fix {
+                // Attempt fix: check if we can ping the Tailscale IP
+                let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Running, detail: "unreachable — attempting fix...".into() });
+
+                // Check 1: Can we ping the host at all?
+                let ping_ok = tokio::time::timeout(Duration::from_secs(3),
+                    Command::new("ping").args(["-c", "1", "-W", "2", &host]).output()
+                ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+
+                if !ping_ok {
+                    let _ = tx.send(DiagStep { label: "  → Ping".into(), status: DiagStatus::Fail, detail: format!("{} not responding to ICMP", host) });
+
+                    // Try to restart Tailscale on our end for this route
+                    let _ = tx.send(DiagStep { label: "  → Tailscale route".into(), status: DiagStatus::Running, detail: "checking local Tailscale...".into() });
+                    let ts_status = Command::new("tailscale").args(["status", "--json"]).output().await;
+                    let peer_found = ts_status.as_ref().map(|o| {
+                        let s = String::from_utf8_lossy(&o.stdout);
+                        s.contains(&host)
+                    }).unwrap_or(false);
+
+                    if peer_found {
+                        let _ = tx.send(DiagStep { label: "  → Tailscale route".into(), status: DiagStatus::Pass, detail: "peer known to Tailscale".into() });
+                        // Try DERP relay ping
+                        let _ = tx.send(DiagStep { label: "  → Tailscale ping".into(), status: DiagStatus::Running, detail: "trying direct WireGuard...".into() });
+                        let ts_ping = tokio::time::timeout(Duration::from_secs(8),
+                            Command::new("tailscale").args(["ping", "--c", "1", "--timeout", "5s", &host]).output()
+                        ).await.ok().and_then(|r| r.ok());
+                        let ts_ping_ok = ts_ping.as_ref().map(|o| o.status.success()).unwrap_or(false);
+                        if ts_ping_ok {
+                            let ping_detail = ts_ping.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                            let _ = tx.send(DiagStep { label: "  → Tailscale ping".into(), status: DiagStatus::Pass, detail: ping_detail.chars().take(80).collect::<String>() });
+                            // WireGuard works but SSH doesn't — might be firewall or sshd
+                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                detail: "Tailscale reachable but SSH refused — check sshd on target".into() });
+                        } else {
+                            let _ = tx.send(DiagStep { label: "  → Tailscale ping".into(), status: DiagStatus::Fail, detail: "WireGuard unreachable".into() });
+                            // Machine is probably off or Tailscale is down on that end
+                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                detail: "machine offline or Tailscale down on target — cannot auto-fix".into() });
+                        }
+                    } else {
+                        let _ = tx.send(DiagStep { label: "  → Tailscale route".into(), status: DiagStatus::Fail,
+                            detail: format!("{} not in Tailscale peer list — may need re-enrollment", host) });
+                        let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                            detail: "not in mesh — needs Tailscale login on target machine".into() });
+                    }
+                    false
+                } else {
+                    // Ping works but SSH failed — try again with longer timeout
+                    let _ = tx.send(DiagStep { label: "  → Ping".into(), status: DiagStatus::Pass, detail: format!("{} responds to ping", host) });
+                    let _ = tx.send(DiagStep { label: "  → SSH retry".into(), status: DiagStatus::Running, detail: "retrying with 5s timeout...".into() });
+                    let retry = tokio::time::timeout(Duration::from_secs(8),
+                        Command::new("ssh").args(["-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                            &format!("{}@{}", user, host), "echo ok"]).output()
+                    ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+                    if retry {
+                        let _ = tx.send(DiagStep { label: "  → SSH retry".into(), status: DiagStatus::Pass, detail: "connected on retry".into() });
+                        let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fixed, detail: "connected (slow handshake)".into() });
+                        true
+                    } else {
+                        // Check if port 22 is open
+                        let port_check = tokio::time::timeout(Duration::from_secs(3),
+                            Command::new("bash").args(["-c", &format!("echo | nc -w 2 {} 22 2>/dev/null && echo OPEN || echo CLOSED", host)]).output()
+                        ).await.ok().and_then(|r| r.ok());
+                        let port_open = port_check.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("OPEN")).unwrap_or(false);
+                        if port_open {
+                            let _ = tx.send(DiagStep { label: "  → SSH retry".into(), status: DiagStatus::Fail, detail: "port 22 open but auth fails — check SSH keys".into() });
+                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                detail: "auth rejected — deploy SSH key with: ssh-copy-id".into() });
+                        } else {
+                            let _ = tx.send(DiagStep { label: "  → SSH retry".into(), status: DiagStatus::Fail, detail: "port 22 closed — sshd not running".into() });
+                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                detail: "sshd not running on target — needs manual start".into() });
+                        }
+                        false
+                    }
+                }
+            } else if ssh_ok {
+                let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Pass, detail: "connected".into() });
+                true
+            } else {
+                let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail, detail: "unreachable — press D to diagnose deeper".into() });
+                false
+            };
+
+            if !ssh_ok {
+                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cannot proceed without SSH — see details above".into() });
+                return;
+            }
 
             // Step 2: Tailscale status
             let _ = tx.send(DiagStep { label: "Tailscale".into(), status: DiagStatus::Running, detail: String::new() });
@@ -1435,6 +1536,7 @@ SAMEOF", path, path, escaped_content);
     fn start_refresh(&mut self) {
         if self.refreshing { return; }
         self.refreshing = true;
+        self.refresh_cycle += 1;
         self.last_refresh = Instant::now();
         let (tx, rx) = mpsc::unbounded_channel();
         self.refresh_rx = Some(rx);
@@ -1442,8 +1544,9 @@ SAMEOF", path, path, escaped_content);
         for (i, a) in self.agents.iter().enumerate() {
             let (host, user, sip) = (a.host.clone(), a.ssh_user.clone(), self.self_ip.clone());
             let tx = tx.clone();
+            let full = self.refresh_cycle % 5 == 0; // full probe every 5th cycle
             tokio::spawn(async move {
-                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx) = probe_agent(&host, &user, &sip).await;
+                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx) = probe_agent(&host, &user, &sip, full).await;
                 let _ = tx.send(ProbeResult { index: i, status, os, kernel: kern, oc_version: oc, latency_ms: lat, cpu_pct: cpu, ram_pct: ram, disk_pct: disk, activity: act, context_pct: ctx });
             });
         }
@@ -1563,8 +1666,21 @@ SAMEOF", path, path, escaped_content);
 
 // ---- SSH Probe ----
 
-async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, String, String, String, Option<u32>, Option<f32>, Option<f32>, Option<f32>, String, Option<f32>) {
+async fn probe_agent(host: &str, user: &str, self_ip: &str, full: bool) -> (AgentStatus, String, String, String, Option<u32>, Option<f32>, Option<f32>, Option<f32>, String, Option<f32>) {
     let start = Instant::now();
+    // Fast probe: just SSH echo (connectivity + latency only)
+    if !full && host != "localhost" && host != self_ip {
+        let tgt = format!("{}@{}", user, host);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            Command::new("ssh").args(["-o","ConnectTimeout=1","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"echo","ok"]).output()
+        ).await;
+        let ms = start.elapsed().as_millis() as u32;
+        return match result {
+            Ok(Ok(o)) if o.status.success() => (AgentStatus::Online, String::new(), String::new(), String::new(), Some(ms), None, None, None, String::new(), None),
+            _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None),
+        };
+    }
     if host == "localhost" || host == self_ip {
         let os = Command::new("bash").args(["-c", ". /etc/os-release 2>/dev/null && echo \"$NAME $VERSION_ID\" || echo unknown"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         let kern = Command::new("uname").arg("-r").output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
@@ -2027,8 +2143,8 @@ fn render_splash(frame: &mut Frame, app: &App) {
     let bg = Block::default().style(Style::default().bg(app.bg_density.bg()));
     frame.render_widget(bg, area);
 
-    let ver_line = format!("    v{} — {} agents in fleet", env!("CARGO_PKG_VERSION"), app.agents.len());
-    let online_line = format!("    {} online", app.agents.iter().filter(|a| a.status == AgentStatus::Online).count());
+    let ver_line = format!("v{} — {} agents in fleet", env!("CARGO_PKG_VERSION"), app.agents.len());
+    let online_line = format!("{} online", app.agents.iter().filter(|a| a.status == AgentStatus::Online).count());
     let logo: Vec<&str> = vec![
         "",
         r"    ____    _    __  __ ",
@@ -2038,26 +2154,26 @@ fn render_splash(frame: &mut Frame, app: &App) {
         r"   |____/_/   \_\_|  |_|",
         "",
         "",
-        "    S . A . M   M I S S I O N   C O N T R O L",
+        "S . A . M   M I S S I O N   C O N T R O L",
         "",
         &ver_line,
         &online_line,
         "",
-        "    Strange Artificial Machine — Fleet Orchestration TUI",
+        "Strange Artificial Machine — Fleet Orchestration TUI",
         "",
-        "    Press any key to continue...",
+        "Press any key to continue...",
     ];
 
-    // Animated gradient: cycle through blue shades using elapsed time
+    // Animated gradient: cycle through theme accent colors using elapsed time
     let elapsed_ms = app.splash_start.elapsed().as_millis() as u32;
     let phase = (elapsed_ms / 80) % 6;
     let gradient_colors = [
-        Color::Rgb(40, 140, 220),
-        Color::Rgb(60, 170, 255),
-        Color::Rgb(80, 200, 255),
-        Color::Rgb(100, 220, 255),
-        Color::Rgb(80, 200, 255),
-        Color::Rgb(60, 170, 255),
+        t.accent,
+        t.accent2,
+        t.header_title,
+        t.header_title,
+        t.accent2,
+        t.accent,
     ];
 
     let cy = area.height / 2;
@@ -2067,10 +2183,12 @@ fn render_splash(frame: &mut Frame, app: &App) {
         let y = start_y + i as u16;
         if y >= area.height { break; }
         let color = if i >= 1 && i <= 5 {
-            // Animated gradient on logo lines
+            // Animated gradient on logo lines using theme colors
             gradient_colors[((i as u32 + phase) % 6) as usize]
         } else if i == 8 {
             t.header_title
+        } else if i == logo.len() - 1 {
+            t.text
         } else {
             t.text_dim
         };
@@ -2262,9 +2380,13 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
         vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Length(12), Constraint::Min(10)]
     };
     let fleet_title = if app.filter_active {
-        format!(" ◆── Fleet 🔍 {} ──◆ ", app.filter_text)
+        if app.filter_text.is_empty() {
+            " ◆── Fleet 🔍 (type to search) ──◆ ".to_string()
+        } else {
+            format!(" ◆── Fleet 🔍 {} ──◆ ", app.filter_text)
+        }
     } else {
-        " ◆── Fleet ──◆ ".to_string()
+        format!(" ◆── Fleet [{}{}] ──◆ ", app.sort_mode.label(), app.sort_mode.arrow())
     };
     let table = Table::new(rows, widths).header(hrow)
     .block(Block::default().title(Span::styled(fleet_title, Style::default().fg(fb).bold()))
@@ -2459,9 +2581,37 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
 fn render_diagnostics(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let area = frame.area();
-    // Center overlay
-    let w = 60.min(area.width.saturating_sub(4));
-    let h = (app.diag_steps.len() as u16 + 6).min(area.height.saturating_sub(4));
+
+    // Deduplicate — only show latest status per label (computed first for sizing)
+    let mut seen: std::collections::HashMap<String, DiagStep> = std::collections::HashMap::new();
+    for step in &app.diag_steps {
+        seen.insert(step.label.clone(), step.clone());
+    }
+    let mut ordered_labels: Vec<String> = Vec::new();
+    for step in &app.diag_steps {
+        if !ordered_labels.contains(&step.label) {
+            ordered_labels.push(step.label.clone());
+        }
+    }
+
+    // Count check steps (excludes header "Diagnosing…" and "DONE")
+    let total_steps = ordered_labels.iter().filter(|l| {
+        *l != "DONE" && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+    }).count();
+    let done_count = ordered_labels.iter().filter(|l| {
+        *l != "DONE"
+            && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+            && seen.get(*l).map(|s| !matches!(s.status, DiagStatus::Running)).unwrap_or(false)
+    }).count();
+    let is_done = seen.contains_key("DONE");
+
+    // ~60% width; 58 is the minimum to fit the progress bar + step labels legibly
+    let w = ((area.width as f32 * 0.6) as u16).max(58).min(area.width.saturating_sub(4));
+    let content_h = ordered_labels.len().saturating_sub(1) as u16  // visible labels (DONE hidden)
+        + if total_steps > 0 { 2 } else { 0 }  // progress bar + blank
+        + if is_done { 3 } else { 2 }           // summary+hint or running hint
+        + 5;                                     // blanks + borders + padding
+    let h = content_h.min(area.height.saturating_sub(4)).max(8);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -2474,17 +2624,14 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
 
-    // Deduplicate — only show latest status per label
-    let mut seen = std::collections::HashMap::new();
-    for step in &app.diag_steps {
-        seen.insert(step.label.clone(), step.clone());
-    }
-    // Maintain order of first appearance
-    let mut ordered_labels = Vec::new();
-    for step in &app.diag_steps {
-        if !ordered_labels.contains(&step.label) {
-            ordered_labels.push(step.label.clone());
-        }
+    // Progress bar (step N / total)
+    if total_steps > 0 {
+        let bar_inner = w.saturating_sub(14) as usize;
+        let filled = (done_count * bar_inner / total_steps).min(bar_inner);
+        let empty = bar_inner - filled;
+        let bar = format!("  [{}{}] {}/{}", "█".repeat(filled), "░".repeat(empty), done_count, total_steps);
+        lines.push(Line::from(Span::styled(bar, Style::default().fg(t.accent))));
+        lines.push(Line::from(""));
     }
 
     for label in &ordered_labels {
@@ -2495,73 +2642,108 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
                 lines.push(Line::from(""));
                 continue;
             }
-            let (icon, color) = match step.status {
-                DiagStatus::Running => ("⏳", t.pending),
-                DiagStatus::Pass => ("✓ ", t.status_online),
-                DiagStatus::Fail => ("✗ ", t.status_offline),
-                DiagStatus::Fixed => ("🔧", Color::Yellow),
-                DiagStatus::Skipped => ("⊘ ", t.text_dim),
-            };
-            let detail = if step.detail.is_empty() { String::new() } else { format!(" — {}", step.detail) };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
-                Span::styled(&step.label, Style::default().fg(t.text).bold()),
-                Span::styled(detail, Style::default().fg(t.text_dim)),
-            ]));
+            if step.status == DiagStatus::Running {
+                let c = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+                let elapsed_str = app.diag_start
+                    .map(|s| format!(" {:.1}s", s.elapsed().as_secs_f64()))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", c), Style::default().fg(t.pending)),
+                    Span::styled(&step.label, Style::default().fg(t.text).bold()),
+                    Span::styled(format!("  running{}", elapsed_str), Style::default().fg(t.text_dim)),
+                ]));
+            } else {
+                let (icon, color) = match step.status {
+                    DiagStatus::Pass => ("✓ ", t.status_online),
+                    DiagStatus::Fail => ("✗ ", t.status_offline),
+                    DiagStatus::Fixed => ("🔧", t.status_busy),
+                    DiagStatus::Skipped => ("⊘ ", t.text_dim),
+                    DiagStatus::Running => ("⏳", t.pending),
+                };
+                let detail = if step.detail.is_empty() { String::new() } else { format!(" — {}", step.detail) };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+                    Span::styled(&step.label, Style::default().fg(t.text).bold()),
+                    Span::styled(detail, Style::default().fg(t.text_dim)),
+                ]));
+            }
         }
     }
 
-    // Show done status
-    if let Some(done) = seen.get("DONE") {
+    // Summary when done, or cancel hint while running
+    if is_done {
         lines.push(Line::from(""));
-        let total = ordered_labels.len() - 2; // minus header and DONE
         let passed = ordered_labels.iter().filter(|l| {
-            *l != "DONE" && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
-                && seen.get(*l).map(|s| matches!(s.status, DiagStatus::Pass | DiagStatus::Fixed)).unwrap_or(false)
+            *l != "DONE"
+                && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+                && seen.get(*l).map(|s| s.status == DiagStatus::Pass).unwrap_or(false)
         }).count();
-        let failed = total - passed;
-        let summary = if failed == 0 {
-            format!("  All {} checks passed ✓", total)
+        let fixed = ordered_labels.iter().filter(|l| {
+            *l != "DONE"
+                && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+                && seen.get(*l).map(|s| s.status == DiagStatus::Fixed).unwrap_or(false)
+        }).count();
+        let failed = ordered_labels.iter().filter(|l| {
+            *l != "DONE"
+                && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+                && seen.get(*l).map(|s| s.status == DiagStatus::Fail).unwrap_or(false)
+        }).count();
+        let summary = if failed == 0 && fixed == 0 {
+            format!("  All {} checks passed ✓", total_steps)
+        } else if fixed > 0 && failed == 0 {
+            format!("  {}/{} passed, {} fixed ✓", passed, total_steps, fixed)
+        } else if fixed > 0 {
+            format!("  {}/{} passed, {} fixed, {} failed", passed, total_steps, fixed, failed)
         } else {
-            format!("  {}/{} passed, {} failed", passed, total, failed)
+            format!("  {}/{} passed, {} failed", passed, total_steps, failed)
         };
         let color = if failed == 0 { t.status_online } else { t.status_offline };
         lines.push(Line::from(Span::styled(summary, Style::default().fg(color).bold())));
-        lines.push(Line::from(Span::styled("  Press Esc to close", Style::default().fg(t.text_dim))));
+        lines.push(Line::from(Span::styled("  Press Esc or q to close", Style::default().fg(t.text_dim))));
+    } else if total_steps > 0 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  Press Esc or q to cancel", Style::default().fg(t.text_dim))));
     }
 
     let diag = Paragraph::new(lines)
         .block(Block::default()
             .title(Span::styled(title, Style::default().fg(t.accent).bold()))
             .borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(Style::default().fg(if app.diag_auto_fix { Color::Yellow } else { t.accent }))
-            .style(Style::default().bg(Color::Rgb(15, 17, 22))));
+            .border_style(Style::default().fg(if app.diag_auto_fix { t.status_busy } else { t.accent }))
+            .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(diag, popup);
 }
 
 fn render_services(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let split = Layout::default().direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(40)])
+        .constraints([Constraint::Length(32), Constraint::Min(40)])
         .split(area);
 
-    // Left: service list
+    // Left: service list with status indicators
     let mut items: Vec<Line> = Vec::new();
-    items.push(Line::from(Span::styled("  🔌 Services & Plugins", Style::default().fg(t.header_title).bold())));
+    let agent_name = app.agents.get(app.selected).map(|a| a.name.as_str()).unwrap_or("?");
+    items.push(Line::from(Span::styled(format!("  🔌 {} Services", agent_name), Style::default().fg(t.header_title).bold())));
     items.push(Line::from(""));
 
     if app.svc_loading {
-        items.push(Line::from(Span::styled("  Loading config...", Style::default().fg(t.pending))));
+        items.push(Line::from(Span::styled("  ⏳ Loading config...", Style::default().fg(t.pending))));
     } else if app.svc_list.is_empty() {
-        items.push(Line::from(Span::styled("  No config loaded", Style::default().fg(t.text_dim))));
+        items.push(Line::from(Span::styled("  ⚠ No config found", Style::default().fg(t.status_offline))));
+        items.push(Line::from(""));
+        items.push(Line::from(Span::styled("  Press 'd' to run diagnostics", Style::default().fg(t.text_dim))));
+        items.push(Line::from(Span::styled("  or 'S' to setup OpenClaw", Style::default().fg(t.text_dim))));
     } else {
         for (i, svc) in app.svc_list.iter().enumerate() {
             let selected = i == app.svc_selected;
-            let prefix = if selected { " ▸ " } else { "   " };
-            let status_icon = if svc.name == "model" || svc.name == "gateway" {
-                "◆"
-            } else if svc.enabled { "●" } else { "○" };
-            let status_color = if svc.enabled { t.status_online } else { t.text_dim };
+            let prefix = if selected { " ▶ " } else { "   " };
+            let (status_icon, status_color) = if svc.name == "model" || svc.name == "gateway" {
+                ("◆", t.accent)
+            } else if svc.enabled {
+                ("●", t.status_online)
+            } else {
+                ("○", t.text_dim)
+            };
             let name_style = if selected {
                 Style::default().fg(Color::Black).bg(t.accent).bold()
             } else {
@@ -2577,8 +2759,13 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     items.push(Line::from(""));
-    items.push(Line::from(Span::styled("  ↑↓ select  Space toggle", Style::default().fg(t.text_dim))));
-    items.push(Line::from(Span::styled("  Enter details  r reload", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  ─── Quick Actions ───", Style::default().fg(t.border))));
+    items.push(Line::from(Span::styled("  Space  toggle on/off", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  g      restart gateway", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  d      run diagnostics", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  l      view gateway logs", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  e      edit raw config", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  r      reload", Style::default().fg(t.text_dim))));
 
     let list = Paragraph::new(items)
         .block(Block::default()
@@ -2588,7 +2775,7 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(list, split[0]);
 
-    // Right: service detail
+    // Right: contextual action panel (NOT raw JSON)
     let detail_lines = if app.svc_selected < app.svc_list.len() {
         let svc = &app.svc_list[app.svc_selected];
         let mut lines = vec![
@@ -2602,41 +2789,110 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("  Summary: ", Style::default().fg(t.text_bold).bold()),
-                Span::styled(&svc.summary, Style::default().fg(t.text)),
-            ]),
-            Line::from(""),
         ];
 
-        // Show raw config section if available
-        if let Some(ref config) = app.svc_config {
-            let section = if svc.name == "gateway" {
-                config.get("gateway")
-            } else if svc.name == "model" {
-                config.get("agents")
+        // Gateway: show status + actions
+        if svc.name == "gateway" {
+            lines.push(Line::from(Span::styled("  Status", Style::default().fg(t.text_bold).bold())));
+            // Parse summary for display
+            for part in svc.summary.split("  ") {
+                let part = part.trim();
+                if part.is_empty() { continue; }
+                let (icon, color) = if part.contains("token:✓") || part.contains("on") || part.contains("lan") {
+                    ("  ✓ ", t.status_online)
+                } else if part.contains("none") || part.contains("off") || part.contains("localhost") {
+                    ("  ⚠ ", Color::Yellow)
+                } else {
+                    ("  ◦ ", t.text)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(icon, Style::default().fg(color)),
+                    Span::styled(part, Style::default().fg(t.text)),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Actions", Style::default().fg(t.text_bold).bold())));
+            lines.push(Line::from(Span::styled("  [g] Restart gateway", Style::default().fg(t.accent))));
+            lines.push(Line::from(Span::styled("  [l] View recent logs", Style::default().fg(t.accent))));
+            lines.push(Line::from(Span::styled("  [e] Edit raw config", Style::default().fg(t.accent))));
+            lines.push(Line::from(""));
+            // Warnings
+            if let Some(ref config) = app.svc_config {
+                let bind = config.get("gateway").and_then(|g| g.get("bind")).and_then(|b| b.as_str()).unwrap_or("localhost");
+                if bind == "localhost" {
+                    lines.push(Line::from(Span::styled("  ⚠ bind=localhost — not reachable over Tailscale", Style::default().fg(Color::Yellow))));
+                    lines.push(Line::from(Span::styled("    Recommended: bind=lan or bind=0.0.0.0", Style::default().fg(t.text_dim))));
+                }
+                let chat = config.get("gateway").and_then(|g| g.get("chatCompletions"))
+                    .and_then(|c| c.get("enabled")).and_then(|e| e.as_bool()).unwrap_or(false);
+                if !chat {
+                    lines.push(Line::from(Span::styled("  ⚠ Chat completions API disabled", Style::default().fg(Color::Yellow))));
+                    lines.push(Line::from(Span::styled("    SAM chat requires this. Enable it?", Style::default().fg(t.text_dim))));
+                }
+                let has_token = config.get("gateway").and_then(|g| g.get("auth")).and_then(|a| a.get("token")).is_some();
+                if !has_token {
+                    lines.push(Line::from(Span::styled("  ⚠ No auth token set — API is open", Style::default().fg(Color::Yellow))));
+                }
+            }
+        } else if svc.name == "model" {
+            // Model: show current config
+            lines.push(Line::from(Span::styled("  Configuration", Style::default().fg(t.text_bold).bold())));
+            for part in svc.summary.split("  ") {
+                let part = part.trim();
+                if part.is_empty() { continue; }
+                lines.push(Line::from(Span::styled(format!("  ◦ {}", part), Style::default().fg(t.text))));
+            }
+            if let Some(ref config) = app.svc_config {
+                let ctx = config.get("agents").and_then(|a| a.get("defaults"))
+                    .and_then(|d| d.get("contextTokens")).and_then(|c| c.as_u64()).unwrap_or(0);
+                if ctx < 500_000 {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(format!("  ⚠ Context window {}K — consider 1000K", ctx/1000), Style::default().fg(Color::Yellow))));
+                }
+            }
+        } else {
+            // Plugin/channel service
+            lines.push(Line::from(Span::styled("  Status", Style::default().fg(t.text_bold).bold())));
+            if svc.enabled && svc.has_channel_config {
+                lines.push(Line::from(Span::styled("  ✓ Plugin enabled", Style::default().fg(t.status_online))));
+                lines.push(Line::from(Span::styled("  ✓ Channel configured", Style::default().fg(t.status_online))));
+                // Parse summary for details
+                for part in svc.summary.split("  ") {
+                    let part = part.trim();
+                    if part.is_empty() { continue; }
+                    lines.push(Line::from(Span::styled(format!("    {}", part), Style::default().fg(t.text))));
+                }
+            } else if svc.enabled && !svc.has_channel_config {
+                lines.push(Line::from(Span::styled("  ✓ Plugin enabled", Style::default().fg(t.status_online))));
+                lines.push(Line::from(Span::styled("  ⚠ No channel config", Style::default().fg(Color::Yellow))));
+                lines.push(Line::from(Span::styled("    This plugin won't work without channel settings", Style::default().fg(t.text_dim))));
+            } else if !svc.enabled && svc.has_channel_config {
+                lines.push(Line::from(Span::styled("  ✗ Plugin disabled", Style::default().fg(t.status_offline))));
+                lines.push(Line::from(Span::styled("  ✓ Channel config exists", Style::default().fg(t.text_dim))));
+                lines.push(Line::from(Span::styled("    Press Space to enable this plugin", Style::default().fg(t.text_dim))));
             } else {
-                // Show channel config if exists, otherwise plugin config
-                config.get("channels").and_then(|c| c.get(&svc.name))
-                    .or_else(|| config.get("plugins").and_then(|p| p.get("entries")).and_then(|e| e.get(&svc.name)))
-            };
+                lines.push(Line::from(Span::styled("  ✗ Plugin disabled", Style::default().fg(t.status_offline))));
+                lines.push(Line::from(Span::styled("  ✗ No channel config", Style::default().fg(t.text_dim))));
+            }
 
-            if let Some(section) = section {
-                lines.push(Line::from(Span::styled("  Configuration:", Style::default().fg(t.text_bold).bold())));
-                lines.push(Line::from(""));
-                let pretty = serde_json::to_string_pretty(section).unwrap_or_default();
-                for line in pretty.lines() {
-                    // Syntax highlight JSON
-                    let styled = if line.contains(':') {
-                        let parts: Vec<&str> = line.splitn(2, ':').collect();
-                        Line::from(vec![
-                            Span::styled(format!("  {}", parts[0]), Style::default().fg(t.accent)),
-                            Span::styled(format!(":{}", parts.get(1).unwrap_or(&"")), Style::default().fg(t.text)),
-                        ])
-                    } else {
-                        Line::from(Span::styled(format!("  {}", line), Style::default().fg(t.text_dim)))
-                    };
-                    lines.push(styled);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Actions", Style::default().fg(t.text_bold).bold())));
+            lines.push(Line::from(Span::styled(
+                if svc.enabled { "  [Space] Disable plugin" } else { "  [Space] Enable plugin" },
+                Style::default().fg(t.accent),
+            )));
+            lines.push(Line::from(Span::styled("  [e]     Edit raw config", Style::default().fg(t.accent))));
+
+            // Health warnings
+            if svc.enabled {
+                let has_token = svc.summary.contains("token:✓");
+                let has_bot_id = svc.summary.contains("botId:✓");
+                if !has_token {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled("  ⚠ No bot token configured", Style::default().fg(Color::Yellow))));
+                }
+                if !has_bot_id && (svc.name == "discord" || svc.name == "telegram") {
+                    lines.push(Line::from(Span::styled("  ⚠ No bot ID set", Style::default().fg(Color::Yellow))));
                 }
             }
         }
@@ -2739,8 +2995,15 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(file_panel, split[0]);
 
-    // Right: file content viewer
-    let content_text = if let Some(ref content) = app.ws_content {
+    // Right: file content viewer / editor
+    let content_text = if app.ws_editing {
+        app.ws_edit_buffer.lines().enumerate().map(|(i, line)| {
+            Line::from(vec![
+                Span::styled(format!("{:>4} │ ", i + 1), Style::default().fg(t.text_dim)),
+                Span::styled(line.to_string(), Style::default().fg(t.text)),
+            ])
+        }).collect::<Vec<_>>()
+    } else if let Some(ref content) = app.ws_content {
         let lines: Vec<Line> = content.lines().enumerate().map(|(i, line)| {
             Line::from(vec![
                 Span::styled(format!("{:>4} │ ", i + 1), Style::default().fg(t.text_dim)),
@@ -2757,7 +3020,14 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
         ]
     };
 
-    let file_title = if app.ws_selected < app.ws_files.len() {
+    let file_title = if app.ws_editing {
+        let name = if app.ws_selected < app.ws_files.len() {
+            format!(" ✏ EDITING: {} ", app.ws_files[app.ws_selected].name)
+        } else {
+            " ✏ EDITING ".to_string()
+        };
+        name
+    } else if app.ws_selected < app.ws_files.len() {
         format!(" {} {} ", app.ws_files[app.ws_selected].icon, app.ws_files[app.ws_selected].name)
     } else {
         " File Viewer ".to_string()
@@ -2766,9 +3036,9 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
     let viewer = Paragraph::new(content_text)
         .scroll((app.ws_content_scroll, 0))
         .block(Block::default()
-            .title(Span::styled(file_title, Style::default().fg(t.accent).bold()))
+            .title(Span::styled(file_title, Style::default().fg(if app.ws_editing { t.status_busy } else { t.accent }).bold()))
             .borders(Borders::ALL).border_type(t.border_type)
-            .border_style(Style::default().fg(t.border))
+            .border_style(Style::default().fg(if app.ws_editing { t.status_busy } else { t.border }))
             .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(viewer, split[1]);
 }
@@ -2833,7 +3103,7 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
 
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
-        Span::styled("Esc=back │ Headscale at vpn.example.com │ v=VPN │ q=quit", Style::default().fg(t.text_dim)),
+        Span::styled("Esc/q=back  │  b=bg  │  c=theme", Style::default().fg(t.text_dim)),
     ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(footer, outer[2]);
@@ -2842,7 +3112,7 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
 
 fn render_task_board(frame: &mut Frame, app: &App) {
     let filter_label = app.task_filter_agent.as_ref()
-        .map(|a| format!(" ({})", a)).unwrap_or_default();
+        .map(|a| format!(" — {}", a)).unwrap_or_else(|| " — All".to_string());
     let t = &app.theme;
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -2923,6 +3193,7 @@ fn render_task_board(frame: &mut Frame, app: &App) {
         };
 
         let desc: String = task.description.chars().take(30).collect();
+        let is_done = matches!(task.status.as_str(), "completed" | "failed");
 
         Row::new(vec![
             Cell::from(format!("{}{}", cursor, task.id)),
@@ -2930,7 +3201,11 @@ fn render_task_board(frame: &mut Frame, app: &App) {
             Cell::from(format!("{} {}", st_icon, task.status)).style(Style::default().fg(st_color)),
             Cell::from(task.assigned_agent.as_deref().unwrap_or("—").to_string()).style(Style::default().fg(t.accent2)),
             Cell::from(desc).style(Style::default().fg(t.text)),
-        ]).style(Style::default().bg(bg)).height(1)
+        ]).style(if is_done {
+            Style::default().bg(bg).fg(t.text_dim).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().bg(bg)
+        }).height(1)
     }).collect();
 
     let table = Table::new(rows, [
@@ -3009,11 +3284,16 @@ fn render_task_board(frame: &mut Frame, app: &App) {
     // New task input
     let input_active = app.task_input_active;
     let ib = if input_active { t.border_active } else { t.border };
-    let prompt = if input_active { " new task description ⏎ " } else { " n=new task  d=done  Esc=back " };
+    let prompt = if input_active { " new task description ⏎  Esc=cancel " } else { " n=new task  d=done  Esc=back " };
+    let show_placeholder = input_active && app.task_input.is_empty();
     let input = Paragraph::new(Line::from(vec![
         Span::styled(" › ", Style::default().fg(t.accent)),
-        Span::styled(&app.task_input, Style::default().fg(t.text)),
-        if input_active { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
+        if show_placeholder {
+            Span::styled("type description and press Enter…", Style::default().fg(t.text_dim))
+        } else {
+            Span::styled(&app.task_input, Style::default().fg(t.text))
+        },
+        if input_active && !show_placeholder { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
     ])).block(Block::default().title(prompt)
         .borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(ib))
@@ -3095,70 +3375,147 @@ fn render_alerts(frame: &mut Frame, app: &App) {
     frame.render_widget(footer, outer[2]);
 }
 
-fn render_help(frame: &mut Frame, app: &App) {
+fn render_spawn_manager(frame: &mut Frame, app: &App) {
     let t = &app.theme;
-    let sections = vec![
-        ("", ""),
-        ("DASHBOARD", ""),
-        ("  Tab", "Switch focus: Fleet ↔ Chat"),
-        ("  ↑↓ / j k", "Navigate fleet list"),
-        ("  Enter", "Open agent detail"),
-        ("  r", "Refresh all agents (SSH)"),
-        ("  s", "Sort: name → status → location → version"),
-        ("  t", "Task board"),
-        ("  v", "VPN mesh status"),
-        ("  w", "Alerts & warnings"),
-        ("  Space", "Toggle agent selection"),
-        ("  A (Shift)", "Select all agents"),
-        ("  N (Shift)", "Clear selection"),
-        ("  a", "New agent wizard"),
-        ("  /", "Fleet command (runs on all agents)"),
-        ("  g", "Restart gateway (selected)"),
-        ("  G (Shift)", "Investigate gateway (selected)"),
-        ("  o", "OpenClaw version audit"),
-        ("  u", "Bulk update OpenClaw"),
-        ("  g", "Restart gateway (selected agent)"),
-        ("  c", "Cycle color theme"),
-        ("  b", "Cycle background density"),
-        ("  q", "Quit"),
-        ("", ""),
-        ("AGENT DETAIL", ""),
-        ("  e", "View agent config (openclaw.json)"),
-        ("  Tab", "Switch: Info ↔ Chat"),
-        ("  Enter", "Send direct message"),
-        ("  Esc", "Back to dashboard"),
-        ("", ""),
-        ("TASK BOARD", ""),
-        ("  j / k", "Navigate tasks"),
-        ("  n", "Create new task"),
-        ("  d", "Mark done"),
-        ("  Esc", "Back"),
-        ("", ""),
-        ("MOUSE", ""),
-        ("  Click", "Focus panel / select agent"),
-        ("  Scroll", "Scroll chat panels"),
-        ("", ""),
-        ("THEMES (10)", "standard noir paper 1977 2077 matrix sunset arctic ocean ember"),
-        ("BACKGROUNDS", "dark medium light white terminal"),
+    let outer = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
+        .split(frame.area());
+
+    let bg_block = Block::default().style(Style::default().bg(app.bg_density.bg()));
+    frame.render_widget(bg_block, frame.area());
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("🤖 SPAWN MANAGER", Style::default().fg(t.header_title).bold()),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(header, outer[0]);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("  🚧 Coming Soon", Style::default().fg(t.accent).bold())),
+        Line::from(""),
+        Line::from(Span::styled("  Spawn Manager will allow you to:", Style::default().fg(t.text))),
+        Line::from(""),
+        Line::from(Span::styled("    • View spawned agent sessions and processes", Style::default().fg(t.text_dim))),
+        Line::from(Span::styled("    • Monitor agent name, spawn time, and status", Style::default().fg(t.text_dim))),
+        Line::from(Span::styled("    • Inspect active prompt / task per agent", Style::default().fg(t.text_dim))),
+        Line::from(Span::styled("    • Kill, respawn, or view output of agents", Style::default().fg(t.text_dim))),
     ];
 
-    let lines: Vec<Line> = sections.iter().map(|(l, r)| {
+    let body = Paragraph::new(lines)
+        .block(Block::default().title(Span::styled(" ◆── Spawn Manager ──◆ ", Style::default().fg(t.border_active).bold()))
+            .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(t.border_active))
+            .style(Style::default().bg(app.bg_density.bg()))
+            .padding(Padding::new(1, 1, 1, 0)));
+    frame.render_widget(body, outer[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Esc=back │ q=quit", Style::default().fg(t.text_dim)),
+    ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(footer, outer[2]);
+}
+
+fn render_help(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let theme_label = app.theme_name.label();
+    let version = env!("CARGO_PKG_VERSION");
+
+    // Category color helpers
+    let nav_style   = Style::default().fg(t.accent);          // navigation keys (cyan)
+    let act_style   = Style::default().fg(t.accent2);         // action keys (yellow/secondary)
+    let dest_style  = Style::default().fg(t.status_offline);  // destructive keys (red)
+    let dim_style   = Style::default().fg(t.text_dim);
+    let head_style  = Style::default().fg(t.accent).bold();
+    let text_style  = Style::default().fg(t.text);
+
+    // (key, description, key_style)
+    let sections: Vec<(&str, &str, Style)> = vec![
+        ("", "", dim_style),
+        // --- Global keys ---
+        ("GLOBAL", "", dim_style),
+        ("  ?", "Open this help screen", nav_style),
+        ("  q", "Quit", dest_style),
+        ("  c", "Cycle color theme", act_style),
+        ("  b", "Cycle background density", act_style),
+        ("", "", dim_style),
+        // --- Dashboard ---
+        ("DASHBOARD", "", dim_style),
+        ("  Tab", "Switch focus: Fleet ↔ Chat", nav_style),
+        ("  ↑↓ / j k", "Navigate fleet list", nav_style),
+        ("  Enter", "Open agent detail", nav_style),
+        ("  r", "Refresh all agents (SSH)", act_style),
+        ("  s", "Sort: name → status → location → version", act_style),
+        ("  f", "Filter fleet list", act_style),
+        ("  t", "Task board", nav_style),
+        ("  v", "VPN mesh status", nav_style),
+        ("  w", "Alerts & warnings", nav_style),
+        ("  Space", "Toggle agent selection", act_style),
+        ("  A (Shift)", "Select all agents", act_style),
+        ("  N (Shift)", "Clear selection", act_style),
+        ("  a", "New agent wizard", act_style),
+        ("  /", "Fleet command (runs on all agents)", act_style),
+        ("  g", "Restart gateway (selected)", act_style),
+        ("  G (Shift)", "Investigate gateway (selected)", act_style),
+        ("  o", "OpenClaw version audit", act_style),
+        ("  u", "Bulk update OpenClaw", act_style),
+        ("", "", dim_style),
+        // --- Agent Detail ---
+        ("AGENT DETAIL", "", dim_style),
+        ("  1-5", "Switch tabs: Info / Chat / Files / Tasks / Services", nav_style),
+        ("  Tab", "Switch: Info ↔ Chat", nav_style),
+        ("  e", "View agent config (openclaw.json)", act_style),
+        ("  d", "Run diagnostics", act_style),
+        ("  D (Shift)", "Run diagnostics + auto-fix", act_style),
+        ("  Enter", "Send direct message", act_style),
+        ("  Esc", "Back to dashboard", nav_style),
+        ("", "", dim_style),
+        // --- Task Board ---
+        ("TASK BOARD", "", dim_style),
+        ("  j / k", "Navigate tasks", nav_style),
+        ("  n", "Create new task", act_style),
+        ("  d", "Mark done", act_style),
+        ("  Esc", "Back", nav_style),
+        ("", "", dim_style),
+        // --- Mouse ---
+        ("MOUSE", "", dim_style),
+        ("  Click", "Focus panel / select agent", nav_style),
+        ("  Scroll", "Scroll chat panels", nav_style),
+    ];
+
+    let mut lines: Vec<Line> = sections.iter().map(|(l, r, style)| {
         if r.is_empty() && !l.is_empty() && !l.starts_with(' ') {
-            Line::from(Span::styled(format!("  {}", l), Style::default().fg(t.accent).bold()))
+            Line::from(Span::styled(format!("  {}", l), head_style))
         } else {
             Line::from(vec![
-                Span::styled(format!("  {:<14}", l), Style::default().fg(t.sender_self)),
-                Span::styled(r.to_string(), Style::default().fg(t.text)),
+                Span::styled(format!("  {:<14}", l), *style),
+                Span::styled(r.to_string(), text_style),
             ])
         }
     }).collect();
 
-    let help = Paragraph::new(lines).block(Block::default()
-        .title(Span::styled(" Help — press any key to close ", Style::default().fg(t.accent).bold()))
-        .borders(Borders::ALL).border_type(t.border_type)
-        .border_style(Style::default().fg(t.accent))
-        .style(Style::default().bg(app.bg_density.bg()))
-        .padding(Padding::new(2, 2, 1, 1)));
+    // Footer: theme and version info
+    lines.push(Line::from(vec![]));
+    lines.push(Line::from(vec![
+        Span::styled("  Theme: ", dim_style),
+        Span::styled(theme_label, Style::default().fg(t.accent2).bold()),
+        Span::styled("   Background: ", dim_style),
+        Span::styled(app.bg_density.label(), Style::default().fg(t.accent2).bold()),
+        Span::styled("   SAM v", dim_style),
+        Span::styled(version, Style::default().fg(t.text_bold).bold()),
+    ]));
+
+    let help = Paragraph::new(lines)
+        .scroll((app.help_scroll, 0))
+        .block(Block::default()
+            .title(Span::styled(" ◆── Help ──◆  Esc=close  ↑↓=scroll ", Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(t.border_type)
+            .border_style(Style::default().fg(t.accent))
+            .style(Style::default().bg(app.bg_density.bg()))
+            .padding(Padding::new(2, 2, 1, 1)));
     frame.render_widget(help, frame.area());
 }
 
@@ -3187,11 +3544,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
         Screen::Help => "Help".to_string(),
+        Screen::SpawnManager => "Dashboard › Spawn Manager".to_string(),
         _ => "Dashboard".to_string(),
     };
 
     // Build styled key hints (key highlighted, label dim)
     let keys: Vec<(&str, &str)> = match app.screen {
+        Screen::Dashboard if app.filter_active => vec![("type","filter"),("↑↓","navigate"),("⏎","apply"),("Esc","cancel")],
         Screen::Dashboard => match app.focus {
             Focus::Chat => vec![("Tab","fleet"),("⏎","send"),("@","target"),("Esc","back")],
             Focus::Command => vec![("⏎","run"),("Esc","cancel")],
@@ -3199,6 +3558,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         },
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
+            Focus::Workspace if app.ws_editing => vec![("^S","save"),("Esc","cancel edit")],
             Focus::Workspace => vec![("⏎","view"),("e","edit"),("r","reload"),("Esc","info"),("1-5","tabs")],
             Focus::Services => vec![("␣","toggle"),("r","reload"),("Esc","info"),("1-5","tabs")],
             _ => vec![("⏎","detail"),("d","check"),("D","fix"),("w","files"),("t","tasks"),("5","svc"),("Tab","chat"),("Esc","back")],
@@ -3209,6 +3569,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             vec![("n","new"),("d","done"),("Esc","back")]
         },
         Screen::Help => vec![("Esc","back"),("q","quit")],
+        Screen::SpawnManager => vec![("Esc","back"),("q","quit")],
         _ => vec![("Esc","back")],
     };
 
@@ -3364,7 +3725,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Screen::VpnStatus => render_vpn_status(f, &app),
                 Screen::Alerts => render_alerts(f, &app),
                 Screen::Help => render_help(f, &app),
-                Screen::SpawnManager => render_help(f, &app),
+                Screen::SpawnManager => render_spawn_manager(f, &app),
             }
             // Diagnostic overlay (renders on top of everything)
             if app.diag_active {
@@ -3403,7 +3764,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Splash dismiss
             if app.show_splash {
-                if let Event::Key(_) = &ev { app.show_splash = false; }
+                match &ev {
+                    Event::Key(_) | Event::Mouse(_) => { app.show_splash = false; }
+                    _ => {}
+                }
                 continue;
             }
 
@@ -3530,7 +3894,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         last_probe_at: None,
                                     });
                                     app.wizard.active = false;
-                                    app.status_message = format!("✅ Agent '{}' created", app.wizard.agent_name);
+                                    let created_name = app.wizard.agent_name.clone();
+                                    app.toast(&format!("✅ Agent '{}' created", created_name));
                                 }
                             }
                             KeyCode::Tab => {
@@ -3540,22 +3905,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let user = app.wizard.ssh_user.clone();
                                     app.wizard.testing_ssh = true;
                                     app.wizard.ssh_result = Some("Testing...".into());
-                                    let result = tokio::process::Command::new("ssh")
-                                        .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                            &format!("{}@{}", user, host), "hostname && openclaw --version 2>/dev/null || echo 'OC not found'"])
-                                        .output().await;
-                                    app.wizard.testing_ssh = false;
-                                    match result {
-                                        Ok(o) if o.status.success() => {
-                                            app.wizard.ssh_result = Some(format!("✅ {}", String::from_utf8_lossy(&o.stdout).trim()));
-                                        }
-                                        Ok(o) => {
-                                            app.wizard.ssh_result = Some(format!("❌ {}", String::from_utf8_lossy(&o.stderr).trim().chars().take(60).collect::<String>()));
-                                        }
-                                        Err(e) => {
-                                            app.wizard.ssh_result = Some(format!("❌ {}", e));
-                                        }
-                                    }
+                                    let (tx, rx) = mpsc::unbounded_channel();
+                                    app.wizard_ssh_rx = Some(rx);
+                                    tokio::spawn(async move {
+                                        let result = tokio::process::Command::new("ssh")
+                                            .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                &format!("{}@{}", user, host), "hostname && openclaw --version 2>/dev/null || echo 'OC not found'"])
+                                            .output().await;
+                                        let msg = match result {
+                                            Ok(o) if o.status.success() => format!("✅ {}", String::from_utf8_lossy(&o.stdout).trim()),
+                                            Ok(o) => format!("❌ {}", String::from_utf8_lossy(&o.stderr).trim().chars().take(60).collect::<String>()),
+                                            Err(e) => format!("❌ {}", e),
+                                        };
+                                        let _ = tx.send(msg);
+                                    });
                                 } else {
                                     // Tab = skip/advance
                                     app.wizard.advance();
@@ -3572,6 +3935,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Esc | KeyCode::Char('q') => {
                                 app.diag_active = false;
                                 app.diag_steps.clear();
+                                app.diag_rx = None;
+                                app.diag_start = None;
                                 app.start_refresh(); // re-probe after fix
                             }
                             _ => {}
@@ -3579,11 +3944,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                     match app.screen {
                         Screen::SpawnManager => { if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc { app.screen = Screen::Dashboard; } },
-                    Screen::Help => { app.screen = Screen::Dashboard; }
+                    Screen::Help => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => { app.screen = Screen::Dashboard; app.help_scroll = 0; }
+                            KeyCode::Up | KeyCode::Char('k') => { app.help_scroll = app.help_scroll.saturating_sub(1); }
+                            KeyCode::Down | KeyCode::Char('j') => { app.help_scroll = app.help_scroll.saturating_add(1); }
+                            KeyCode::PageUp => { app.help_scroll = app.help_scroll.saturating_sub(10); }
+                            KeyCode::PageDown => { app.help_scroll = app.help_scroll.saturating_add(10); }
+                            _ => {}
+                        },
                         Screen::AgentDetail if app.config_text.is_some() => match key.code {
                             KeyCode::Esc => { app.config_text = None; }
-                            KeyCode::PageUp | KeyCode::Up => { app.config_scroll = app.config_scroll.saturating_add(3); }
-                            KeyCode::PageDown | KeyCode::Down => { app.config_scroll = app.config_scroll.saturating_sub(3); }
+                            KeyCode::PageUp | KeyCode::Up => { app.config_scroll = app.config_scroll.saturating_sub(3); }
+                            KeyCode::PageDown | KeyCode::Down => { app.config_scroll = app.config_scroll.saturating_add(3); }
                             _ => { app.config_text = None; }
                         },
                         Screen::AgentDetail => match app.focus {
@@ -3598,18 +3970,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                 }
-                                KeyCode::Char('5') => { app.focus = Focus::Services; app.start_services_load(); }
                                 KeyCode::Char('5') => {} // already here
                                 KeyCode::Up => { if app.svc_selected > 0 { app.svc_selected -= 1; app.svc_detail_scroll = 0; } }
                                 KeyCode::Down => { if app.svc_selected < app.svc_list.len().saturating_sub(1) { app.svc_selected += 1; app.svc_detail_scroll = 0; } }
                                 KeyCode::Char(' ') => app.toggle_service(),
                                 KeyCode::Char('r') => app.start_services_load(),
+                                KeyCode::Char('d') => app.start_diagnostics(false),
+                                KeyCode::Char('D') => app.start_diagnostics(true),
+                                KeyCode::Char('g') => {
+                                    // Restart gateway from services tab
+                                    if let Some(agent) = app.agents.get(app.selected) {
+                                        let host = agent.host.clone();
+                                        let user = agent.ssh_user.clone();
+                                        let name = agent.name.clone();
+                                        let is_mac = agent.os.to_lowercase().contains("mac");
+                                        app.toast(&format!("🔄 Restarting gateway on {}...", name));
+                                        tokio::spawn(async move {
+                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                            let cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
+                                            let _ = tokio::process::Command::new("ssh")
+                                                .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                    &format!("{}@{}", user, host), &cmd])
+                                                .output().await;
+                                        });
+                                    }
+                                }
+                                KeyCode::Char('l') => {
+                                    // View gateway logs from services tab
+                                    if let Some(agent) = app.agents.get(app.selected) {
+                                        let host = agent.host.clone();
+                                        let user = agent.ssh_user.clone();
+                                        let self_ip = app.self_ip.clone();
+                                        let is_mac = agent.os.to_lowercase().contains("mac");
+                                        app.toast("📋 Fetching logs...");
+                                        let (tx, rx) = mpsc::unbounded_channel();
+                                        app.config_load_rx = Some(rx);
+                                        tokio::spawn(async move {
+                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                            let cmd = format!("{}journalctl -u openclaw-gateway --no-pager -n 30 --output=short-iso 2>/dev/null || openclaw gateway status 2>/dev/null || echo 'no logs available'", pfx);
+                                            let output = if host == "localhost" || host == self_ip {
+                                                tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                                            } else {
+                                                tokio::time::timeout(
+                                                    std::time::Duration::from_secs(5),
+                                                    tokio::process::Command::new("ssh")
+                                                        .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                            &format!("{}@{}", user, host), &cmd])
+                                                        .output()
+                                                ).await.ok().and_then(|r| r.ok())
+                                            };
+                                            let text = output.map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                                                .unwrap_or_else(|| "Timeout fetching logs".into());
+                                            let _ = tx.send(Some(text));
+                                        });
+                                    }
+                                }
+                                KeyCode::Char('e') => {
+                                    // Open raw config viewer
+                                    if let Some(ref config) = app.svc_config {
+                                        let pretty = serde_json::to_string_pretty(config).unwrap_or_default();
+                                        app.config_text = Some(pretty);
+                                        app.config_scroll = 0;
+                                    }
+                                }
                                 KeyCode::PageUp => app.svc_detail_scroll = app.svc_detail_scroll.saturating_add(5),
                                 KeyCode::PageDown => app.svc_detail_scroll = app.svc_detail_scroll.saturating_sub(5),
                                 KeyCode::Char('q') => app.should_quit = true,
                                 _ => {}
                             },
-                            Focus::Workspace => match key.code {
+                            Focus::Workspace => if app.ws_editing {
+                                match key.code {
+                                    KeyCode::Esc => { app.ws_editing = false; }
+                                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => app.start_file_save(),
+                                    KeyCode::Enter => { app.ws_edit_buffer.push('\n'); }
+                                    KeyCode::Backspace => { app.ws_edit_buffer.pop(); }
+                                    KeyCode::Char(c) => { app.ws_edit_buffer.push(c); }
+                                    _ => {}
+                                }
+                            } else { match key.code {
                                 KeyCode::Esc => app.focus = Focus::Fleet,
                                 KeyCode::Tab => app.focus = Focus::Fleet,
                                 KeyCode::Char('1') => app.focus = Focus::Fleet,
@@ -3637,7 +4075,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::PageDown => app.ws_content_scroll = app.ws_content_scroll.saturating_sub(5),
                                 KeyCode::Char('q') => app.should_quit = true,
                                 _ => {}
-                            },
+                            }}
                             Focus::AgentChat => if app.ac_visible {
                                 match key.code {
                                     KeyCode::Up => { if app.ac_selected > 0 { app.ac_selected -= 1; } else { app.ac_selected = app.ac_matches.len().saturating_sub(1); } }
@@ -3673,19 +4111,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Tab => app.focus = Focus::AgentChat,
                                 KeyCode::Char('1') => app.focus = Focus::Fleet,
                                 KeyCode::Char('2') => app.focus = Focus::AgentChat,
-                                KeyCode::Char('3') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
-                                KeyCode::Char('w') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
-                                KeyCode::Char('d') => app.start_diagnostics(false),
-                                KeyCode::Char('D') => app.start_diagnostics(true),
+                                KeyCode::Char('3') | KeyCode::Char('w') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
                                 KeyCode::Char('4') | KeyCode::Char('t') => {
                                     app.task_filter_agent = Some(app.agents[app.selected].db_name.clone());
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                 }
-                                KeyCode::Char('q') => app.should_quit = true,
-                                KeyCode::Char('r') => app.start_refresh(),
+                                KeyCode::Char('5') => { app.focus = Focus::Services; app.start_services_load(); }
                                 KeyCode::Char('d') => app.start_diagnostics(false),
                                 KeyCode::Char('D') => app.start_diagnostics(true),
+                                KeyCode::Char('q') => app.should_quit = true,
+                                KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('e') => {
                                     // Fetch remote config (non-blocking)
@@ -3779,15 +4215,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Screen::TaskBoard => {
                             if app.task_input_active {
                                 match key.code {
-                                    KeyCode::Esc => app.task_input_active = false,
+                                    KeyCode::Esc => { app.task_input_active = false; app.task_input.clear(); }
                                     KeyCode::Enter => {
                                         if !app.task_input.trim().is_empty() {
                                             let desc = app.task_input.clone();
                                             app.task_input.clear();
                                             app.task_input_active = false;
                                             if let Some(pool) = &app.db_pool {
-                                                let agent = app.task_filter_agent.as_deref(); let _ = db::create_task(pool, &desc, 5, &app.user(), agent).await;
-if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
+                                                let pool = pool.clone();
+                                                let agent = app.task_filter_agent.clone();
+                                                let user = app.user();
+                                                tokio::spawn(async move {
+                                                    let _ = db::create_task(&pool, &desc, 5, &user, agent.as_deref()).await;
+                                                });
+                                                // Trigger re-poll on next tick
+                                                app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                             }
                                             app.toast("✓ Task created");
                                         }
@@ -3820,9 +4262,17 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                         if let Some(task) = app.tasks.get(app.task_selected) {
                                             let tid = task.id;
                                             if let Some(pool) = &app.db_pool {
-                                                let _ = db::update_task_status(pool, tid, "completed").await;
-                                                if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
+                                                let pool = pool.clone();
+                                                tokio::spawn(async move {
+                                                    let _ = db::update_task_status(&pool, tid, "completed").await;
+                                                });
+                                                // Mark completed locally (optimistic)
+                                                if let Some(t) = app.tasks.get_mut(app.task_selected) {
+                                                    t.status = "completed".into();
+                                                }
+                                                app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                             }
+                                            app.toast(&format!("✓ Task #{} marked complete", tid));
                                         }
                                     }
                                     KeyCode::Char('c') if app.task_filter_agent.is_some() => {
@@ -3874,7 +4324,7 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                 KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('c') => app.cycle_theme(),
-                                KeyCode::Char('s') => app.cycle_sort(),
+                                KeyCode::Char('s') => { app.cycle_sort(); app.toast(&format!("Sort: {}{}", app.sort_mode.label(), app.sort_mode.arrow())); }
                                 KeyCode::Char('a') => { app.wizard.open(); }
                                 KeyCode::Char('A') => {
                                     // Select all
@@ -3997,21 +4447,30 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                     }
                                 }
                                 KeyCode::Char('g') => {
-                                    // Restart gateway on focused agent
+                                    // Restart gateway on focused agent — requires two presses within 5s
                                     if let Some(agent) = app.agents.get(app.selected) {
-                                        let host = agent.host.clone();
-                                        let user = agent.ssh_user.clone();
                                         let name = agent.name.clone();
-                                        let is_mac = agent.os.to_lowercase().contains("mac");
-                                        app.status_message = format!("🔄 Restarting gateway on {}...", name);
-                                        tokio::spawn(async move {
-                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-                                            let cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
-                                            let _ = tokio::process::Command::new("ssh")
-                                                .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                                    &format!("{}@{}", user, host), &cmd])
-                                                .output().await;
-                                        });
+                                        let confirmed = app.gateway_confirm_at
+                                            .map(|t| t.elapsed().as_secs() < 5)
+                                            .unwrap_or(false);
+                                        if confirmed {
+                                            app.gateway_confirm_at = None;
+                                            let host = agent.host.clone();
+                                            let user = agent.ssh_user.clone();
+                                            let is_mac = agent.os.to_lowercase().contains("mac");
+                                            app.status_message = format!("🔄 Restarting gateway on {}...", name);
+                                            tokio::spawn(async move {
+                                                let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                                let cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
+                                                let _ = tokio::process::Command::new("ssh")
+                                                    .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                        &format!("{}@{}", user, host), &cmd])
+                                                    .output().await;
+                                            });
+                                        } else {
+                                            app.gateway_confirm_at = Some(Instant::now());
+                                            app.toast(&format!("⚠ Press g again to restart gateway on {}", name));
+                                        }
                                     }
                                 }
                                 KeyCode::Char('w') => {
@@ -4169,6 +4628,15 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                         // Keep overlay open for user to see results
                     }
                 }
+            }
+        }
+
+        // Receive wizard SSH test result (non-blocking)
+        if let Some(ref mut rx) = app.wizard_ssh_rx {
+            if let Ok(result) = rx.try_recv() {
+                app.wizard.testing_ssh = false;
+                app.wizard.ssh_result = Some(result);
+                app.wizard_ssh_rx = None;
             }
         }
 
