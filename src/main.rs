@@ -306,6 +306,7 @@ struct App {
     svc_config: Option<serde_json::Value>,  // Full openclaw.json
     svc_loading: bool,
     svc_load_rx: Option<mpsc::UnboundedReceiver<Option<serde_json::Value>>>,
+    config_load_rx: Option<mpsc::UnboundedReceiver<Option<String>>>,
     svc_detail_scroll: u16,
     // Workspace (agent file management)
     ws_files: Vec<WorkspaceFile>,
@@ -418,7 +419,7 @@ impl App {
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
             diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false,
-            svc_list: vec![], svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
+            svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
         }
@@ -693,7 +694,7 @@ impl App {
                                 let response = match tokio::time::timeout(
                                     std::time::Duration::from_secs(60),
                                     tokio::process::Command::new("ssh")
-                                        .args(["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                                        .args(["-o", "ConnectTimeout=2", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                                             &format!("{}@{}", bcast_user, bcast_host), &ssh_cmd])
                                         .output()
                                 ).await {
@@ -974,9 +975,9 @@ impl App {
 
         tokio::spawn(async move {
             let output = tokio::time::timeout(
-                Duration::from_secs(8),
+                Duration::from_secs(5),
                 Command::new("ssh").args([
-                    "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), "cat ~/.openclaw/openclaw.json 2>/dev/null || echo null",
                 ]).output()
             ).await;
@@ -1113,7 +1114,7 @@ impl App {
 
         tokio::spawn(async move {
             let is_mac_check = Command::new("ssh").args([
-                "-o", "ConnectTimeout=4", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), "uname -s"
             ]).output().await;
             let is_mac = is_mac_check.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string() == "Darwin").unwrap_or(false);
@@ -1122,7 +1123,7 @@ impl App {
             // Step 1: SSH connectivity
             let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Running, detail: format!("ssh {}@{}", user, host) });
             let ssh_ok = tokio::time::timeout(Duration::from_secs(6),
-                Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), "echo ok"]).output()
             ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
             let _ = tx.send(DiagStep {
@@ -1134,7 +1135,7 @@ impl App {
 
             // Step 2: Tailscale status
             let _ = tx.send(DiagStep { label: "Tailscale".into(), status: DiagStatus::Running, detail: String::new() });
-            let ts_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+            let ts_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), r#"tailscale status --self --json 2>/dev/null | grep -o '"Online":[a-z]*' | head -1 | cut -d: -f2 || echo ?"#
             ]).output().await;
             let ts_online = ts_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
@@ -1147,7 +1148,7 @@ impl App {
 
             // Step 3: OpenClaw installed
             let _ = tx.send(DiagStep { label: "OpenClaw installed".into(), status: DiagStatus::Running, detail: String::new() });
-            let oc_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+            let oc_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), &format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx)
             ]).output().await;
             let oc_ver = oc_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
@@ -1157,7 +1158,7 @@ impl App {
                 let install_cmd = if is_mac { format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx) }
                     else { "sudo npm install -g openclaw@latest 2>&1 | tail -1".into() };
                 let _ = tokio::time::timeout(Duration::from_secs(120),
-                    Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                         &format!("{}@{}", user, host), &install_cmd]).output()).await;
                 let _ = tx.send(DiagStep { label: "OpenClaw installed".into(), status: DiagStatus::Fixed, detail: "installed".into() });
             } else {
@@ -1170,7 +1171,7 @@ impl App {
 
             // Step 4: Gateway running
             let _ = tx.send(DiagStep { label: "Gateway running".into(), status: DiagStatus::Running, detail: String::new() });
-            let gw_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+            let gw_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), &format!("ss -tlnp 2>/dev/null | grep {} | head -1 || echo NONE", gw_port)
             ]).output().await;
             let gw_line = gw_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
@@ -1182,7 +1183,7 @@ impl App {
                 } else {
                     "sudo systemctl start openclaw-gateway 2>/dev/null || nohup openclaw gateway start > /dev/null 2>&1 &".into()
                 };
-                let _ = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                let _ = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), &start_cmd]).output().await;
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 let _ = tx.send(DiagStep { label: "Gateway running".into(), status: DiagStatus::Fixed, detail: "started".into() });
@@ -1196,7 +1197,7 @@ impl App {
 
             // Step 5: Gateway API responding
             let _ = tx.send(DiagStep { label: "Gateway API".into(), status: DiagStatus::Running, detail: String::new() });
-            let api_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+            let api_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), &format!("curl -s -m 3 http://localhost:{}/health 2>/dev/null || echo FAIL", gw_port)
             ]).output().await;
             let api_resp = api_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
@@ -1209,7 +1210,7 @@ impl App {
 
             // Step 6: Config file exists
             let _ = tx.send(DiagStep { label: "Config file".into(), status: DiagStatus::Running, detail: String::new() });
-            let cfg_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+            let cfg_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), "test -f ~/.openclaw/openclaw.json && echo EXISTS || echo MISSING"
             ]).output().await;
             let cfg_exists = cfg_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "EXISTS").unwrap_or(false);
@@ -1221,7 +1222,7 @@ impl App {
 
             // Step 7: Workspace exists
             let _ = tx.send(DiagStep { label: "Agent workspace".into(), status: DiagStatus::Running, detail: String::new() });
-            let ws_out = Command::new("ssh").args(["-o","ConnectTimeout=4","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+            let ws_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), "ls ~/CLAUDE/clawd/SOUL.md 2>/dev/null && echo HAS_SOUL || echo NO_SOUL"
             ]).output().await;
             let has_soul = ws_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("HAS_SOUL")).unwrap_or(false);
@@ -1265,9 +1266,9 @@ print('ok')
 
         tokio::spawn(async move {
             let _ = tokio::time::timeout(
-                Duration::from_secs(8),
+                Duration::from_secs(5),
                 Command::new("ssh").args([
-                    "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), &cmd,
                 ]).output()
             ).await;
@@ -1301,7 +1302,7 @@ print('ok')
             let output = tokio::time::timeout(
                 Duration::from_secs(10),
                 Command::new("ssh").args([
-                    "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), &check_cmd,
                 ]).output()
             ).await;
@@ -1335,9 +1336,9 @@ print('ok')
 
             // Crons
             let cron_output = tokio::time::timeout(
-                Duration::from_secs(8),
+                Duration::from_secs(5),
                 Command::new("ssh").args([
-                    "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), "openclaw cron list --json 2>/dev/null || echo '[]'",
                 ]).output()
             ).await;
@@ -1379,9 +1380,9 @@ print('ok')
 
         tokio::spawn(async move {
             let output = tokio::time::timeout(
-                Duration::from_secs(8),
+                Duration::from_secs(5),
                 Command::new("ssh").args([
-                    "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), &format!("cat '{}'", path),
                 ]).output()
             ).await;
@@ -1417,7 +1418,7 @@ SAMEOF", path, path, escaped_content);
             let _ = tokio::time::timeout(
                 Duration::from_secs(10),
                 Command::new("ssh").args([
-                    "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), &cmd,
                 ]).output()
             ).await;
@@ -1465,7 +1466,7 @@ SAMEOF", path, path, escaped_content);
                 }
             }
         }
-        if self.refreshing && self.last_refresh.elapsed() > Duration::from_secs(8) {
+        if self.refreshing && self.last_refresh.elapsed() > Duration::from_secs(5) {
             self.refreshing = false;
         }
         updates
@@ -1575,8 +1576,8 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, Str
     let tgt = format!("{}@{}", user, host);
     let script = r#"OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; ACT=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
     let result = tokio::time::timeout(
-        Duration::from_secs(8),
-        Command::new("ssh").args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"bash","-c",script]).output()
+        Duration::from_secs(5),
+        Command::new("ssh").args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"bash","-c",script]).output()
     ).await;
     let result = match result {
         Ok(r) => r,
@@ -3524,7 +3525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.wizard.testing_ssh = true;
                                     app.wizard.ssh_result = Some("Testing...".into());
                                     let result = tokio::process::Command::new("ssh")
-                                        .args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                        .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
                                             &format!("{}@{}", user, host), "hostname && openclaw --version 2>/dev/null || echo 'OC not found'"])
                                         .output().await;
                                     app.wizard.testing_ssh = false;
@@ -3671,29 +3672,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('D') => app.start_diagnostics(true),
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('e') => {
-                                    // Fetch remote config
+                                    // Fetch remote config (non-blocking)
                                     if let Some(agent) = app.agents.get(app.selected) {
                                         let host = agent.host.clone();
                                         let user = agent.ssh_user.clone();
                                         let self_ip = app.self_ip.clone();
-                                        let aname = agent.name.clone();
                                         let is_mac = agent.os.to_lowercase().contains("mac");
-                                        let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-                                        let cmd = format!("{}cat ~/.openclaw/openclaw.json 2>/dev/null || echo '(no config found)'", pfx);
-                                        let output = if host == "localhost" || host == self_ip {
-                                            tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
-                                        } else {
-                                            tokio::time::timeout(
-                                                std::time::Duration::from_secs(8),
-                                                tokio::process::Command::new("ssh")
-                                                    .args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                                        &format!("{}@{}", user, host), &cmd])
-                                                    .output()
-                                            ).await.ok().and_then(|r| r.ok())
-                                        };
-                                        app.config_text = output.map(|o| String::from_utf8_lossy(&o.stdout).to_string());
-                                        app.config_scroll = 0;
-                                        app.toast("📋 Config loaded — PageUp/Down to scroll, Esc to close");
+                                        app.toast("📋 Fetching config...");
+                                        let (tx, rx) = mpsc::unbounded_channel();
+                                        app.config_load_rx = Some(rx);
+                                        tokio::spawn(async move {
+                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                            let cmd = format!("{}cat ~/.openclaw/openclaw.json 2>/dev/null || echo '(no config found)'", pfx);
+                                            let output = if host == "localhost" || host == self_ip {
+                                                tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                                            } else {
+                                                tokio::time::timeout(
+                                                    std::time::Duration::from_secs(5),
+                                                    tokio::process::Command::new("ssh")
+                                                        .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                            &format!("{}@{}", user, host), &cmd])
+                                                        .output()
+                                                ).await.ok().and_then(|r| r.ok())
+                                            };
+                                            let _ = tx.send(output.map(|o| String::from_utf8_lossy(&o.stdout).to_string()));
+                                        });
                                     }
                                 }
                                 KeyCode::Char('c') => app.cycle_theme(),
@@ -3715,9 +3718,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     let is_mac = host.contains("mac") || host.contains("darwin");
                                                     let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
                                                     tokio::time::timeout(
-                                                        std::time::Duration::from_secs(8),
+                                                        std::time::Duration::from_secs(5),
                                                         tokio::process::Command::new("ssh")
-                                                            .args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                            .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
                                                                 &format!("{}@{}", user, host), &format!("{}{}", pfx, cmd)])
                                                             .output()
                                                     ).await.ok().and_then(|r| r.ok())
@@ -3924,7 +3927,7 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                             let _ = tokio::time::timeout(
                                                 std::time::Duration::from_secs(60),
                                                 tokio::process::Command::new("ssh")
-                                                    .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                    .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
                                                         &format!("{}@{}", user, host), &cmd])
                                                     .output()
                                             ).await;
@@ -3954,7 +3957,7 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                                     tokio::time::timeout(
                                                         std::time::Duration::from_secs(10),
                                                         tokio::process::Command::new("ssh")
-                                                            .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                            .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
                                                                 &format!("{}@{}", user, host), &cmd])
                                                             .output()
                                                     ).await.ok().and_then(|r| r.ok())
@@ -3987,7 +3990,7 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                             let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
                                             let cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
                                             let _ = tokio::process::Command::new("ssh")
-                                                .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
                                                     &format!("{}@{}", user, host), &cmd])
                                                 .output().await;
                                         });
@@ -4048,7 +4051,7 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                                         tokio::time::timeout(
                                                             std::time::Duration::from_secs(10),
                                                             tokio::process::Command::new("ssh")
-                                                                .args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                                .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
                                                                     &format!("{}@{}", ssh_user, host), &full_cmd])
                                                                 .output()
                                                         ).await.ok().and_then(|r| r.ok())
@@ -4147,6 +4150,15 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                         // Keep overlay open for user to see results
                     }
                 }
+            }
+        }
+
+        // Receive config load results (non-blocking)
+        if let Some(ref mut rx) = app.config_load_rx {
+            if let Ok(result) = rx.try_recv() {
+                app.config_text = result;
+                app.config_scroll = 0;
+                app.toast("📋 Config loaded — PageUp/Down to scroll, Esc to close");
             }
         }
 
