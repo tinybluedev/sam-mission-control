@@ -942,6 +942,12 @@ struct FleetDoctorAgentResult {
     fixed_actions: Vec<String>,
 }
 
+impl FleetDoctorAgentResult {
+    fn is_healthy(&self) -> bool {
+        self.ssh_reachable && self.gateway_api_reachable && self.oc_current
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct FleetDoctorOutput {
     total_agents: usize,
@@ -954,12 +960,14 @@ struct FleetDoctorOutput {
 
 fn parse_semver(raw: &str) -> Option<String> {
     raw.split_whitespace()
+        .map(|part| part.trim_start_matches('v'))
         .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))
         .map(|s| s.trim().to_string())
 }
 
 fn doctor_exit_code(total_agents: usize, unhealthy_agents: usize, down_agents: usize) -> i32 {
-    if total_agents > 0 && down_agents * 2 > total_agents { 2 }
+    // down_agents * 2 > total_agents means "strictly more than 50% down".
+    if total_agents > 0 && (down_agents * 2) > total_agents { 2 }
     else if unhealthy_agents > 0 { 1 }
     else { 0 }
 }
@@ -974,6 +982,7 @@ pub async fn run_doctor_fleet(
 ) -> Result<i32, Box<dyn std::error::Error>> {
     use tokio::process::Command;
     use tokio::sync::mpsc;
+    let timeout_secs = timeout_secs.max(1);
 
     print_banner();
 
@@ -987,7 +996,7 @@ pub async fn run_doctor_fleet(
     };
 
     let latest_oc_version = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs.max(1)),
+        std::time::Duration::from_secs(timeout_secs),
         Command::new("npm").args(["view", "openclaw", "version", "--silent"]).output(),
     )
     .await
@@ -997,9 +1006,9 @@ pub async fn run_doctor_fleet(
     .and_then(|o| parse_semver(&String::from_utf8_lossy(&o.stdout)));
 
     let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
-        .unwrap_or_default();
+        ?;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     for agent in targets {
@@ -1016,7 +1025,7 @@ pub async fn run_doctor_fleet(
             let mut fixed_actions = Vec::new();
 
             let ssh_reachable = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs.max(1)),
+                std::time::Duration::from_secs(timeout_secs),
                 Command::new("ssh")
                     .args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", &ssh_target, "echo ok"])
                     .output(),
@@ -1033,7 +1042,7 @@ pub async fn run_doctor_fleet(
 
             if ssh_reachable {
                 let oc_raw = tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs.max(1)),
+                    std::time::Duration::from_secs(timeout_secs),
                     Command::new("ssh")
                         .args([
                             "-o",
@@ -1157,7 +1166,7 @@ pub async fn run_doctor_fleet(
 
     let unhealthy_agents = results
         .iter()
-        .filter(|r| !r.ssh_reachable || !r.gateway_api_reachable || !r.oc_current)
+        .filter(|r| !r.is_healthy())
         .count();
     let down_agents = results.iter().filter(|r| !r.ssh_reachable).count();
     let exit_code = doctor_exit_code(results.len(), unhealthy_agents, down_agents);
@@ -1175,7 +1184,7 @@ pub async fn run_doctor_fleet(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if quiet {
         for r in &payload.results {
-            if r.ssh_reachable && r.gateway_api_reachable && r.oc_current {
+            if r.is_healthy() {
                 continue;
             }
             println!(
@@ -1220,8 +1229,10 @@ pub async fn run_doctor_fleet(
     }
 
     let status = if exit_code == 0 { "pass" } else { "fail" };
-    crate::db::record_fleet_doctor_run(&pool, status, &serde_json::to_string(&payload)?).await?;
-    pool.disconnect().await?;
+    let record_result = crate::db::record_fleet_doctor_run(&pool, status, &serde_json::to_string(&payload)?).await;
+    let disconnect_result = pool.disconnect().await;
+    record_result?;
+    disconnect_result?;
     Ok(exit_code)
 }
 
@@ -1416,14 +1427,14 @@ mod cli_tests {
     #[test]
     fn parse_semver_extracts_version_token() {
         assert_eq!(parse_semver("openclaw 1.2.3"), Some("1.2.3".to_string()));
-        assert_eq!(parse_semver("v1.2.3"), None);
+        assert_eq!(parse_semver("v1.2.3"), Some("1.2.3".to_string()));
     }
 
     #[test]
     fn doctor_exit_codes_follow_thresholds() {
         assert_eq!(doctor_exit_code(4, 0, 0), 0);
         assert_eq!(doctor_exit_code(4, 1, 2), 1);
-        assert_eq!(doctor_exit_code(4, 2, 3), 2);
+        assert_eq!(doctor_exit_code(4, 3, 3), 2);
     }
 }
 
