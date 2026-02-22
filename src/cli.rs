@@ -782,7 +782,7 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
     let encoded_pass = db_pass.replace("$", "%24").replace("@", "%40");
     let url = format!("mysql://{}:{}@{}:{}/{}", db_user, encoded_pass, db_host, db_port, db_name);
     let pool = mysql_async::Pool::new(url.as_str());
-    let mut conn = pool.get_conn().await.map_err(|e| format!("DB connection failed: {}", e))?;
+    let mut conn = pool.get_conn().await.map_err(|e| crate::db::sanitize_error(&format!("DB connection failed: {}", e)))?;
     println!("✅");
 
     // Step 2: Create tables
