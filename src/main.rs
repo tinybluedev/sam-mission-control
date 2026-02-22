@@ -1131,12 +1131,96 @@ impl App {
                 Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), "echo ok"]).output()
             ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
-            let _ = tx.send(DiagStep {
-                label: "SSH connectivity".into(),
-                status: if ssh_ok { DiagStatus::Pass } else { DiagStatus::Fail },
-                detail: if ssh_ok { "connected".into() } else { "unreachable — check Tailscale/network".into() },
-            });
-            if !ssh_ok { let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cannot proceed without SSH".into() }); return; }
+
+            let ssh_ok = if !ssh_ok && fix {
+                // Attempt fix: check if we can ping the Tailscale IP
+                let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Running, detail: "unreachable — attempting fix...".into() });
+
+                // Check 1: Can we ping the host at all?
+                let ping_ok = tokio::time::timeout(Duration::from_secs(3),
+                    Command::new("ping").args(["-c", "1", "-W", "2", &host]).output()
+                ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+
+                if !ping_ok {
+                    let _ = tx.send(DiagStep { label: "  → Ping".into(), status: DiagStatus::Fail, detail: format!("{} not responding to ICMP", host) });
+
+                    // Try to restart Tailscale on our end for this route
+                    let _ = tx.send(DiagStep { label: "  → Tailscale route".into(), status: DiagStatus::Running, detail: "checking local Tailscale...".into() });
+                    let ts_status = Command::new("tailscale").args(["status", "--json"]).output().await;
+                    let peer_found = ts_status.as_ref().map(|o| {
+                        let s = String::from_utf8_lossy(&o.stdout);
+                        s.contains(&host)
+                    }).unwrap_or(false);
+
+                    if peer_found {
+                        let _ = tx.send(DiagStep { label: "  → Tailscale route".into(), status: DiagStatus::Pass, detail: "peer known to Tailscale".into() });
+                        // Try DERP relay ping
+                        let _ = tx.send(DiagStep { label: "  → Tailscale ping".into(), status: DiagStatus::Running, detail: "trying direct WireGuard...".into() });
+                        let ts_ping = tokio::time::timeout(Duration::from_secs(8),
+                            Command::new("tailscale").args(["ping", "--c", "1", "--timeout", "5s", &host]).output()
+                        ).await.ok().and_then(|r| r.ok());
+                        let ts_ping_ok = ts_ping.as_ref().map(|o| o.status.success()).unwrap_or(false);
+                        if ts_ping_ok {
+                            let ping_detail = ts_ping.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                            let _ = tx.send(DiagStep { label: "  → Tailscale ping".into(), status: DiagStatus::Pass, detail: ping_detail.chars().take(80).collect::<String>() });
+                            // WireGuard works but SSH doesn't — might be firewall or sshd
+                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                detail: "Tailscale reachable but SSH refused — check sshd on target".into() });
+                        } else {
+                            let _ = tx.send(DiagStep { label: "  → Tailscale ping".into(), status: DiagStatus::Fail, detail: "WireGuard unreachable".into() });
+                            // Machine is probably off or Tailscale is down on that end
+                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                detail: "machine offline or Tailscale down on target — cannot auto-fix".into() });
+                        }
+                    } else {
+                        let _ = tx.send(DiagStep { label: "  → Tailscale route".into(), status: DiagStatus::Fail,
+                            detail: format!("{} not in Tailscale peer list — may need re-enrollment", host) });
+                        let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                            detail: "not in mesh — needs Tailscale login on target machine".into() });
+                    }
+                    false
+                } else {
+                    // Ping works but SSH failed — try again with longer timeout
+                    let _ = tx.send(DiagStep { label: "  → Ping".into(), status: DiagStatus::Pass, detail: format!("{} responds to ping", host) });
+                    let _ = tx.send(DiagStep { label: "  → SSH retry".into(), status: DiagStatus::Running, detail: "retrying with 5s timeout...".into() });
+                    let retry = tokio::time::timeout(Duration::from_secs(8),
+                        Command::new("ssh").args(["-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                            &format!("{}@{}", user, host), "echo ok"]).output()
+                    ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+                    if retry {
+                        let _ = tx.send(DiagStep { label: "  → SSH retry".into(), status: DiagStatus::Pass, detail: "connected on retry".into() });
+                        let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fixed, detail: "connected (slow handshake)".into() });
+                        true
+                    } else {
+                        // Check if port 22 is open
+                        let port_check = tokio::time::timeout(Duration::from_secs(3),
+                            Command::new("bash").args(["-c", &format!("echo | nc -w 2 {} 22 2>/dev/null && echo OPEN || echo CLOSED", host)]).output()
+                        ).await.ok().and_then(|r| r.ok());
+                        let port_open = port_check.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("OPEN")).unwrap_or(false);
+                        if port_open {
+                            let _ = tx.send(DiagStep { label: "  → SSH retry".into(), status: DiagStatus::Fail, detail: "port 22 open but auth fails — check SSH keys".into() });
+                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                detail: "auth rejected — deploy SSH key with: ssh-copy-id".into() });
+                        } else {
+                            let _ = tx.send(DiagStep { label: "  → SSH retry".into(), status: DiagStatus::Fail, detail: "port 22 closed — sshd not running".into() });
+                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                detail: "sshd not running on target — needs manual start".into() });
+                        }
+                        false
+                    }
+                }
+            } else if ssh_ok {
+                let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Pass, detail: "connected".into() });
+                true
+            } else {
+                let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail, detail: "unreachable — press D to diagnose deeper".into() });
+                false
+            };
+
+            if !ssh_ok {
+                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cannot proceed without SSH — see details above".into() });
+                return;
+            }
 
             // Step 2: Tailscale status
             let _ = tx.send(DiagStep { label: "Tailscale".into(), status: DiagStatus::Running, detail: String::new() });
