@@ -1160,9 +1160,10 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let cur = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw --version 2>/dev/null || echo '(not installed)'", pfx)).await;
             let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Pass, detail: cur.trim().to_string() });
 
-            // Step 2: stream npm install
+            // Step 2: stream npm install (stdout + stderr merged via 2>&1)
             let _ = tx.send(DiagStep { label: "Installing openclaw@latest".into(), status: DiagStatus::Running, detail: "running npm install...".into() });
-            let install_cmd = format!("{}sudo npm install -g openclaw@latest 2>&1", pfx);
+            // 2>&1 merges stderr so we capture error messages too
+            let install_cmd = format!("{}sudo npm install -g openclaw@latest 2>&1; echo "__EXIT:$?__"", pfx);
             use tokio::io::AsyncBufReadExt;
             let mut child = if host == "localhost" || host == self_ip {
                 tokio::process::Command::new("bash").args(["-c", &install_cmd])
@@ -1175,22 +1176,48 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             };
             let mut install_ok = false;
             let mut last_line = String::new();
+            let mut error_lines: Vec<String> = Vec::new();
             if let Ok(ref mut child) = child {
                 if let Some(stdout) = child.stdout.take() {
                     let mut reader = tokio::io::BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let clean = line.trim().to_string();
                         if clean.is_empty() { continue; }
+                        // Parse exit code marker
+                        if clean.starts_with("__EXIT:") {
+                            let code = clean.trim_start_matches("__EXIT:").trim_end_matches("__");
+                            install_ok = code == "0";
+                            continue;
+                        }
                         last_line = clean.clone();
+                        // Track error lines for failure reporting
+                        if clean.to_lowercase().contains("err") || clean.starts_with("npm ERR") {
+                            error_lines.push(clean.chars().take(80).collect());
+                        }
                         let _ = tx.send(DiagStep { label: "  npm".into(), status: DiagStatus::Running, detail: clean.chars().take(70).collect() });
                     }
                 }
-                install_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
+                // If we didn't parse exit code, use process exit status
+                if let Ok(status) = child.wait().await {
+                    if !install_ok { install_ok = status.success(); }
+                }
             }
+            // Remove stale "running" npm step — replace with outcome
+            let fail_detail = if !error_lines.is_empty() {
+                error_lines.last().cloned().unwrap_or("install failed".into())
+            } else if !last_line.is_empty() {
+                last_line.chars().take(60).collect()
+            } else {
+                "no output — check npm/sudo permissions".into()
+            };
             let _ = tx.send(DiagStep {
                 label: "Installing openclaw@latest".into(),
                 status: if install_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
-                detail: if install_ok { last_line.chars().take(60).collect() } else { "install failed".into() },
+                detail: if install_ok {
+                    last_line.chars().take(60).collect()
+                } else {
+                    fail_detail
+                },
             });
 
             // Step 3: new version
