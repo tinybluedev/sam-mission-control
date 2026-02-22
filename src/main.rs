@@ -43,6 +43,9 @@ struct Agent {
     capabilities: Vec<String>,
     token_burn: i32,
     latency_ms: Option<u32>,
+    cpu_pct: Option<f32>,
+    ram_pct: Option<f32>,
+    disk_pct: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -115,6 +118,9 @@ struct ProbeResult {
     kernel: String,
     oc_version: String,
     latency_ms: Option<u32>,
+    cpu_pct: Option<f32>,
+    ram_pct: Option<f32>,
+    disk_pct: Option<f32>,
 }
 
 struct App {
@@ -191,6 +197,7 @@ impl App {
                         capabilities: caps,
                         token_burn: da.token_burn_today,
                         latency_ms: None,
+                        cpu_pct: None, ram_pct: None, disk_pct: None,
                     });
                 }
             }
@@ -346,8 +353,8 @@ impl App {
             let (host, user, sip) = (a.host.clone(), a.ssh_user.clone(), self.self_ip.clone());
             let tx = tx.clone();
             tokio::spawn(async move {
-                let (status, os, kern, oc, lat) = probe_agent(&host, &user, &sip).await;
-                let _ = tx.send(ProbeResult { index: i, status, os, kernel: kern, oc_version: oc, latency_ms: lat });
+                let (status, os, kern, oc, lat, cpu, ram, disk) = probe_agent(&host, &user, &sip).await;
+                let _ = tx.send(ProbeResult { index: i, status, os, kernel: kern, oc_version: oc, latency_ms: lat, cpu_pct: cpu, ram_pct: ram, disk_pct: disk });
             });
         }
     }
@@ -362,6 +369,9 @@ impl App {
                     if !r.kernel.is_empty() { self.agents[r.index].kernel = r.kernel.clone(); }
                     if !r.oc_version.is_empty() { self.agents[r.index].oc_version = r.oc_version.clone(); }
                     self.agents[r.index].latency_ms = r.latency_ms;
+                    self.agents[r.index].cpu_pct = r.cpu_pct;
+                    self.agents[r.index].ram_pct = r.ram_pct;
+                    self.agents[r.index].disk_pct = r.disk_pct;
                     self.agents[r.index].last_seen = now_str();
                     updates.push((r.index, r.status, r.os, r.kernel, r.oc_version, r.latency_ms));
                 }
@@ -395,24 +405,27 @@ impl App {
 
 // ---- SSH Probe ----
 
-async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, String, String, String, Option<u32>) {
+async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, String, String, String, Option<u32>, Option<f32>, Option<f32>, Option<f32>) {
     let start = Instant::now();
     if host == "localhost" || host == self_ip {
         let os = Command::new("bash").args(["-c", ". /etc/os-release 2>/dev/null && echo \"$NAME $VERSION_ID\" || echo unknown"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         let kern = Command::new("uname").arg("-r").output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         let oc = Command::new("bash").args(["-c", "openclaw --version 2>/dev/null || echo ?"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let cpu = Command::new("bash").args(["-c", r#"top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}'"#]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok()).ok().flatten();
+        let ram = Command::new("bash").args(["-c", r#"free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}'"#]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok()).ok().flatten();
+        let disk = Command::new("bash").args(["-c", r#"df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}'"#]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok()).ok().flatten();
         let ms = start.elapsed().as_millis() as u32;
-        return (AgentStatus::Online, os, kern, oc, Some(ms));
+        return (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk);
     }
     let tgt = format!("{}@{}", user, host);
-    let script = r#"OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC""#;
+    let script = r#"OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK""#;
     let result = tokio::time::timeout(
         Duration::from_secs(8),
         Command::new("ssh").args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"bash","-c",script]).output()
     ).await;
     let result = match result {
         Ok(r) => r,
-        Err(_) => return (AgentStatus::Offline, String::new(), String::new(), String::new(), None),
+        Err(_) => return (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None),
     };
     match result {
         Ok(o) if o.status.success() => {
@@ -423,10 +436,16 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, Str
                 else if let Some(v) = l.strip_prefix("KERN:") { kern = v.trim().into(); }
                 else if let Some(v) = l.strip_prefix("OC:") { oc = v.trim().into(); }
             }
+            let (mut cpu, mut ram, mut disk) = (None, None, None);
+            for l in s.lines() {
+                if let Some(v) = l.strip_prefix("CPU:") { cpu = v.trim().parse::<f32>().ok(); }
+                else if let Some(v) = l.strip_prefix("RAM:") { ram = v.trim().parse::<f32>().ok(); }
+                else if let Some(v) = l.strip_prefix("DISK:") { disk = v.trim().parse::<f32>().ok(); }
+            }
             let ms = start.elapsed().as_millis() as u32;
-            (AgentStatus::Online, os, kern, oc, Some(ms))
+            (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk)
         }
-        _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None),
+        _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None),
     }
 }
 
@@ -768,6 +787,12 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         ("OC Version", a.oc_version.clone(), t.version),
         ("SSH User", a.ssh_user.clone(), t.text),
         ("Capabilities", caps, t.text),
+        ("CPU", match a.cpu_pct { Some(p) => format!("{:.1}%", p), None => "—".into() },
+            match a.cpu_pct { Some(p) if p > 90.0 => t.status_offline, Some(p) if p > 70.0 => t.status_busy, Some(_) => t.status_online, _ => t.text_dim }),
+        ("RAM", match a.ram_pct { Some(p) => format!("{:.1}%", p), None => "—".into() },
+            match a.ram_pct { Some(p) if p > 85.0 => t.status_offline, Some(p) if p > 70.0 => t.status_busy, Some(_) => t.status_online, _ => t.text_dim }),
+        ("Disk", match a.disk_pct { Some(p) => format!("{:.0}%", p), None => "—".into() },
+            match a.disk_pct { Some(p) if p > 90.0 => t.status_offline, Some(p) if p > 80.0 => t.status_busy, Some(_) => t.status_online, _ => t.text_dim }),
         ("Latency", match a.latency_ms { Some(ms) => format!("{}ms", ms), None => "—".into() },
             match a.latency_ms { Some(ms) if ms < 100 => t.status_online, Some(ms) if ms < 500 => t.status_busy, Some(_) => t.status_offline, _ => t.text_dim }),
         ("Tokens Today", format!("{}", a.token_burn), t.text),
@@ -1336,6 +1361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         capabilities: vec![],
                                         token_burn: 0,
                                         latency_ms: None,
+                                        cpu_pct: None, ram_pct: None, disk_pct: None,
                                     });
                                     app.wizard.active = false;
                                     app.status_message = format!("✅ Agent '{}' created", app.wizard.agent_name);
