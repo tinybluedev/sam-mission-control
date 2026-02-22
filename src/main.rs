@@ -27,7 +27,8 @@ use std::collections::HashSet;
 use std::io::stdout;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use std::sync::Arc;
 
 use theme::{BgDensity, Theme, ThemeName};
 
@@ -354,6 +355,16 @@ struct App {
     ac_matches: Vec<String>,
     ac_selected: usize,
     ac_start_pos: usize,  // cursor position of the '@'
+    // Bulk update confirmation + progress
+    bulk_update_pending: bool,
+    bulk_update_active: bool,
+    bulk_update_targets: Vec<(String, String, String, bool, String)>,  // (db_name, host, ssh_user, is_mac, oc_version)
+    bulk_update_names: Vec<String>,
+    bulk_update_deselected: std::collections::HashSet<usize>,
+    bulk_update_cursor: usize,
+    bulk_update_progress: Vec<BulkUpdateStatus>,
+    bulk_update_details: Vec<String>,
+    bulk_update_rx: Option<mpsc::UnboundedReceiver<(usize, BulkUpdateStatus, String)>>,
 }
 
 impl App {
@@ -437,6 +448,11 @@ impl App {
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
+            bulk_update_pending: false, bulk_update_active: false,
+            bulk_update_targets: vec![], bulk_update_names: vec![],
+            bulk_update_deselected: HashSet::new(), bulk_update_cursor: 0,
+            bulk_update_progress: vec![], bulk_update_details: vec![],
+            bulk_update_rx: None,
         }
     }
 
@@ -1231,6 +1247,111 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Fixed, detail: restart_msg.trim().to_string() });
 
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
+        });
+    }
+
+    fn start_bulk_update(&mut self) {
+        // Collect selected (non-deselected) indices
+        let index_map: Vec<usize> = self.bulk_update_targets.iter().enumerate()
+            .filter(|(i, _)| !self.bulk_update_deselected.contains(i))
+            .map(|(i, _)| i)
+            .collect();
+
+        if index_map.is_empty() {
+            self.toast("No agents selected for update");
+            self.bulk_update_pending = false;
+            return;
+        }
+
+        let targets: Vec<(String, String, String, bool, String)> = index_map.iter()
+            .map(|&i| self.bulk_update_targets[i].clone())
+            .collect();
+
+        // Reset progress for all entries
+        for s in self.bulk_update_progress.iter_mut() {
+            *s = BulkUpdateStatus::Pending;
+        }
+        for d in self.bulk_update_details.iter_mut() { d.clear(); }
+
+        let (tx, rx) = mpsc::unbounded_channel::<(usize, BulkUpdateStatus, String)>();
+        self.bulk_update_rx = Some(rx);
+        self.bulk_update_active = true;
+        self.bulk_update_pending = false;
+
+        let latest = self.latest_oc_version.clone();
+        let pool = self.db_pool.clone();
+        let sender = self.user();
+        let self_ip = self.self_ip.clone();
+        let max_concurrent = std::env::var("MAX_CONCURRENT_UPDATES")
+            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3);
+
+        tokio::spawn(async move {
+            let sem = Arc::new(Semaphore::new(max_concurrent));
+            let mut handles = Vec::new();
+
+            for (slot, orig_idx) in index_map.into_iter().enumerate() {
+                let (db_name, host, ssh_user, is_mac, old_ver) = targets[slot].clone();
+                let tx = tx.clone();
+                let sem = sem.clone();
+                let latest = latest.clone();
+                let pool = pool.clone();
+                let sender = sender.clone();
+                let self_ip = self_ip.clone();
+
+                let handle = tokio::spawn(async move {
+                    let _permit = sem.acquire().await.ok();
+                    let _ = tx.send((orig_idx, BulkUpdateStatus::Running, String::new()));
+
+                    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                    let cmd = format!(
+                        "{}openclaw --version 2>/dev/null && sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1",
+                        pfx
+                    );
+
+                    let output = if host == "localhost" || host == self_ip {
+                        tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                    } else {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(120),
+                            tokio::process::Command::new("ssh")
+                                .args(["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                                    &format!("{}@{}", ssh_user, host), &cmd])
+                                .output()
+                        ).await.ok().and_then(|r| r.ok())
+                    };
+
+                    let (status, detail) = match output {
+                        Some(o) if o.status.success() => {
+                            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            (BulkUpdateStatus::Done, s.chars().take(80).collect::<String>())
+                        }
+                        Some(o) => {
+                            let s = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                            let s = if s.is_empty() { String::from_utf8_lossy(&o.stdout).trim().to_string() } else { s };
+                            (BulkUpdateStatus::Failed, s.chars().take(80).collect::<String>())
+                        }
+                        None => (BulkUpdateStatus::Failed, "Timeout".into()),
+                    };
+
+                    if let Some(pool) = pool {
+                        let msg = format!("🔄 update {} → {}", old_ver, latest);
+                        let _ = crate::db::send_direct(&pool, &sender, &db_name, &msg).await;
+                        if let Ok(mut conn) = pool.get_conn().await {
+                            use mysql_async::prelude::*;
+                            let response = detail.clone();
+                            let _ = conn.exec_drop(
+                                "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                                (&response, &sender, &db_name),
+                            ).await;
+                        }
+                    }
+
+                    let _ = tx.send((orig_idx, status, detail));
+                });
+                handles.push(handle);
+            }
+
+            for h in handles { let _ = h.await; }
         });
     }
 
@@ -2219,6 +2340,14 @@ impl DiagStatus {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum BulkUpdateStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
 const SERVICE_ICONS: &[(&str, &str)] = &[
     ("telegram", "📱"), ("discord", "🎮"), ("signal", "🔒"), ("whatsapp", "💬"),
     ("slack", "💼"), ("irc", "📟"), ("matrix", "🔷"), ("imessage", "🍎"),
@@ -3146,6 +3275,123 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
             .border_style(Style::default().fg(if app.diag_auto_fix { t.status_busy } else { t.accent }))
             .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(diag, popup);
+}
+
+fn render_bulk_update_overlay(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = frame.area();
+    let latest = &app.latest_oc_version;
+    let total = app.bulk_update_targets.len();
+    let selected_count = total - app.bulk_update_deselected.len();
+
+    let w = ((area.width as f32 * 0.65) as u16).max(62).min(area.width.saturating_sub(4));
+    let h_content = total as u16 + 8;
+    let h = h_content.min(area.height.saturating_sub(4)).max(10);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, popup);
+
+    let title = if app.bulk_update_active {
+        let done_count = app.bulk_update_progress.iter().enumerate()
+            .filter(|(i, _)| !app.bulk_update_deselected.contains(i))
+            .filter(|(_, s)| matches!(s, BulkUpdateStatus::Done | BulkUpdateStatus::Failed))
+            .count();
+        format!(" Updating {}/{} agents ", done_count, selected_count)
+    } else {
+        let ver_label = if latest.is_empty() { "latest".to_string() } else { latest.clone() };
+        format!(" Bulk Update — {} agent{} to {} [Y/n] ", selected_count, if selected_count == 1 { "" } else { "s" }, ver_label)
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+
+    for (i, name) in app.bulk_update_names.iter().enumerate() {
+        let is_deselected = app.bulk_update_deselected.contains(&i);
+        let is_cursor = i == app.bulk_update_cursor && !app.bulk_update_active;
+        let (_, _, _, _, oc_ver) = &app.bulk_update_targets[i];
+        let ver_label = if latest.is_empty() { "latest" } else { latest.as_str() };
+
+        let (status_str, status_color) = if app.bulk_update_active {
+            match &app.bulk_update_progress[i] {
+                BulkUpdateStatus::Pending if is_deselected => ("  ⊘ skipped".to_string(), t.text_dim),
+                BulkUpdateStatus::Pending => ("  ⧖ queued".to_string(), t.text_dim),
+                BulkUpdateStatus::Running => {
+                    let c = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+                    (format!("  {} running...", c), t.pending)
+                }
+                BulkUpdateStatus::Done => ("  ✓ done".to_string(), t.status_online),
+                BulkUpdateStatus::Failed => {
+                    let detail = &app.bulk_update_details[i];
+                    let msg = if detail.is_empty() { "failed".to_string() } else { detail.chars().take(40).collect::<String>() };
+                    (format!("  ✗ {}", msg), t.status_offline)
+                }
+            }
+        } else {
+            let s = format!("  {} → {}", oc_ver, ver_label);
+            let c = if is_deselected { t.text_dim } else { t.text };
+            (s, c)
+        };
+
+        let checkbox = if is_deselected { "[ ]" } else { "[✓]" };
+        let prefix = if is_cursor { "▶" } else { " " };
+        let name_style = if is_cursor {
+            Style::default().fg(t.accent).bold()
+        } else if is_deselected {
+            Style::default().fg(t.text_dim)
+        } else {
+            Style::default().fg(t.text)
+        };
+        let cb_color = if is_cursor { t.accent } else { t.text_dim };
+
+        if app.bulk_update_active {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {}  ", prefix), Style::default().fg(t.accent)),
+                Span::styled(name.clone(), name_style),
+                Span::styled(status_str, Style::default().fg(status_color)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} {} ", prefix, checkbox), Style::default().fg(cb_color)),
+                Span::styled(name.clone(), name_style),
+                Span::styled(status_str, Style::default().fg(status_color)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    if app.bulk_update_active {
+        let done_count = app.bulk_update_progress.iter().enumerate()
+            .filter(|(i, _)| !app.bulk_update_deselected.contains(i))
+            .filter(|(_, s)| matches!(s, BulkUpdateStatus::Done | BulkUpdateStatus::Failed))
+            .count();
+        if done_count >= selected_count {
+            lines.push(Line::from(Span::styled("  Done — press Esc to close", Style::default().fg(t.text_dim))));
+        } else {
+            lines.push(Line::from(Span::styled("  Updating… press Esc to dismiss", Style::default().fg(t.text_dim))));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  Y", Style::default().fg(t.status_online).bold()),
+            Span::styled(" confirm · ", Style::default().fg(t.text_dim)),
+            Span::styled("N/Esc", Style::default().fg(t.status_offline).bold()),
+            Span::styled(" cancel · ", Style::default().fg(t.text_dim)),
+            Span::styled("Space", Style::default().fg(t.accent).bold()),
+            Span::styled(" toggle · ", Style::default().fg(t.text_dim)),
+            Span::styled("↑↓", Style::default().fg(t.accent).bold()),
+            Span::styled(" navigate", Style::default().fg(t.text_dim)),
+        ]));
+    }
+
+    let border_color = if app.bulk_update_active { t.status_busy } else { t.accent };
+    let p = Paragraph::new(lines)
+        .block(Block::default()
+            .title(Span::styled(title, Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(p, popup);
 }
 
 fn render_services(frame: &mut Frame, app: &App, area: Rect) {
@@ -4190,6 +4436,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if app.wizard.active {
                 wizard::render_wizard(f, &app.wizard, &app.theme, app.bg_density.bg());
             }
+            if app.bulk_update_pending || app.bulk_update_active {
+                render_bulk_update_overlay(f, &app);
+            }
             } // close else for show_splash
         })?;
 
@@ -4360,6 +4609,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             KeyCode::Backspace => app.wizard.pop_char(),
                             KeyCode::Char(ch) => app.wizard.push_char(ch),
+                            _ => {}
+                        }
+                    } else {
+                    // Bulk update overlay intercepts all keys when active
+                    if app.bulk_update_pending || app.bulk_update_active {
+                        match key.code {
+                            KeyCode::Esc => {
+                                // Allow close if not mid-run or if all done
+                                let all_done = app.bulk_update_targets.iter().enumerate()
+                                    .filter(|(i, _)| !app.bulk_update_deselected.contains(i))
+                                    .all(|(i, _)| matches!(app.bulk_update_progress.get(i), Some(BulkUpdateStatus::Done) | Some(BulkUpdateStatus::Failed)));
+                                if !app.bulk_update_active || all_done {
+                                    app.bulk_update_pending = false;
+                                    app.bulk_update_active = false;
+                                    app.bulk_update_rx = None;
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') if !app.bulk_update_active => {
+                                app.bulk_update_pending = false;
+                            }
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if app.bulk_update_pending && !app.bulk_update_active => {
+                                app.start_bulk_update();
+                            }
+                            KeyCode::Up | KeyCode::Char('k') if !app.bulk_update_active => {
+                                if app.bulk_update_cursor > 0 { app.bulk_update_cursor -= 1; }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') if !app.bulk_update_active => {
+                                if app.bulk_update_cursor < app.bulk_update_targets.len().saturating_sub(1) {
+                                    app.bulk_update_cursor += 1;
+                                }
+                            }
+                            KeyCode::Char(' ') if !app.bulk_update_active => {
+                                let idx = app.bulk_update_cursor;
+                                if app.bulk_update_deselected.contains(&idx) {
+                                    app.bulk_update_deselected.remove(&idx);
+                                } else {
+                                    app.bulk_update_deselected.insert(idx);
+                                }
+                            }
                             _ => {}
                         }
                     } else {
@@ -4815,62 +5103,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('u') => {
-                                    // Bulk update OC on outdated agents (or selected)
+                                    // Show bulk update confirmation overlay
                                     let latest = app.latest_oc_version.clone();
-                                    let targets: Vec<(String, String, String, bool, String)> = if app.multi_selected.is_empty() {
-                                        app.agents.iter()
-                                            .filter(|a| a.status == AgentStatus::Online)
-                                            .filter(|a| latest.is_empty() || !a.oc_version.contains(&latest))
-                                            .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"), a.oc_version.clone()))
+                                    let iter: Vec<(&Agent, usize)> = if app.multi_selected.is_empty() {
+                                        app.agents.iter().enumerate()
+                                            .filter(|(_, a)| a.status == AgentStatus::Online)
+                                            .filter(|(_, a)| latest.is_empty() || !a.oc_version.contains(&latest))
+                                            .map(|(i, a)| (a, i))
                                             .collect()
                                     } else {
                                         app.multi_selected.iter()
-                                            .filter_map(|&i| app.agents.get(i))
-                                            .filter(|a| a.status == AgentStatus::Online)
-                                            .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"), a.oc_version.clone()))
+                                            .filter_map(|&i| app.agents.get(i).map(|a| (a, i)))
+                                            .filter(|(a, _)| a.status == AgentStatus::Online)
                                             .collect()
                                     };
+                                    let (targets, names): (Vec<_>, Vec<_>) = iter.iter()
+                                        .map(|(a, _)| (
+                                            (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"), a.oc_version.clone()),
+                                            a.name.clone(),
+                                        ))
+                                        .unzip();
                                     if targets.is_empty() {
                                         app.toast("✓ All agents already on latest version");
                                     } else {
-                                        let count = targets.len();
-                                        app.toast(&format!("🔄 Updating {} agents to {}...", count, if latest.is_empty() { "latest".into() } else { latest.clone() }));
-                                        for (db_name, host, ssh_user, is_mac, old_ver) in targets {
-                                            if let Some(pool) = &app.db_pool {
-                                                let pool = pool.clone();
-                                                let sender = app.user();
-                                                let self_ip = app.self_ip.clone();
-                                                let latest = latest.clone();
-                                                tokio::spawn(async move {
-                                                    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-                                                    let cmd = format!("{}openclaw --version 2>/dev/null && sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1", pfx);
-                                                    let output = if host == "localhost" || host == self_ip {
-                                                        tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
-                                                    } else {
-                                                        tokio::time::timeout(
-                                                            std::time::Duration::from_secs(120),
-                                                            tokio::process::Command::new("ssh")
-                                                                .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                                                    &format!("{}@{}", ssh_user, host), &cmd])
-                                                                .output()
-                                                        ).await.ok().and_then(|r| r.ok())
-                                                    };
-                                                    let response = output.map(|o| {
-                                                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                                                        if s.is_empty() { "(no output)".into() } else { s.chars().take(500).collect::<String>() }
-                                                    }).unwrap_or_else(|| "Timeout".into());
-                                                    let msg = format!("🔄 update {} → {}", old_ver, latest);
-                                                    let _ = crate::db::send_direct(&pool, &sender, &db_name, &msg).await;
-                                                    if let Ok(mut conn) = pool.get_conn().await {
-                                                        use mysql_async::prelude::*;
-                                                        let _ = conn.exec_drop(
-                                                            "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
-                                                            (&response, &sender, &db_name),
-                                                        ).await;
-                                                    }
-                                                });
-                                            }
-                                        }
+                                        let n = targets.len();
+                                        app.bulk_update_targets = targets;
+                                        app.bulk_update_names = names;
+                                        app.bulk_update_deselected = std::collections::HashSet::new();
+                                        app.bulk_update_cursor = 0;
+                                        app.bulk_update_progress = (0..n).map(|_| BulkUpdateStatus::Pending).collect();
+                                        app.bulk_update_details = (0..n).map(|_| String::new()).collect();
+                                        app.bulk_update_pending = true;
+                                        app.bulk_update_active = false;
+                                        app.bulk_update_rx = None;
                                     }
                                 }
                                 KeyCode::Char('U') => app.start_oc_update(),
@@ -5062,7 +5327,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                     }
-                    } // close else for diag_active
+                    } // close else if diag_active
+                    } // close else if bulk_update_pending/active
             }
         }
 
@@ -5095,6 +5361,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             app.last_task_poll = Instant::now();
+        }
+
+        // Receive bulk update progress (non-blocking)
+        if app.bulk_update_active {
+            if let Some(ref mut rx) = app.bulk_update_rx {
+                while let Ok((idx, status, detail)) = rx.try_recv() {
+                    if idx < app.bulk_update_progress.len() {
+                        app.bulk_update_details[idx] = detail;
+                        app.bulk_update_progress[idx] = status;
+                    }
+                }
+            }
+            // Check if all selected agents are done
+            let selected_count = app.bulk_update_targets.len() - app.bulk_update_deselected.len();
+            let done_count = app.bulk_update_targets.iter().enumerate()
+                .filter(|(i, _)| !app.bulk_update_deselected.contains(i))
+                .filter(|(i, _)| matches!(app.bulk_update_progress.get(*i), Some(BulkUpdateStatus::Done) | Some(BulkUpdateStatus::Failed)))
+                .count();
+            if selected_count > 0 && done_count >= selected_count {
+                let ok_count = app.bulk_update_targets.iter().enumerate()
+                    .filter(|(i, _)| !app.bulk_update_deselected.contains(i))
+                    .filter(|(i, _)| matches!(app.bulk_update_progress.get(*i), Some(BulkUpdateStatus::Done)))
+                    .count();
+                app.toast(&format!("✅ Bulk update complete: {}/{} succeeded", ok_count, selected_count));
+                app.bulk_update_active = false;
+            }
         }
 
         // Receive diagnostic steps (non-blocking)
