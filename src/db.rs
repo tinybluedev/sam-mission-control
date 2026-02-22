@@ -579,6 +579,20 @@ mod tests {
         assert!(static_query.contains("status='interrupted'"));
         assert!(static_query.contains("LIMIT 20"));
     }
+
+    #[test]
+    fn audit_payload_changes_when_content_changes() {
+        let base = compute_audit_payload("", "sam", "task.create", "agent-1", "priority=5");
+        let changed = compute_audit_payload("", "sam", "task.create", "agent-1", "priority=1");
+        assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn audit_payload_depends_on_prev_hash() {
+        let p1 = compute_audit_payload("abc", "sam", "chat.send", "all", "broadcast");
+        let p2 = compute_audit_payload("def", "sam", "chat.send", "all", "broadcast");
+        assert_ne!(p1, p2);
+    }
 }
 
 // ---- Task Board ----

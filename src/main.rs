@@ -669,6 +669,21 @@ impl App {
 
         let tn = ThemeName::Standard;
         let bd = BgDensity::Dark;
+        let (audit_tx, mut audit_input_rx) = mpsc::unbounded_channel::<AuditEvent>();
+        let (audit_result_tx, audit_result_rx) = mpsc::unbounded_channel::<AuditResult>();
+        let audit_pool = pool.clone();
+        tokio::spawn(async move {
+            while let Some(evt) = audit_input_rx.recv().await {
+                let result = db::append_audit_log(&audit_pool, &evt.actor, &evt.action, &evt.target, &evt.detail).await;
+                let send_result = match result {
+                    Ok(()) => audit_result_tx.send(AuditResult { ok: true, action: evt.action, target: evt.target, error: None }),
+                    Err(e) => audit_result_tx.send(AuditResult { ok: false, action: evt.action, target: evt.target, error: Some(db::sanitize_error(&e.to_string())) }),
+                };
+                if let Err(e) = send_result {
+                    eprintln!("audit result channel send failed: {}", e);
+                }
+            }
+        });
 
         App {
             fleet_config: fleet_config.agent,
@@ -1209,6 +1224,11 @@ impl App {
             parent_id: None,
             depth: 0,
         });
+        self.queue_audit_mutation(
+            if targeted { "chat.mention_send" } else { "chat.broadcast_send" },
+            &format!("{} agent(s)", agent_names.len()),
+            "message_queued",
+        );
 
         if let Some(pool) = &self.db_pool {
             let ids = db::send_broadcast(pool, &self.user(), &message, &agent_names)
@@ -2030,6 +2050,7 @@ impl App {
         let is_mac = agent.os.to_lowercase().contains("mac");
         let self_ip = self.self_ip.clone();
         let pool_opt = self.db_pool.clone();
+        self.queue_audit_mutation("agent.oc_update", &name, "requested");
 
         self.diag_active = true;
         self.diag_task_running = true;
@@ -2352,6 +2373,7 @@ impl App {
         let location = agent.location.clone();
         let gw_port = agent.gateway_port;
         let pool_opt = self.db_pool.clone();
+        self.queue_audit_mutation(if fix { "agent.diagnostics_fix" } else { "agent.diagnostics_check" }, &name, "requested");
         self.diag_active = true;
         self.diag_task_running = true;
         self.diag_auto_fix = fix;
@@ -4233,6 +4255,7 @@ impl App {
         let agent = &self.agents[self.selected];
         let host = agent.host.clone();
         let user = agent.ssh_user.clone();
+        let agent_db_name = agent.db_name.clone();
 
         let cmd = format!(
             r#"python3 -c "
@@ -4255,6 +4278,11 @@ print('ok')
             if new_state { "enabled" } else { "disabled" }
         );
         self.toast(&toast_msg);
+        self.queue_audit_mutation(
+            "agent.service_toggle",
+            &format!("{}:{}", agent_db_name, name),
+            if new_state { "enabled" } else { "disabled" },
+        );
 
         tokio::spawn(async move {
             let _ = tokio::time::timeout(
@@ -4619,11 +4647,13 @@ PY",
         let agent = &self.agents[self.selected];
         let host = agent.host.clone();
         let user = agent.ssh_user.clone();
+        let agent_db_name = agent.db_name.clone();
         let path = if file.path.is_empty() {
             format!("~/CLAUDE/clawd/{}", file.name)
         } else {
             file.path.clone()
         };
+        let file_name = file.name.clone();
 
         let content = self.ws_edit_buffer.join("\n");
 
@@ -11031,6 +11061,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.wizard.testing_ssh = false;
                 app.wizard.ssh_result = Some(result);
                 app.wizard_ssh_rx = None;
+            }
+        }
+
+        if let Some(ref mut rx) = app.audit_rx {
+            while let Ok(result) = rx.try_recv() {
+                app.audit_pending = app.audit_pending.saturating_sub(1);
+                app.audit_last = if result.ok {
+                    format!("🧾 {} {}", result.action, result.target)
+                } else {
+                    format!(
+                        "🧾 {} {} (write failed: {})",
+                        result.action,
+                        result.target,
+                        result.error.unwrap_or_else(|| "unknown".into())
+                    )
+                };
             }
         }
 
