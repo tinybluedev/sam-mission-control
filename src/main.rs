@@ -3157,6 +3157,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             let tab = match app.focus {
                 Focus::AgentChat => "Chat",
                 Focus::Workspace => "Files",
+                Focus::Services => "Services",
                 _ => "Info",
             };
             format!("Dashboard › {} › {}", name, tab)
@@ -3172,57 +3173,65 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         _ => "Dashboard".to_string(),
     };
 
-    // Contextual keybinds
-    let keys = match app.screen {
+    // Build styled key hints (key highlighted, label dim)
+    let keys: Vec<(&str, &str)> = match app.screen {
         Screen::Dashboard => match app.focus {
-            Focus::Chat => "Tab:fleet  Enter:send  Esc:back  @agent:target",
-            Focus::Command => "Enter:run  Esc:cancel",
-            _ => "Enter:open  d:diagnose  D:fix  t:tasks  f:filter  s:sort  r:refresh  ?:help  q:quit",
+            Focus::Chat => vec![("Tab","fleet"),("⏎","send"),("@","target"),("Esc","back")],
+            Focus::Command => vec![("⏎","run"),("Esc","cancel")],
+            _ => vec![("⏎","open"),("d","check"),("D","fix"),("t","tasks"),("f","filter"),("s","sort"),("r","refresh"),("?","help"),("q","quit")],
         },
         Screen::AgentDetail => match app.focus {
-            Focus::AgentChat => "Enter:send  @:tag  Tab:next  Esc:info  1-5:tabs",
-            Focus::Workspace => "Enter:view  e:edit  r:reload  Esc:info  1-5:tabs",
-            Focus::Services => "Space:toggle  r:reload  PgUp/Dn:scroll  Esc:info  1-5:tabs",
-            _ => "Tab:chat  w:files  t:tasks  5:services  Esc:back  1-5:tabs",
+            Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
+            Focus::Workspace => vec![("⏎","view"),("e","edit"),("r","reload"),("Esc","info"),("1-5","tabs")],
+            Focus::Services => vec![("␣","toggle"),("r","reload"),("Esc","info"),("1-5","tabs")],
+            _ => vec![("⏎","detail"),("d","check"),("D","fix"),("w","files"),("t","tasks"),("5","svc"),("Tab","chat"),("Esc","back")],
         },
         Screen::TaskBoard => if app.task_filter_agent.is_some() {
-            "n:new  d:done  c:clear  1-3/5:tabs  Esc:back"
+            vec![("n","new"),("d","done"),("c","clear"),("1-5","tabs"),("Esc","back")]
         } else {
-            "n:new  d:done  Esc:back"
+            vec![("n","new"),("d","done"),("Esc","back")]
         },
-        Screen::Help => "Esc:back  q:quit",
-        _ => "Esc:back",
+        Screen::Help => vec![("Esc","back"),("q","quit")],
+        _ => vec![("Esc","back")],
     };
 
     // Toast (auto-dismiss after 4s)
     let show_toast = app.toast_at.map(|t| t.elapsed() < Duration::from_secs(4)).unwrap_or(false);
     let toast_text = if show_toast { app.toast_message.as_deref().unwrap_or("") } else { "" };
 
-    let left = vec![
+    // Build left side (breadcrumb)
+    let mut left_spans = vec![
         Span::styled("  ", Style::default()),
         Span::styled(&crumb, Style::default().fg(t.accent).bold()),
     ];
 
-    let right_text = if !toast_text.is_empty() {
-        format!("{}  ", toast_text)
-    } else {
-        format!("{}  ", keys)
-    };
-
-    // Calculate padding
-    let left_len: usize = crumb.len() + 2;
-    let right_len = right_text.len();
-    let pad = (area.width as usize).saturating_sub(left_len + right_len + 4);
-
-    let mut spans = left;
-    spans.push(Span::raw(" ".repeat(pad)));
+    // Build right side
+    let mut right_spans: Vec<Span> = Vec::new();
     if !toast_text.is_empty() {
-        spans.push(Span::styled(right_text, Style::default().fg(Color::Yellow).bold()));
+        right_spans.push(Span::styled(toast_text, Style::default().fg(Color::Yellow).bold()));
     } else {
-        spans.push(Span::styled(right_text, Style::default().fg(t.text_dim)));
+        for (i, (key, label)) in keys.iter().enumerate() {
+            if i > 0 { right_spans.push(Span::styled(" ", Style::default().fg(t.text_dim))); }
+            right_spans.push(Span::styled(format!(" {} ", key), Style::default().fg(Color::Black).bg(t.accent).bold()));
+            right_spans.push(Span::styled(format!("{}", label), Style::default().fg(t.text_dim)));
+        }
     }
+    right_spans.push(Span::raw("  "));
 
-    let footer = Paragraph::new(Line::from(spans))
+    // Calculate padding between left and right
+    let left_len: usize = crumb.len() + 2;
+    let right_len: usize = if !toast_text.is_empty() {
+        toast_text.len() + 2
+    } else {
+        keys.iter().map(|(k, l)| k.len() + l.len() + 3).sum::<usize>() + 2
+    };
+    let pad = (area.width as usize).saturating_sub(left_len + right_len + 4);
+    left_spans.push(Span::raw(" ".repeat(pad)));
+
+    let mut all_spans = left_spans;
+    all_spans.extend(right_spans);
+
+    let footer = Paragraph::new(Line::from(all_spans))
         .block(Block::default().borders(Borders::ALL).border_type(t.border_type)
             .border_style(Style::default().fg(t.border))
             .style(Style::default().bg(app.bg_density.bg())));
@@ -3372,7 +3381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } // close else for show_splash
         })?;
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
 
             // Splash dismiss
@@ -3658,6 +3667,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 KeyCode::Char('q') => app.should_quit = true,
                                 KeyCode::Char('r') => app.start_refresh(),
+                                KeyCode::Char('d') => app.start_diagnostics(false),
+                                KeyCode::Char('D') => app.start_diagnostics(true),
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('e') => {
                                     // Fetch remote config
