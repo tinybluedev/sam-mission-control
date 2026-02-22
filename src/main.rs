@@ -464,7 +464,7 @@ struct App {
     // Help screen
     help_scroll: u16,
     // Multi-select
-    multi_selected: std::collections::HashSet<usize>,
+    selected_agents: std::collections::HashSet<String>,
     // Theme
     theme_name: ThemeName,
     bg_density: BgDensity,
@@ -1035,6 +1035,16 @@ impl App {
                 if keep { Some(i) } else { None }
             })
             .collect()
+    }
+
+    fn selected_agent_indices(&self) -> Vec<usize> {
+        self.agents.iter().enumerate()
+            .filter_map(|(i, a)| if self.selected_agents.contains(&a.db_name) { Some(i) } else { None })
+            .collect()
+    }
+
+    fn selected_agent_count(&self) -> usize {
+        self.agents.iter().filter(|a| self.selected_agents.contains(&a.db_name)).count()
     }
 
     fn active_chat_input_mut(&mut self) -> &mut String {
@@ -3647,12 +3657,12 @@ impl App {
     /// Start fleet diagnostics for all multi-selected agents sequentially.
     /// Falls back to single-agent diagnostic if nothing is multi-selected.
     fn start_fleet_diagnostics(&mut self, fix: bool) {
-        if self.multi_selected.is_empty() {
+        if self.selected_agents.is_empty() {
             self.start_diagnostics(fix);
             return;
         }
 
-        let mut indices: Vec<usize> = self.multi_selected.iter().copied().collect();
+        let mut indices: Vec<usize> = self.selected_agent_indices();
         indices.sort();
 
         // Build snapshot of agent info for the background task
@@ -5944,14 +5954,20 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             Constraint::Min(10),
         ]
     };
+    let selected_count = app.selected_agent_count();
+    let selected_info = if selected_count > 0 {
+        format!(" • {} selected", selected_count)
+    } else {
+        String::new()
+    };
     let fleet_title = if app.filter_active {
         if app.filter_text.is_empty() {
-            " ◆── Fleet 🔍 (type to search) ──◆ ".to_string()
+            format!(" ◆── Fleet 🔍 (type to search{}) ──◆ ", selected_info)
         } else {
-            format!(" ◆── Fleet 🔍 {} ──◆ ", app.filter_text)
+            format!(" ◆── Fleet 🔍 {}{} ──◆ ", app.filter_text, selected_info)
         }
     } else if app.group_filter != GroupFilter::All {
-        format!(" ◆── Fleet [{}] ──◆ ", app.group_filter.label())
+        format!(" ◆── Fleet [{}{}] ──◆ ", app.group_filter.label(), selected_info)
     } else {
         format!(
             " ◆── Fleet [{}{}] ──◆ ",
@@ -8147,18 +8163,20 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("  Tab", "Switch focus: Fleet ↔ Chat", nav_style),
         ("  ↑↓ / j k", "Navigate fleet list", nav_style),
         ("  Enter", "Open agent detail", nav_style),
-        ("  r", "Refresh all agents (SSH)", act_style),
+        ("  R", "Refresh all agents (SSH)", act_style),
         ("  s", "Sort: name → status → location → version", act_style),
         ("  f", "Filter fleet list", act_style),
         ("  t", "Task board", nav_style),
         ("  v", "VPN mesh status", nav_style),
         ("  w", "Alerts & warnings", nav_style),
         ("  Space", "Toggle agent selection", act_style),
-        ("  A (Shift)", "Select all agents", act_style),
-        ("  N (Shift)", "Clear selection", act_style),
-        ("  a", "New agent wizard", act_style),
-        ("  /", "Fleet command (runs on all agents)", act_style),
-        ("  g", "Restart gateway (selected)", act_style),
+        ("  a", "Select all agents", act_style),
+        ("  A", "Clear selection", act_style),
+        ("  g", "Select all in current filter group", act_style),
+        ("  Esc", "Clear selection", act_style),
+        ("  /", "Fleet command (runs on selection/all)", act_style),
+        ("  r", "Restart gateway (selected)", act_style),
+        ("  P (Shift)", "Config push (selected)", act_style),
         ("  G (Shift)", "Investigate gateway (selected)", act_style),
         ("  o", "OpenClaw version audit", act_style),
         ("  u", "Bulk update OpenClaw", act_style),
