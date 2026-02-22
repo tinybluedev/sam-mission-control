@@ -307,6 +307,13 @@ struct App {
     diag_auto_fix: bool,
     diag_title: Option<String>,
     diag_start: Option<Instant>,
+    // Fleet diagnostics (multi-agent)
+    fleet_diag_active: bool,
+    fleet_diag_results: Vec<FleetDiagResult>,
+    fleet_diag_selected: usize,
+    fleet_diag_fix: bool,
+    fleet_diag_rx: Option<mpsc::UnboundedReceiver<FleetDiagMsg>>,
+    fleet_diag_done: bool,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -432,6 +439,7 @@ impl App {
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
             diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None,
+            fleet_diag_active: false, fleet_diag_results: vec![], fleet_diag_selected: 0, fleet_diag_fix: false, fleet_diag_rx: None, fleet_diag_done: false,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
@@ -1766,7 +1774,233 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         });
     }
 
-    /// Toggle a service plugin enabled/disabled via SSH
+    /// Start fleet diagnostics for all multi-selected agents sequentially.
+    /// Falls back to single-agent diagnostic if nothing is multi-selected.
+    fn start_fleet_diagnostics(&mut self, fix: bool) {
+        if self.multi_selected.is_empty() {
+            self.start_diagnostics(fix);
+            return;
+        }
+
+        let mut indices: Vec<usize> = self.multi_selected.iter().copied().collect();
+        indices.sort();
+
+        // Build snapshot of agent info for the background task
+        let agents_to_run: Vec<(usize, String, String, String, String, i32)> = indices.iter()
+            .filter_map(|&i| self.agents.get(i).map(|a| (i, a.name.clone(), a.emoji.clone(), a.host.clone(), a.ssh_user.clone(), a.gateway_port)))
+            .collect();
+
+        if agents_to_run.is_empty() { return; }
+
+        self.fleet_diag_results = agents_to_run.iter().enumerate().map(|(ri, (_ai, name, emoji, _host, _user, _gw_port))| FleetDiagResult {
+            agent_idx: agents_to_run[ri].0,
+            name: name.clone(),
+            emoji: emoji.clone(),
+            checks: [None; 7],
+            top_issue: String::new(),
+            running: ri == 0,
+            done: false,
+        }).collect();
+
+        self.fleet_diag_active = true;
+        self.fleet_diag_fix = fix;
+        self.fleet_diag_selected = 0;
+        self.fleet_diag_done = false;
+
+        let (tx, rx) = mpsc::unbounded_channel::<FleetDiagMsg>();
+        self.fleet_diag_rx = Some(rx);
+
+        tokio::spawn(async move {
+            for (result_idx, (_agent_idx, name, _emoji, host, user, gw_port)) in agents_to_run.iter().enumerate() {
+                let _ = tx.send(FleetDiagMsg::AgentStart(result_idx));
+
+                // Detect macOS for PATH prefix
+                let is_mac_check = tokio::process::Command::new("ssh").args([
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), "uname -s"
+                ]).output().await;
+                let is_mac = is_mac_check.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "Darwin").unwrap_or(false);
+                let pfx = if is_mac { "export PATH=/opt/homebrew/bin:$PATH; " } else { "" };
+
+                // Check 0: SSH connectivity
+                let ssh_ok = tokio::time::timeout(Duration::from_secs(6),
+                    tokio::process::Command::new("ssh").args([
+                        "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), "echo ok"
+                    ]).output()
+                ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+                let _ = tx.send(FleetDiagMsg::CheckDone {
+                    result_idx, check_idx: 0,
+                    status: if ssh_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                    issue: if ssh_ok { String::new() } else { "SSH unreachable".into() },
+                });
+
+                if !ssh_ok {
+                    // Mark remaining checks as skipped
+                    for ci in 1..7 {
+                        let _ = tx.send(FleetDiagMsg::CheckDone { result_idx, check_idx: ci, status: DiagStatus::Skipped, issue: String::new() });
+                    }
+                    let _ = tx.send(FleetDiagMsg::AgentDone(result_idx));
+                    continue;
+                }
+
+                // Check 1: Tailscale
+                let ts_out = tokio::process::Command::new("ssh").args([
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host),
+                    r#"tailscale status --self --json 2>/dev/null | grep -o '"Online":[a-z]*' | head -1 | cut -d: -f2 || echo ?"#
+                ]).output().await;
+                let ts_online = ts_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+                let ts_ok = ts_online == "True" || ts_online == "true";
+                let ts_status = if !ts_ok && fix {
+                    let fix_cmd = if is_mac {
+                        format!("{}sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --hostname={} --reset --timeout=25s 2>&1 | tail -1 || echo FAIL", pfx, name)
+                    } else {
+                        format!("sudo systemctl restart tailscaled 2>/dev/null; sleep 2; sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --hostname={} --reset --timeout=25s 2>&1 | tail -1 || echo FAIL", name)
+                    };
+                    let fix_out = tokio::process::Command::new("ssh").args([
+                        "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), &fix_cmd
+                    ]).output().await;
+                    if fix_out.map(|o| !String::from_utf8_lossy(&o.stdout).contains("FAIL")).unwrap_or(false) { DiagStatus::Fixed } else { DiagStatus::Fail }
+                } else {
+                    if ts_ok { DiagStatus::Pass } else { DiagStatus::Fail }
+                };
+                let _ = tx.send(FleetDiagMsg::CheckDone {
+                    result_idx, check_idx: 1, status: ts_status,
+                    issue: if matches!(ts_status, DiagStatus::Fail) { format!("Tailscale offline ({})", ts_online) } else { String::new() },
+                });
+
+                // Check 2: OpenClaw installed
+                let oc_out = tokio::process::Command::new("ssh").args([
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx)
+                ]).output().await;
+                let oc_ver = oc_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+                let oc_installed = !oc_ver.contains("NOT_INSTALLED") && oc_ver != "?";
+                let oc_status = if !oc_installed && fix {
+                    let install_cmd = if is_mac { format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx) }
+                        else { "sudo npm install -g openclaw@latest 2>&1 | tail -1".into() };
+                    let _ = tokio::time::timeout(Duration::from_secs(120),
+                        tokio::process::Command::new("ssh").args([
+                            "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                            &format!("{}@{}", user, host), &install_cmd
+                        ]).output()
+                    ).await;
+                    DiagStatus::Fixed
+                } else {
+                    if oc_installed { DiagStatus::Pass } else { DiagStatus::Fail }
+                };
+                let _ = tx.send(FleetDiagMsg::CheckDone {
+                    result_idx, check_idx: 2, status: oc_status,
+                    issue: if matches!(oc_status, DiagStatus::Fail) { "OpenClaw not installed".into() } else { String::new() },
+                });
+
+                // Check 3: Gateway running
+                let gw_out = tokio::process::Command::new("ssh").args([
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &format!("ss -tlnp 2>/dev/null | grep {} | head -1 || echo NONE", gw_port)
+                ]).output().await;
+                let gw_line = gw_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+                let gw_running = !gw_line.contains("NONE") && !gw_line.is_empty();
+                let gw_status = if !gw_running && fix {
+                    let start_cmd = if is_mac {
+                        format!("{}nohup openclaw gateway start > /dev/null 2>&1 &", pfx)
+                    } else {
+                        "sudo systemctl start openclaw-gateway 2>/dev/null || nohup openclaw gateway start > /dev/null 2>&1 &".into()
+                    };
+                    let _ = tokio::process::Command::new("ssh").args([
+                        "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), &start_cmd
+                    ]).output().await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    DiagStatus::Fixed
+                } else {
+                    if gw_running { DiagStatus::Pass } else { DiagStatus::Fail }
+                };
+                let _ = tx.send(FleetDiagMsg::CheckDone {
+                    result_idx, check_idx: 3, status: gw_status,
+                    issue: if matches!(gw_status, DiagStatus::Fail) { "Gateway not running".into() } else { String::new() },
+                });
+
+                // Check 4: Gateway API
+                let api_out = tokio::process::Command::new("ssh").args([
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &format!("curl -s -m 3 http://localhost:{}/health 2>/dev/null || echo FAIL", gw_port)
+                ]).output().await;
+                let api_resp = api_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+                let api_ok = !api_resp.contains("FAIL") && !api_resp.is_empty();
+                let api_status = if !api_ok && fix {
+                    let restart_cmd = if is_mac {
+                        format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)
+                    } else {
+                        "systemctl --user restart openclaw-gateway 2>/dev/null || sudo systemctl restart openclaw-gateway 2>/dev/null || openclaw gateway restart 2>&1 | tail -1".into()
+                    };
+                    let _ = tokio::process::Command::new("ssh").args([
+                        "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), &restart_cmd
+                    ]).output().await;
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    let recheck = tokio::process::Command::new("ssh").args([
+                        "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), &format!("curl -s -m 3 http://localhost:{}/health 2>/dev/null || echo FAIL", gw_port)
+                    ]).output().await;
+                    if recheck.map(|o| !String::from_utf8_lossy(&o.stdout).contains("FAIL")).unwrap_or(false) { DiagStatus::Fixed } else { DiagStatus::Fail }
+                } else {
+                    if api_ok { DiagStatus::Pass } else { DiagStatus::Fail }
+                };
+                let _ = tx.send(FleetDiagMsg::CheckDone {
+                    result_idx, check_idx: 4, status: api_status,
+                    issue: if matches!(api_status, DiagStatus::Fail) { "Gateway API down".into() } else { String::new() },
+                });
+
+                // Check 5: Config file
+                let cfg_out = tokio::process::Command::new("ssh").args([
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), "test -f ~/.openclaw/openclaw.json && echo EXISTS || echo MISSING"
+                ]).output().await;
+                let cfg_exists = cfg_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "EXISTS").unwrap_or(false);
+                let cfg_status = if !cfg_exists && fix {
+                    let init_cmd = format!("{}mkdir -p ~/.openclaw && openclaw init --non-interactive 2>/dev/null || echo '{{}}' > ~/.openclaw/openclaw.json && echo CREATED", pfx);
+                    let init_out = tokio::process::Command::new("ssh").args([
+                        "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), &init_cmd
+                    ]).output().await;
+                    if init_out.map(|o| String::from_utf8_lossy(&o.stdout).contains("CREATED")).unwrap_or(false) { DiagStatus::Fixed } else { DiagStatus::Fail }
+                } else {
+                    if cfg_exists { DiagStatus::Pass } else { DiagStatus::Fail }
+                };
+                let _ = tx.send(FleetDiagMsg::CheckDone {
+                    result_idx, check_idx: 5, status: cfg_status,
+                    issue: if matches!(cfg_status, DiagStatus::Fail) { "Config missing".into() } else { String::new() },
+                });
+
+                // Check 6: Workspace
+                let ws_out = tokio::process::Command::new("ssh").args([
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), "ls ~/CLAUDE/clawd/SOUL.md 2>/dev/null && echo HAS_SOUL || echo NO_SOUL"
+                ]).output().await;
+                let has_soul = ws_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("HAS_SOUL")).unwrap_or(false);
+                let ws_status = if !has_soul && fix {
+                    let ws_cmd = "mkdir -p ~/CLAUDE/clawd/memory && echo '# SOUL.md' > ~/CLAUDE/clawd/SOUL.md && echo '# AGENTS.md' > ~/CLAUDE/clawd/AGENTS.md && echo '# MEMORY.md' > ~/CLAUDE/clawd/MEMORY.md && echo CREATED";
+                    let ws_result = tokio::process::Command::new("ssh").args([
+                        "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), ws_cmd
+                    ]).output().await;
+                    if ws_result.map(|o| String::from_utf8_lossy(&o.stdout).contains("CREATED")).unwrap_or(false) { DiagStatus::Fixed } else { DiagStatus::Fail }
+                } else {
+                    if has_soul { DiagStatus::Pass } else { DiagStatus::Fail }
+                };
+                let _ = tx.send(FleetDiagMsg::CheckDone {
+                    result_idx, check_idx: 6, status: ws_status,
+                    issue: if matches!(ws_status, DiagStatus::Fail) { "Workspace missing".into() } else { String::new() },
+                });
+
+                let _ = tx.send(FleetDiagMsg::AgentDone(result_idx));
+            }
+            let _ = tx.send(FleetDiagMsg::AllDone);
+        });
+    }
     fn toggle_service(&mut self) {
         if self.svc_selected >= self.svc_list.len() { return; }
         let svc = &self.svc_list[self.svc_selected];
@@ -2204,7 +2438,7 @@ struct DiagStep {
     detail: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum DiagStatus {
     Running,
     Pass,
@@ -2217,6 +2451,27 @@ impl DiagStatus {
     fn icon(&self) -> &'static str {
         match self { DiagStatus::Running => "⏳", DiagStatus::Pass => "✓", DiagStatus::Fail => "✗", DiagStatus::Fixed => "🔧", DiagStatus::Skipped => "⊘" }
     }
+}
+
+const FLEET_CHECK_LABELS: [&str; 7] = ["SSH", "TS", "OC", "GW", "API", "CFG", "WS"];
+
+/// Per-agent summary row in fleet diagnostic overlay
+#[derive(Clone, Debug)]
+struct FleetDiagResult {
+    agent_idx: usize,
+    name: String,
+    emoji: String,
+    checks: [Option<DiagStatus>; 7], // ssh, tailscale, oc, gateway, api, config, workspace
+    top_issue: String,
+    running: bool,
+    done: bool,
+}
+
+enum FleetDiagMsg {
+    AgentStart(usize),
+    CheckDone { result_idx: usize, check_idx: usize, status: DiagStatus, issue: String },
+    AgentDone(usize),
+    AllDone,
 }
 
 const SERVICE_ICONS: &[(&str, &str)] = &[
@@ -3010,6 +3265,132 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
 
     // Footer
     render_footer(frame, app, chunks[2]);
+}
+
+fn render_fleet_diagnostics(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = frame.area();
+
+    let n = app.fleet_diag_results.len();
+    // Width: header + check columns + issue column
+    let w = ((area.width as f32 * 0.75) as u16).max(72).min(area.width.saturating_sub(4));
+    // Height: title border + header row + separator + agent rows + summary + hint + border
+    let h = (n as u16 + 7).min(area.height.saturating_sub(4)).max(8);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, popup);
+
+    let done_count = app.fleet_diag_results.iter().filter(|r| r.done).count();
+    let fail_count = app.fleet_diag_results.iter().filter(|r| r.done && r.checks.iter().any(|c| matches!(c, Some(DiagStatus::Fail)))).count();
+    let pass_count = done_count.saturating_sub(fail_count);
+
+    let title = format!(
+        " {} Fleet Diagnostic — {} agents ",
+        if app.fleet_diag_fix { "🔧" } else { "🔍" },
+        n
+    );
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+
+    // Column header: name (20), then 7 check columns (4 each), then issue
+    let name_w = 20usize;
+    let col_w = 4usize;
+    let mut header_spans = vec![
+        Span::styled(format!("  {:name_w$}", "Agent"), Style::default().fg(t.text_dim).bold()),
+    ];
+    for label in &FLEET_CHECK_LABELS {
+        header_spans.push(Span::styled(format!("{:col_w$}", label), Style::default().fg(t.text_dim).bold()));
+    }
+    header_spans.push(Span::styled("  Issue".to_string(), Style::default().fg(t.text_dim).bold()));
+    lines.push(Line::from(header_spans));
+
+    // Separator
+    lines.push(Line::from(Span::styled(
+        format!("  {}", "─".repeat((w.saturating_sub(4)) as usize)),
+        Style::default().fg(t.text_dim),
+    )));
+
+    for (i, result) in app.fleet_diag_results.iter().enumerate() {
+        let selected = i == app.fleet_diag_selected;
+        let row_style = if selected { Style::default().bg(t.accent).fg(t.text) } else { Style::default() };
+
+        let mut spans: Vec<Span> = Vec::new();
+
+        // Selection indicator + name
+        let sel_icon = if selected { "▶ " } else { "  " };
+        let name_display = format!("{}{} {}", sel_icon, result.emoji, result.name);
+        let name_truncated = if name_display.chars().count() > name_w + 2 {
+            format!("{}…", name_display.chars().take(name_w + 1).collect::<String>())
+        } else {
+            format!("{:width$}", name_display, width = name_w + 2)
+        };
+
+        if result.running {
+            let spinner = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+            spans.push(Span::styled(name_truncated, if selected { row_style } else { Style::default().fg(t.text) }));
+            spans.push(Span::styled(
+                format!(" {} running…", spinner),
+                if selected { row_style } else { Style::default().fg(t.pending) },
+            ));
+        } else if !result.done && !result.running {
+            spans.push(Span::styled(name_truncated, if selected { row_style } else { Style::default().fg(t.text_dim) }));
+            spans.push(Span::styled(" (pending)", if selected { row_style } else { Style::default().fg(t.text_dim) }));
+        } else {
+            spans.push(Span::styled(name_truncated, if selected { row_style } else { Style::default().fg(t.text) }));
+            for check in &result.checks {
+                let (icon, color) = match check {
+                    None => ("  ? ", t.text_dim),
+                    Some(DiagStatus::Pass) => ("  ✓ ", t.status_online),
+                    Some(DiagStatus::Fail) => ("  ✗ ", t.status_offline),
+                    Some(DiagStatus::Fixed) => (" 🔧 ", t.status_busy),
+                    Some(DiagStatus::Skipped) => ("  — ", t.text_dim),
+                    Some(DiagStatus::Running) => ("  … ", t.pending),
+                };
+                spans.push(Span::styled(icon.to_string(), if selected { row_style } else { Style::default().fg(color) }));
+            }
+            if !result.top_issue.is_empty() {
+                let issue = format!("  {}", result.top_issue);
+                spans.push(Span::styled(issue, if selected { row_style } else { Style::default().fg(t.status_offline) }));
+            }
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::from(""));
+
+    // Summary / status line
+    if app.fleet_diag_done {
+        let summary = if fail_count == 0 {
+            format!("  All {} agents healthy ✓", n)
+        } else {
+            format!("  {}/{} passed, {} failed", pass_count, done_count, fail_count)
+        };
+        let color = if fail_count == 0 { t.status_online } else { t.status_offline };
+        lines.push(Line::from(Span::styled(summary, Style::default().fg(color).bold())));
+    } else {
+        let spinner = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+        lines.push(Line::from(Span::styled(
+            format!("  {} {}/{} agents complete…", spinner, done_count, n),
+            Style::default().fg(t.pending),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ navigate  Enter drill-in  Esc close",
+        Style::default().fg(t.text_dim),
+    )));
+
+    let border_color = if app.fleet_diag_fix { t.status_busy } else { t.accent };
+    let diag = Paragraph::new(lines)
+        .block(Block::default()
+            .title(Span::styled(title, Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(diag, popup);
 }
 
 fn render_diagnostics(frame: &mut Frame, app: &App) {
@@ -4162,7 +4543,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Screen::SpawnManager => render_spawn_manager(f, &app),
             }
             // Diagnostic overlay (renders on top of everything)
-            if app.diag_active {
+            if app.fleet_diag_active {
+                render_fleet_diagnostics(f, &app);
+            } else if app.diag_active {
                 render_diagnostics(f, &app);
             }
 
@@ -4363,6 +4746,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => {}
                         }
                     } else {
+                    // Fleet diagnostic overlay intercepts all keys when active
+                    if app.fleet_diag_active {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.fleet_diag_active = false;
+                                app.fleet_diag_results.clear();
+                                app.fleet_diag_rx = None;
+                                app.fleet_diag_done = false;
+                                app.start_refresh();
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if app.fleet_diag_selected > 0 { app.fleet_diag_selected -= 1; }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.fleet_diag_selected < app.fleet_diag_results.len().saturating_sub(1) {
+                                    app.fleet_diag_selected += 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                // Drill into selected agent — close fleet view and open single-agent diag
+                                let agent_idx = app.fleet_diag_results.get(app.fleet_diag_selected).map(|r| r.agent_idx);
+                                let fix = app.fleet_diag_fix;
+                                app.fleet_diag_active = false;
+                                app.fleet_diag_results.clear();
+                                app.fleet_diag_rx = None;
+                                app.fleet_diag_done = false;
+                                if let Some(idx) = agent_idx {
+                                    app.selected = idx;
+                                    app.start_diagnostics(fix);
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else
                     // Diagnostic overlay intercepts all keys when active
                     if app.diag_active {
                         match key.code {
@@ -4732,8 +5149,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             },
                             Focus::Fleet => match key.code {
                                 KeyCode::Char('q') => app.should_quit = true,
-                                KeyCode::Char('d') => app.start_diagnostics(false),
-                                KeyCode::Char('D') => app.start_diagnostics(true),
+                                KeyCode::Char('d') => app.start_fleet_diagnostics(false),
+                                KeyCode::Char('D') => app.start_fleet_diagnostics(true),
                                 KeyCode::Tab => app.focus = Focus::Chat,
                                 KeyCode::Up | KeyCode::Char('k') => app.previous(),
                                 KeyCode::Down | KeyCode::Char('j') => app.next(),
@@ -5110,7 +5527,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Receive wizard SSH test result (non-blocking)
+        // Receive fleet diagnostic messages (non-blocking)
+        if app.fleet_diag_active {
+            if let Some(ref mut rx) = app.fleet_diag_rx {
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        FleetDiagMsg::AgentStart(ri) => {
+                            if let Some(r) = app.fleet_diag_results.get_mut(ri) {
+                                r.running = true;
+                            }
+                        }
+                        FleetDiagMsg::CheckDone { result_idx, check_idx, status, issue } => {
+                            if let Some(r) = app.fleet_diag_results.get_mut(result_idx) {
+                                if check_idx < 7 { r.checks[check_idx] = Some(status); }
+                                if r.top_issue.is_empty() && matches!(status, DiagStatus::Fail) {
+                                    r.top_issue = issue;
+                                }
+                            }
+                        }
+                        FleetDiagMsg::AgentDone(ri) => {
+                            if let Some(r) = app.fleet_diag_results.get_mut(ri) {
+                                r.running = false;
+                                r.done = true;
+                            }
+                        }
+                        FleetDiagMsg::AllDone => {
+                            app.fleet_diag_done = true;
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(ref mut rx) = app.wizard_ssh_rx {
             if let Ok(result) = rx.try_recv() {
                 app.wizard.testing_ssh = false;
