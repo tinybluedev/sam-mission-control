@@ -44,16 +44,33 @@ pub struct DbAgent {
     pub token_burn_today: i32,
     pub uptime_seconds: i64,
     pub current_task_id: Option<i32>,
+    pub gateway_port: i32,
+    pub gateway_token: Option<String>,
 }
 
 pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
-    let agents: Vec<DbAgent> = conn.query_map(
-        "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id FROM mc_fleet_status ORDER BY agent_name",
-        |(agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id)| {
-            DbAgent { agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id }
-        },
+    let rows: Vec<mysql_async::Row> = conn.query(
+        "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token FROM mc_fleet_status ORDER BY agent_name",
     ).await?;
+    let agents = rows.into_iter().map(|r| {
+        use mysql_async::prelude::FromValue;
+        DbAgent {
+            agent_name: r.get(0).unwrap_or_default(),
+            hostname: r.get(1),
+            tailscale_ip: r.get(2),
+            status: r.get::<String, _>(3).unwrap_or_else(|| "unknown".into()),
+            oc_version: r.get(4),
+            os_info: r.get(5),
+            kernel: r.get(6),
+            capabilities: r.get(7),
+            token_burn_today: r.get(8).unwrap_or(0),
+            uptime_seconds: r.get(9).unwrap_or(0),
+            current_task_id: r.get(10),
+            gateway_port: r.get(11).unwrap_or(18789),
+            gateway_token: r.get(12),
+        }
+    }).collect();
     Ok(agents)
 }
 

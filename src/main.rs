@@ -46,6 +46,8 @@ struct Agent {
     cpu_pct: Option<f32>,
     ram_pct: Option<f32>,
     disk_pct: Option<f32>,
+    gateway_port: i32,
+    gateway_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -222,6 +224,8 @@ impl App {
                         token_burn: da.token_burn_today,
                         latency_ms: None,
                         cpu_pct: None, ram_pct: None, disk_pct: None,
+                        gateway_port: da.gateway_port,
+                        gateway_token: da.gateway_token.clone(),
                     });
                 }
             }
@@ -319,7 +323,44 @@ impl App {
         });
 
         if let Some(pool) = &self.db_pool {
-            let _ = db::send_broadcast(pool, &self.user(), &message, &agent_names).await;
+            let ids = db::send_broadcast(pool, &self.user(), &message, &agent_names).await.unwrap_or_default();
+            // Fire AI requests to all agents with tokens
+            for (i, agent) in self.agents.iter().enumerate() {
+                if let Some(tok) = &agent.gateway_token {
+                    let url = format!("http://{}:{}/v1/chat/completions", agent.host, agent.gateway_port);
+                    let tok = tok.clone();
+                    let msg = message.clone();
+                    let pool = pool.clone();
+                    let msg_id = ids.get(i).copied().unwrap_or(0);
+                    tokio::spawn(async move {
+                        let client = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(60))
+                            .build().unwrap_or_default();
+                        let body = serde_json::json!({
+                            "model": "openclaw:main",
+                            "messages": [{"role": "user", "content": msg}]
+                        });
+                        let result = client.post(&url)
+                            .header("Authorization", format!("Bearer {}", tok))
+                            .header("Content-Type", "application/json")
+                            .json(&body)
+                            .send().await;
+                        let response = match result {
+                            Ok(resp) => {
+                                match resp.json::<serde_json::Value>().await {
+                                    Ok(j) => j["choices"][0]["message"]["content"]
+                                        .as_str().unwrap_or("(no content)").to_string(),
+                                    Err(e) => format!("Parse error: {}", e),
+                                }
+                            }
+                            Err(e) => format!("⚠ {}", e),
+                        };
+                        if msg_id > 0 {
+                            let _ = db::respond_to_chat(&pool, msg_id, &response).await;
+                        }
+                    });
+                }
+            }
         }
         self.chat_scroll = 0;
     }
@@ -328,7 +369,11 @@ impl App {
         if self.agent_chat_input.trim().is_empty() { return; }
         let message = self.agent_chat_input.clone();
         self.agent_chat_input.clear();
-        let target = self.agents[self.selected].db_name.clone();
+        let agent = &self.agents[self.selected];
+        let target = agent.db_name.clone();
+        let host = agent.host.clone();
+        let port = agent.gateway_port;
+        let token = agent.gateway_token.clone();
 
         self.agent_chat_history.push(ChatLine {
             sender: self.user(), target: Some(target.clone()), message: message.clone(),
@@ -336,8 +381,53 @@ impl App {
             kind: "direct".into(),
         });
 
-        if let Some(pool) = &self.db_pool {
-            let _ = db::send_chat(pool, &self.user(), Some(&target), &message).await;
+        // Store in DB
+        let msg_id = if let Some(pool) = &self.db_pool {
+            db::send_chat(pool, &self.user(), Some(&target), &message).await.unwrap_or(0)
+        } else { 0 };
+
+        // Fire AI request via OpenClaw HTTP API
+        if let Some(tok) = token {
+            let pool = self.db_pool.clone();
+            let user = self.user();
+            tokio::spawn(async move {
+                let url = format!("http://{}:{}/v1/chat/completions", host, port);
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build().unwrap_or_default();
+                let body = serde_json::json!({
+                    "model": "openclaw:main",
+                    "messages": [{"role": "user", "content": message}]
+                });
+                let result = client.post(&url)
+                    .header("Authorization", format!("Bearer {}", tok))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send().await;
+                let response = match result {
+                    Ok(resp) => {
+                        match resp.json::<serde_json::Value>().await {
+                            Ok(j) => j["choices"][0]["message"]["content"]
+                                .as_str().unwrap_or("(no content)").to_string(),
+                            Err(e) => format!("Parse error: {}", e),
+                        }
+                    }
+                    Err(e) => format!("Connection error: {}", e),
+                };
+                // Write response to DB
+                if let Some(pool) = pool {
+                    if msg_id > 0 {
+                        let _ = db::respond_to_chat(&pool, msg_id, &response).await;
+                    }
+                }
+            });
+        } else {
+            // No gateway token — fall back to SSH
+            if let Some(pool) = &self.db_pool {
+                if msg_id > 0 {
+                    let _ = db::respond_to_chat(pool, msg_id, "(no gateway token configured)").await;
+                }
+            }
         }
         self.agent_chat_scroll = 0;
     }
@@ -1595,6 +1685,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         token_burn: 0,
                                         latency_ms: None,
                                         cpu_pct: None, ram_pct: None, disk_pct: None,
+                                        gateway_port: 18789,
+                                        gateway_token: None,
                                     });
                                     app.wizard.active = false;
                                     app.status_message = format!("✅ Agent '{}' created", app.wizard.agent_name);
