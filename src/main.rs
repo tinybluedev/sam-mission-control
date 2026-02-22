@@ -4197,6 +4197,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cli::Commands::Onboard { host, user, name }) => {
             return cli::run_onboard(&host, &user, name.as_deref()).await.map_err(|e| e.into());
         }
+        Some(cli::Commands::Log { agent, tail }) => {
+            return cli::run_log(agent.as_deref(), tail).await.map_err(|e| e.into());
+        }
         Some(cli::Commands::Version) => {
             println!("sam v{}", env!("CARGO_PKG_VERSION"));
             return Ok(());

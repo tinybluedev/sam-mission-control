@@ -569,6 +569,41 @@ pub struct Operation {
     pub output: Option<String>,
 }
 
+
+/// A row from mc_operations, used by `sam log`
+pub struct OperationRecord {
+    pub id: u64,
+    pub agent_name: String,
+    pub op_type: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+}
+
+/// Fetch recent operations from mc_operations
+pub async fn get_operations(
+    pool: &Pool,
+    agent: Option<&str>,
+    tail: u32,
+) -> Result<Vec<OperationRecord>, Box<dyn std::error::Error>> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    let rows: Vec<(u64, String, String, String, Option<String>, String)> = if let Some(a) = agent {
+        conn.exec(
+            "SELECT id, agent, op_type, status, output, DATE_FORMAT(started_at, '%Y-%m-%d %H:%i') FROM mc_operations WHERE agent=? ORDER BY id DESC LIMIT ?",
+            (a, tail),
+        ).await?
+    } else {
+        conn.exec(
+            "SELECT id, agent, op_type, status, output, DATE_FORMAT(started_at, '%Y-%m-%d %H:%i') FROM mc_operations ORDER BY id DESC LIMIT ?",
+            (tail,),
+        ).await?
+    };
+    Ok(rows.into_iter().map(|(id, agent_name, op_type, status, detail, created_at)| {
+        OperationRecord { id, agent_name, op_type, status, detail, created_at }
+    }).collect())
+}
+
 /// Record the start of an operation in `mc_operations`. Returns the new record ID.
 pub async fn create_operation(pool: &Pool, agent: &str, op_type: &str) -> Result<i64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
