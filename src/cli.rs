@@ -27,20 +27,20 @@ pub enum Commands {
     /// Full automated setup (DB tables, config, everything)
     Init {
         /// MySQL host
-        #[arg(long, default_value = "127.0.0.1")]
-        db_host: String,
+        #[arg(long)]
+        db_host: Option<String>,
         /// MySQL port
-        #[arg(long, default_value = "3306")]
-        db_port: u16,
+        #[arg(long)]
+        db_port: Option<u16>,
         /// MySQL user
-        #[arg(long, default_value = "root")]
-        db_user: String,
+        #[arg(long)]
+        db_user: Option<String>,
         /// MySQL password
         #[arg(long)]
-        db_pass: String,
+        db_pass: Option<String>,
         /// Database name
-        #[arg(long, default_value = "quantum_memory")]
-        db_name: String,
+        #[arg(long)]
+        db_name: Option<String>,
         /// This machine's IP (for self-detection)
         #[arg(long)]
         self_ip: Option<String>,
@@ -642,11 +642,42 @@ pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Resul
 
 
 /// Full automated init — creates everything from scratch
-pub async fn run_init(db_host: &str, db_port: u16, db_user: &str, db_pass: &str, db_name: &str, self_ip: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Option<&str>, db_pass: Option<&str>, db_name: Option<&str>, self_ip: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use mysql_async::prelude::*;
+    use std::io::{self, Write};
 
-    println!("\n🛰️  S.A.M Mission Control — Auto Init");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("\n🛰️  S.A.M Mission Control — Setup");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+    let prompt = |label: &str, default: &str| -> String {
+        print!("  {} [{}]: ", label, default);
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let v = input.trim().to_string();
+        if v.is_empty() { default.to_string() } else { v }
+    };
+
+    // Interactive prompts for missing values
+    let db_host = db_host.map(|s| s.to_string()).unwrap_or_else(|| prompt("MySQL host", "127.0.0.1"));
+    let db_port = db_port.unwrap_or_else(|| prompt("MySQL port", "3306").parse().unwrap_or(3306));
+    let db_user = db_user.map(|s| s.to_string()).unwrap_or_else(|| prompt("MySQL user", "root"));
+    let db_pass = db_pass.map(|s| s.to_string()).unwrap_or_else(|| {
+        print!("  MySQL password: ");
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        input.trim().to_string()
+    });
+    let db_name = db_name.map(|s| s.to_string()).unwrap_or_else(|| prompt("Database name", "quantum_memory"));
+    let self_ip = self_ip.map(|s| s.to_string()).unwrap_or_else(|| {
+        let detected = std::process::Command::new("hostname").arg("-I").output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("127.0.0.1").to_string())
+            .unwrap_or_else(|_| "127.0.0.1".into());
+        prompt("This machine's IP", &detected)
+    });
+
+    println!();
 
     // Step 1: Connect to DB
     print!("  [1/4] Connecting to MySQL... ");
@@ -712,51 +743,47 @@ pub async fn run_init(db_host: &str, db_port: u16, db_user: &str, db_pass: &str,
 
     // Step 3: Generate config
     print!("  [3/4] Generating config... ");
-    let self_ip_val = self_ip.unwrap_or("127.0.0.1");
     let cfg = SamConfig {
         database: DatabaseConfig {
-            url: Some(format!("mysql://{}:{}@{}:{}/{}", db_user, encoded_pass, db_host, db_port, db_name)),
-            host: Some(db_host.into()),
+            url: Some(url.clone()),
+            host: Some(db_host.clone()),
             port: Some(db_port),
-            user: Some(db_user.into()),
-            password: Some(db_pass.into()),
-            database: Some(db_name.into()),
+            user: Some(db_user.clone()),
+            password: Some(db_pass.clone()),
+            database: Some(db_name.clone()),
         },
         tui: TuiConfig::default(),
         fleet: FleetConfig::default(),
         identity: IdentityConfig { user: whoami().unwrap_or_else(|| "operator".into()) },
     };
     cfg.save()?;
-    
-    // Also write .env for backward compat
+
+    // Also write .env
     let env_path = std::path::Path::new(".env");
     if !env_path.exists() {
         std::fs::write(env_path, format!(
             "SAM_DB_URL={}\nSAM_SELF_IP={}\nSAM_USER={}\n",
-            format!("mysql://{}:{}@{}:{}/{}", db_user, encoded_pass, db_host, db_port, db_name),
-            self_ip_val,
-            cfg.identity.user,
+            url, self_ip, cfg.identity.user,
         ))?;
     }
     println!("✅ ~/.config/sam/config.toml");
 
-    // Step 4: Detect local machine and self-register
+    // Step 4: Self-register
     print!("  [4/4] Registering this machine... ");
     let hostname = std::process::Command::new("hostname").output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "localhost".into());
     conn.exec_drop(
         "INSERT IGNORE INTO mc_fleet_status (agent_name, tailscale_ip, status) VALUES (?, ?, 'online')",
-        (&hostname.to_lowercase(), self_ip_val),
+        (&hostname.to_lowercase(), &self_ip),
     ).await?;
-    println!("✅ {} @ {}", hostname, self_ip_val);
+    println!("✅ {} @ {}", hostname, self_ip);
 
     pool.disconnect().await?;
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  ✅ Ready! Run `sam` to launch Mission Control.");
-    println!("  📡 Add agents: `sam onboard <ip>`");
-    println!();
+    println!("  📡 Add agents: `sam onboard <ip>`\n");
 
     Ok(())
 }

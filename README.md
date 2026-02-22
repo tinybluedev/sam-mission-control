@@ -1,104 +1,73 @@
 # 🛰️ S.A.M Mission Control
 
-Fleet orchestration TUI for AI agents. Monitor, chat with, and manage your entire fleet from one terminal.
+Fleet orchestration TUI for AI agents.
 
-## Quick Start
+## Install
 
 ```bash
-# Build
+curl -fsSL https://raw.githubusercontent.com/tinybluedev/sam-mission-control/main/install.sh | bash
+```
+
+Or build manually:
+
+```bash
 git clone https://github.com/tinybluedev/sam-mission-control.git
 cd sam-mission-control
 cargo build --release
 sudo cp target/release/sam-mission-control /usr/local/bin/sam
-
-# Init (creates DB tables, config, everything)
-sam init --db-host 10.0.0.1 --db-pass 'yourpassword'
-
-# Launch
-sam
 ```
 
-That's it. Three commands.
-
-## Add Agents
+## Setup
 
 ```bash
-# Onboard a machine (installs OpenClaw, configures gateway, registers in fleet)
-sam onboard 10.64.0.3
-
-# Push workspace files to agents
-sam deploy all --file SOUL.md
-sam deploy dellr720 --file AGENTS.md
+sam init
 ```
 
-## What It Does
+That's it. The wizard walks you through everything — database connection, config, and self-registration. All interactive. Pass flags to skip prompts:
 
-| Screen | Key | Description |
-|--------|-----|-------------|
-| **Dashboard** | — | Fleet status, global chat, resource bars |
-| **Agent Detail** | `Enter` | Private AI chat, config viewer, gateway logs |
-| **Task Board** | `t` | Create and track fleet tasks |
-| **Alerts** | `w` | Threshold-based notifications |
-| **VPN Status** | `v` | Tailscale mesh overview |
-| **Help** | `?` | Full keybinding reference |
+```bash
+sam init --db-host 10.0.0.1 --db-pass 'secret'
+```
 
-## Keybindings
+## Usage
 
-| Key | Action |
-|-----|--------|
-| `↑↓` / `jk` | Navigate |
-| `Enter` | Agent detail |
-| `Tab` | Switch panels |
-| `Space` | Toggle select |
-| `f` | Filter/search |
-| `s` | Sort fleet |
-| `/` | Run command on fleet |
-| `g` | Restart gateway |
-| `G` | Investigate gateway |
+```bash
+sam                           # Launch TUI
+sam onboard <ip>              # Add an agent to your fleet
+sam deploy all --file SOUL.md # Push files to agents
+sam status                    # Quick fleet check
+sam chat cyber "hello"        # Message an agent
+```
+
+## What You Get
+
+- **Fleet dashboard** — live status of every agent with SSH probing
+- **AI chat** — talk to agents through OpenClaw's API (real AI responses)
+- **Resource monitoring** — CPU, RAM, disk with color-coded bars
+- **Alerts** — automatic notifications when things go wrong
+- **Task board** — create and track fleet work
+- **One-command onboarding** — `sam onboard <ip>` handles everything
+- **8 themes** — cycle with `c`, backgrounds with `b`
+
+## Keys
+
+`?` in the TUI shows all keybindings. The important ones:
+
+| Key | What it does |
+|-----|-------------|
+| `Enter` | Open agent detail + chat |
+| `f` | Filter/search agents |
+| `/` | Run command across fleet |
+| `g` | Restart agent gateway |
 | `e` | View agent config |
-| `a` | Add agent wizard |
-| `r` | Refresh |
-| `c` / `b` | Cycle theme / background |
-| `?` | Help |
-| `q` | Quit |
-
-## CLI
-
-```bash
-sam                  # TUI
-sam status           # Fleet status (non-interactive)
-sam chat cyber "hi"  # Message an agent
-sam onboard <ip>     # Provision new agent
-sam deploy <target> --file <file>  # Push workspace files
-sam init             # First-time setup
-sam setup            # Config wizard
-```
-
-## Chat
-
-Agent detail chat talks to **real AI agents** via OpenClaw's HTTP API. Each agent responds with its own personality, context, and tools.
-
-Dashboard chat broadcasts to all agents simultaneously.
-
-## Architecture
-
-```
-sam (Rust TUI) ──SQL──► MySQL (mc_fleet_status, mc_chat)
-       │
-       ├──SSH──► Agent probes (status, resources, latency)
-       └──HTTP──► OpenClaw gateway /v1/chat/completions (AI chat)
-```
-
-- **Zero network exposure** — no HTTP server, no open ports on the hub
-- **SSH + Tailscale mesh** — rides your existing VPN
-- **Single binary** — ~6MB, zero runtime deps
+| `t` | Task board |
+| `w` | Alerts |
 
 ## Requirements
 
-- Rust 1.85+
-- MySQL/MariaDB
-- SSH key access to fleet nodes
-- [OpenClaw](https://openclaw.ai) on each agent (installed automatically by `sam onboard`)
+- MySQL or MariaDB (any version)
+- SSH key access to your machines
+- [OpenClaw](https://openclaw.ai) on each agent (auto-installed by `sam onboard`)
 
 ## License
 
