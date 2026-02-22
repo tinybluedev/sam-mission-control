@@ -252,6 +252,8 @@ struct App {
     last_refresh: Instant,
     last_chat_poll: Instant,
     status_message: String,
+    toast_message: Option<String>,
+    toast_at: Option<Instant>,
     db_pool: Option<mysql_async::Pool>,
     chat_input: String,
     chat_history: Vec<ChatLine>,
@@ -379,7 +381,7 @@ impl App {
             fleet_config: fleet_config.agent,
             agents, selected: 0, screen: Screen::Dashboard, focus: Focus::Fleet,
             should_quit: false, last_refresh: Instant::now(), last_chat_poll: Instant::now(),
-            status_message: String::new(),
+            status_message: String::new(), toast_message: None, toast_at: None,
             db_pool: Some(pool),
             chat_input: String::new(), chat_history, chat_scroll: 0,
             agent_chat_input: String::new(), agent_chat_history: vec![], agent_chat_scroll: 0,
@@ -405,6 +407,11 @@ impl App {
 
     fn next(&mut self) { if self.selected < self.agents.len() - 1 { self.selected += 1; } }
     fn previous(&mut self) { if self.selected > 0 { self.selected -= 1; } }
+
+    fn toast(&mut self, msg: &str) {
+        self.toast_message = Some(msg.to_string());
+        self.toast_at = Some(Instant::now());
+    }
 
     fn user(&self) -> String { std::env::var("SAM_USER").unwrap_or_else(|_| "operator".into()) }
 
@@ -1080,6 +1087,8 @@ SAMEOF", path, path, escaped_content);
 
         self.ws_editing = false;
         self.ws_content = Some(self.ws_edit_buffer.clone());
+        let fname = if self.ws_selected < self.ws_files.len() { self.ws_files[self.ws_selected].name.clone() } else { "file".into() };
+        self.toast(&format!("✓ Saved {}", fname));
     }
 
     fn start_refresh(&mut self) {
@@ -2533,12 +2542,79 @@ fn render_help(frame: &mut Frame, app: &App) {
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let footer = Paragraph::new(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(&app.status_message, Style::default().fg(t.text_dim)),
-    ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
-        .border_style(Style::default().fg(t.border))
-        .style(Style::default().bg(app.bg_density.bg())));
+
+    // Breadcrumb
+    let crumb = match app.screen {
+        Screen::Dashboard => "Dashboard".to_string(),
+        Screen::AgentDetail => {
+            let name = if app.selected < app.agents.len() { &app.agents[app.selected].name } else { "?" };
+            let tab = match app.focus {
+                Focus::AgentChat => "Chat",
+                Focus::Workspace => "Files",
+                _ => "Info",
+            };
+            format!("Dashboard › {} › {}", name, tab)
+        }
+        Screen::TaskBoard => {
+            if let Some(ref agent) = app.task_filter_agent {
+                format!("Dashboard › {} › Tasks", agent)
+            } else {
+                "Dashboard › Tasks".to_string()
+            }
+        }
+        Screen::Help => "Help".to_string(),
+        _ => "Dashboard".to_string(),
+    };
+
+    // Contextual keybinds
+    let keys = match app.screen {
+        Screen::Dashboard => match app.focus {
+            Focus::Chat => "Tab:fleet  Enter:send  Esc:back  @agent:target",
+            Focus::Command => "Enter:run  Esc:cancel",
+            _ => "Enter:open  t:tasks  f:filter  s:sort  r:refresh  /:cmd  ?:help  q:quit",
+        },
+        Screen::AgentDetail => match app.focus {
+            Focus::AgentChat => "Enter:send  @:tag  Tab:next  Esc:info  1-4:tabs",
+            Focus::Workspace => "Enter:view  e:edit  r:reload  Esc:info  1-4:tabs",
+            _ => "Tab:chat  w:files  t:tasks  g:gateway  e:config  Esc:back  1-4:tabs",
+        },
+        Screen::TaskBoard => "n:new  d:done  c:clear filter  Esc:back",
+        Screen::Help => "Esc:back  q:quit",
+        _ => "Esc:back",
+    };
+
+    // Toast (auto-dismiss after 4s)
+    let show_toast = app.toast_at.map(|t| t.elapsed() < Duration::from_secs(4)).unwrap_or(false);
+    let toast_text = if show_toast { app.toast_message.as_deref().unwrap_or("") } else { "" };
+
+    let left = vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(&crumb, Style::default().fg(t.accent).bold()),
+    ];
+
+    let right_text = if !toast_text.is_empty() {
+        format!("{}  ", toast_text)
+    } else {
+        format!("{}  ", keys)
+    };
+
+    // Calculate padding
+    let left_len: usize = crumb.len() + 2;
+    let right_len = right_text.len();
+    let pad = (area.width as usize).saturating_sub(left_len + right_len + 4);
+
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(pad)));
+    if !toast_text.is_empty() {
+        spans.push(Span::styled(right_text, Style::default().fg(Color::Yellow).bold()));
+    } else {
+        spans.push(Span::styled(right_text, Style::default().fg(t.text_dim)));
+    }
+
+    let footer = Paragraph::new(Line::from(spans))
+        .block(Block::default().borders(Borders::ALL).border_type(t.border_type)
+            .border_style(Style::default().fg(t.border))
+            .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(footer, area);
 }
 
@@ -2935,7 +3011,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let host = agent.host.clone();
                                         let user = agent.ssh_user.clone();
                                         let self_ip = app.self_ip.clone();
-                                        app.status_message = format!("📋 Fetching config from {}...", agent.name);
+                                        let aname = agent.name.clone();
                                         let is_mac = agent.os.to_lowercase().contains("mac");
                                         let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
                                         let cmd = format!("{}cat ~/.openclaw/openclaw.json 2>/dev/null || echo '(no config found)'", pfx);
@@ -2952,7 +3028,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         };
                                         app.config_text = output.map(|o| String::from_utf8_lossy(&o.stdout).to_string());
                                         app.config_scroll = 0;
-                                        app.status_message = "📋 Config loaded — PageUp/PageDown to scroll, Esc to close".into();
+                                        app.toast("📋 Config loaded — PageUp/Down to scroll, Esc to close");
                                     }
                                 }
                                 KeyCode::Char('c') => app.cycle_theme(),
@@ -3025,8 +3101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             app.task_input_active = false;
                                             if let Some(pool) = &app.db_pool {
                                                 let agent = app.task_filter_agent.as_deref(); let _ = db::create_task(pool, &desc, 5, &app.user(), agent).await;
-                                                if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
+if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                             }
+                                            app.toast("✓ Task created");
                                         }
                                     }
                                     KeyCode::Backspace => { app.task_input.pop(); }
@@ -3100,11 +3177,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('A') => {
                                     // Select all
                                     for i in 0..app.agents.len() { app.multi_selected.insert(i); }
-                                    app.status_message = format!("Selected all {} agents", app.agents.len());
+                                    app.toast(&format!("✓ Selected all {} agents", app.agents.len()));
                                 }
                                 KeyCode::Char('N') => {
                                     app.multi_selected.clear();
-                                    app.status_message = "Selection cleared".into();
+                                    app.toast("Selection cleared");
                                 }
                                 KeyCode::Char('h') => {
                                     // Fleet health summary
@@ -3384,6 +3461,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.ws_files = files;
                 app.ws_crons = crons;
                 app.ws_loading = false;
+                let found = app.ws_files.iter().filter(|f| f.exists).count();
+                app.toast(&format!("✓ Loaded workspace — {}/{} files found", found, app.ws_files.len()));
             }
         }
         if let Some(ref mut rx) = app.ws_file_rx {
