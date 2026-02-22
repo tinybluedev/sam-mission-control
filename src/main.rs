@@ -180,6 +180,9 @@ struct App {
     detail_info_area: Rect,
     detail_chat_area: Rect,
     fleet_row_start_y: u16,  // Y offset where first agent row starts
+    // Splash
+    show_splash: bool,
+    splash_start: Instant,
     // Alerts
     alerts: Vec<Alert>,
     alert_flash: Option<Instant>,
@@ -251,6 +254,7 @@ impl App {
             wizard: wizard::AgentWizard::new(),
             tasks: vec![], task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
+            show_splash: true, splash_start: Instant::now(),
             alerts: vec![], alert_flash: None,
             multi_selected: HashSet::new(),
             spinner_frame: 0, sort_mode: SortMode::Name,
@@ -631,6 +635,46 @@ fn render_too_small(frame: &mut Frame) {
     frame.render_widget(msg, area);
 }
 
+fn render_splash(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = frame.area();
+    let bg = Block::default().style(Style::default().bg(app.bg_density.bg()));
+    frame.render_widget(bg, area);
+
+    let ver_line = format!("    v{} — {} agents in fleet", env!("CARGO_PKG_VERSION"), app.agents.len());
+    let online_line = format!("    {} online", app.agents.iter().filter(|a| a.status == AgentStatus::Online).count());
+    let logo: Vec<&str> = vec![
+        "",
+        "  ███████╗ ██╗ ██████╗  ███╗   ███╗",
+        "  ██╔════╝ ██║██╔═══██╗ ████╗ ████║",
+        "  ███████╗ ██║██║   ██║ ██╔████╔██║",
+        "  ╚════██║ ██║██║▄▄ ██║ ██║╚██╔╝██║",
+        "  ███████║ ██║╚██████╔╝ ██║ ╚═╝ ██║",
+        "  ╚══════╝ ╚═╝ ╚══▀▀═╝ ╚═╝     ╚═╝",
+        "",
+        "    S . A . M   M I S S I O N   C O N T R O L",
+        "",
+        &ver_line,
+        &online_line,
+        "",
+        "    Strange Artificial Machine — Fleet Orchestration TUI",
+        "",
+        "    Press any key to continue...",
+    ];
+
+    let cy = area.height / 2;
+    let start_y = cy.saturating_sub(logo.len() as u16 / 2);
+
+    for (i, line) in logo.iter().enumerate() {
+        let y = start_y + i as u16;
+        if y >= area.height { break; }
+        let color = if i < 7 { t.accent } else if i == 8 { t.header_title } else { t.text_dim };
+        let p = Paragraph::new(Line::from(Span::styled(line.to_string(), Style::default().fg(color).bold())))
+            .alignment(Alignment::Center);
+        frame.render_widget(p, Rect::new(0, y, area.width, 1));
+    }
+}
+
 fn render_dashboard(frame: &mut Frame, app: &mut App) {
     if frame.area().width < 60 || frame.area().height < 20 { render_too_small(frame); return; }
     let t = &app.theme;
@@ -710,9 +754,12 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     let fb = if active { t.border_active } else { t.border };
 
     let show_latency = area.width > 70;
-    let show_resources = area.width > 110;
+    let show_resources = area.width > 120;
+    let show_ip = area.width > 85;
     let hcells_vec: Vec<&str> = if show_resources {
-        vec!["  ", "Agent", "Location", "Status", "Ping", "CPU", "RAM", "Disk", "Version"]
+        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "CPU", "RAM", "Disk", "Version"]
+    } else if show_ip && show_latency {
+        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "Version"]
     } else if show_latency {
         vec!["  ", "Agent", "Location", "Status", "Ping", "Version"]
     } else {
@@ -746,9 +793,14 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
         let mut cells = vec![
             Cell::from(format!("{}{}", cursor, a.emoji)),
             Cell::from(a.name.clone()).style(Style::default().fg(t.text_bold).bold()),
+        ];
+        if show_ip {
+            cells.push(Cell::from(a.host.clone()).style(Style::default().fg(t.accent2)));
+        }
+        cells.extend(vec![
             Cell::from(a.location.clone()).style(Style::default().fg(loc_color)),
             Cell::from(a.status.to_string()).style(Style::default().fg(st_color)),
-        ];
+        ]);
         if show_latency {
             cells.push(Cell::from(lat_str).style(Style::default().fg(lat_color)));
         }
@@ -765,15 +817,15 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
 
     let show_version = area.width > 55;
     let widths = if show_resources && show_version {
-        vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Length(8), Constraint::Length(8), Constraint::Min(12)]
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Length(8), Constraint::Length(8), Constraint::Min(12)]
+    } else if show_ip && show_latency && show_version {
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Min(12)]
     } else if show_latency && show_version {
-        vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Length(12), Constraint::Length(7), Constraint::Min(12)]
-    } else if show_latency {
-        vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Min(12), Constraint::Length(7), Constraint::Length(0)]
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Min(12)]
     } else if show_version {
-        vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Length(12), Constraint::Min(12)]
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Length(12), Constraint::Min(12)]
     } else {
-        vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Min(12), Constraint::Length(0)]
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Min(12), Constraint::Length(0)]
     };
     let table = Table::new(rows, widths).header(hrow)
     .block(Block::default().title(Span::styled(" Fleet ", Style::default().fg(fb).bold()))
@@ -1254,6 +1306,8 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("  N (Shift)", "Clear selection"),
         ("  a", "New agent wizard"),
         ("  /", "Fleet command (runs on all agents)"),
+        ("  g", "Restart gateway (selected)"),
+        ("  G (Shift)", "Investigate gateway (selected)"),
         ("  o", "OpenClaw version audit"),
         ("  u", "Bulk update OpenClaw"),
         ("  g", "Restart gateway (selected agent)"),
@@ -1399,6 +1453,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         terminal.draw(|f| {
+            if app.show_splash {
+                render_splash(f, &app);
+            } else {
             match app.screen {
                 Screen::Dashboard => render_dashboard(f, &mut app),
                 Screen::AgentDetail => render_detail(f, &mut app),
@@ -1407,6 +1464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Screen::Alerts => render_alerts(f, &app),
                 Screen::Help => render_help(f, &app),
             }
+            }
             if app.wizard.active {
                 wizard::render_wizard(f, &app.wizard, &app.theme, app.bg_density.bg());
             }
@@ -1414,6 +1472,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if event::poll(Duration::from_millis(100))? {
             let ev = event::read()?;
+
+            // Splash dismiss
+            if app.show_splash {
+                if let Event::Key(_) = &ev { app.show_splash = false; }
+                continue;
+            }
 
             // Mouse events
             if let Event::Mouse(mouse) = &ev {
@@ -1794,6 +1858,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     app.status_message = "🔄 OC update dispatched to all agents (background)".into();
                                 }
+                                KeyCode::Char('G') => {
+                                    // Gateway status on selected agent
+                                    if let Some(agent) = app.agents.get(app.selected) {
+                                        let host = agent.host.clone();
+                                        let user = agent.ssh_user.clone();
+                                        let name = agent.name.clone();
+                                        let self_ip = app.self_ip.clone();
+                                        let is_mac = agent.os.to_lowercase().contains("mac");
+                                        app.status_message = format!("🔍 Checking gateway on {}...", name);
+                                        if let Some(pool) = &app.db_pool {
+                                            let pool = pool.clone();
+                                            let sender = app.user();
+                                            let db_name = agent.db_name.clone();
+                                            tokio::spawn(async move {
+                                                let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                                let cmd = format!("{}echo '=== Gateway Status ===' && openclaw gateway status 2>&1 && echo '=== OC Version ===' && openclaw --version 2>&1 && echo '=== Last 5 Log Lines ===' && journalctl -u openclaw-gateway --no-pager -n 5 --output=short-iso 2>/dev/null || echo 'no systemd logs'", pfx);
+                                                let output = if host == "localhost" || host == self_ip {
+                                                    tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                                                } else {
+                                                    tokio::time::timeout(
+                                                        std::time::Duration::from_secs(10),
+                                                        tokio::process::Command::new("ssh")
+                                                            .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                                &format!("{}@{}", user, host), &cmd])
+                                                            .output()
+                                                    ).await.ok().and_then(|r| r.ok())
+                                                };
+                                                let response = output.map(|o| {
+                                                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                                    if s.is_empty() { "(no output)".into() } else { s.chars().take(1500).collect::<String>() }
+                                                }).unwrap_or_else(|| "Timeout".into());
+                                                let _ = crate::db::send_direct(&pool, &sender, &db_name, "🔍 gateway investigate").await;
+                                                if let Ok(mut conn) = pool.get_conn().await {
+                                                    use mysql_async::prelude::*;
+                                                    let _ = conn.exec_drop(
+                                                        "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                                                        (&response, &sender, &db_name),
+                                                    ).await;
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
                                 KeyCode::Char('g') => {
                                     // Restart gateway on focused agent
                                     if let Some(agent) = app.agents.get(app.selected) {
@@ -1916,6 +2023,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                     }
             }
+        }
+
+        // Auto-dismiss splash
+        if app.show_splash && app.splash_start.elapsed() > Duration::from_secs(3) {
+            app.show_splash = false;
         }
 
         // Auto-refresh every 30s (non-blocking)
