@@ -1264,16 +1264,15 @@ impl App {
             }));
             let output = if host == "localhost" || host == self_ip {
                 tokio::time::timeout(
-                    Duration::from_secs(15),
+                    Duration::from_secs(PANEL_SCRIPT_TIMEOUT_SECS),
                     Command::new("bash").args(["-lc", &script]).output(),
                 )
                 .await
                 .ok()
                 .and_then(|r| r.ok())
             } else {
-                let cmd = format!("bash -lc {}", shell::escape(&script));
                 tokio::time::timeout(
-                    Duration::from_secs(15),
+                    Duration::from_secs(PANEL_SCRIPT_TIMEOUT_SECS),
                     Command::new("ssh")
                         .args([
                             "-o",
@@ -1283,7 +1282,9 @@ impl App {
                             "-o",
                             "StrictHostKeyChecking=no",
                             &format!("{}@{}", user, host),
-                            &cmd,
+                            "bash",
+                            "-lc",
+                            &script,
                         ])
                         .output(),
                 )
@@ -2819,6 +2820,8 @@ struct ChatPollResult {
 
 /// Minimum content width (chars) for message word-wrap, preventing extremely narrow wrapping.
 const MIN_WRAP_WIDTH: usize = 10;
+const PANEL_SCRIPT_TIMEOUT_SECS: u64 = 15;
+const MAX_PANEL_DISPLAY_LINES: usize = 24;
 /// Approximate lines rendered per chat message (header + body + blank), used to estimate
 /// the number of unseen messages from a raw line count.
 const LINES_PER_MSG_EST: usize = 3;
@@ -4052,10 +4055,18 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(t.status_offline),
                 )));
             } else if let Some(output) = app.svc_panel_outputs.get(&svc.name) {
-                for line in output.lines().take(24) {
+                let all_lines: Vec<&str> = output.lines().collect();
+                for line in all_lines.iter().take(MAX_PANEL_DISPLAY_LINES) {
                     lines.push(Line::from(Span::styled(
                         format!("  {}", line),
                         Style::default().fg(t.text),
+                    )));
+                }
+                let hidden = all_lines.len().saturating_sub(MAX_PANEL_DISPLAY_LINES);
+                if hidden > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("  … ({} more lines)", hidden),
+                        Style::default().fg(t.text_dim),
                     )));
                 }
             } else {
@@ -5248,14 +5259,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if app.svc_selected > 0 {
                                         app.svc_selected -= 1;
                                         app.svc_detail_scroll = 0;
-                                        app.maybe_start_panel_for_selected_service(false);
                                     }
                                 }
                                 KeyCode::Down => {
                                     if app.svc_selected < app.svc_list.len().saturating_sub(1) {
                                         app.svc_selected += 1;
                                         app.svc_detail_scroll = 0;
-                                        app.maybe_start_panel_for_selected_service(false);
                                     }
                                 }
                                 KeyCode::Char(' ') => app.toggle_service(),
@@ -6150,7 +6159,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.svc_config = config;
                 app.parse_services();
                 app.svc_loading = false;
-                app.maybe_start_panel_for_selected_service(false);
                 let count = app.svc_list.len();
                 app.toast(&format!("✓ Loaded {} services", count));
             }
