@@ -3044,7 +3044,7 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
 
 fn render_task_board(frame: &mut Frame, app: &App) {
     let filter_label = app.task_filter_agent.as_ref()
-        .map(|a| format!(" ({})", a)).unwrap_or_default();
+        .map(|a| format!(" — {}", a)).unwrap_or_else(|| " — All".to_string());
     let t = &app.theme;
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -3125,6 +3125,7 @@ fn render_task_board(frame: &mut Frame, app: &App) {
         };
 
         let desc: String = task.description.chars().take(30).collect();
+        let is_done = matches!(task.status.as_str(), "completed" | "failed");
 
         Row::new(vec![
             Cell::from(format!("{}{}", cursor, task.id)),
@@ -3132,7 +3133,11 @@ fn render_task_board(frame: &mut Frame, app: &App) {
             Cell::from(format!("{} {}", st_icon, task.status)).style(Style::default().fg(st_color)),
             Cell::from(task.assigned_agent.as_deref().unwrap_or("—").to_string()).style(Style::default().fg(t.accent2)),
             Cell::from(desc).style(Style::default().fg(t.text)),
-        ]).style(Style::default().bg(bg)).height(1)
+        ]).style(if is_done {
+            Style::default().bg(bg).fg(t.text_dim).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().bg(bg)
+        }).height(1)
     }).collect();
 
     let table = Table::new(rows, [
@@ -3211,11 +3216,16 @@ fn render_task_board(frame: &mut Frame, app: &App) {
     // New task input
     let input_active = app.task_input_active;
     let ib = if input_active { t.border_active } else { t.border };
-    let prompt = if input_active { " new task description ⏎ " } else { " n=new task  d=done  Esc=back " };
+    let prompt = if input_active { " new task description ⏎  Esc=cancel " } else { " n=new task  d=done  Esc=back " };
+    let show_placeholder = input_active && app.task_input.is_empty();
     let input = Paragraph::new(Line::from(vec![
         Span::styled(" › ", Style::default().fg(t.accent)),
-        Span::styled(&app.task_input, Style::default().fg(t.text)),
-        if input_active { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
+        if show_placeholder {
+            Span::styled("type description and press Enter…", Style::default().fg(t.text_dim))
+        } else {
+            Span::styled(&app.task_input, Style::default().fg(t.text))
+        },
+        if input_active && !show_placeholder { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
     ])).block(Block::default().title(prompt)
         .borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(ib))
@@ -4043,7 +4053,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Screen::TaskBoard => {
                             if app.task_input_active {
                                 match key.code {
-                                    KeyCode::Esc => app.task_input_active = false,
+                                    KeyCode::Esc => { app.task_input_active = false; app.task_input.clear(); }
                                     KeyCode::Enter => {
                                         if !app.task_input.trim().is_empty() {
                                             let desc = app.task_input.clone();
@@ -4100,6 +4110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                                 app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                             }
+                                            app.toast(&format!("✓ Task #{} marked complete", tid));
                                         }
                                     }
                                     KeyCode::Char('c') if app.task_filter_agent.is_some() => {
