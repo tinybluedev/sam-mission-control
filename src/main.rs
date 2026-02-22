@@ -880,6 +880,41 @@ fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme, area_width: u1
                 Span::styled(st_icon, Style::default().fg(t.text_dim)),
                 Span::raw(" "),
             ]));
+
+            // Show agent response below outgoing message (left-aligned reply)
+            if let Some(resp) = &msg.response {
+                let responder = msg.target.as_ref().map(|s| s.as_str()).unwrap_or("agent");
+                let avatar = responder.chars().next()
+                    .map(|c| c.to_ascii_uppercase()).unwrap_or('?');
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  [{}] ", avatar), Style::default().fg(t.sender_other).bold()),
+                    Span::styled(responder.to_string(), Style::default().fg(t.sender_other).bold()),
+                ]));
+                let words: Vec<&str> = resp.split_whitespace().collect();
+                let mut cur = String::new();
+                let mut first = true;
+                let body_wrap = wrap_w.saturating_sub(2).max(20);
+                for w in &words {
+                    if !cur.is_empty() && cur.chars().count() + w.len() + 1 > body_wrap {
+                        let prefix = if first { "  ↳ " } else { "    " };
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix.to_string(), Style::default().fg(t.sender_other)),
+                            Span::styled(cur.clone(), Style::default().fg(t.response)),
+                        ]));
+                        cur.clear();
+                        first = false;
+                    }
+                    if !cur.is_empty() { cur.push(' '); }
+                    cur.push_str(w);
+                }
+                if !cur.is_empty() {
+                    let prefix = if first { "  ↳ " } else { "    " };
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), Style::default().fg(t.sender_other)),
+                        Span::styled(cur, Style::default().fg(t.response)),
+                    ]));
+                }
+            }
         } else {
             // Left-aligned incoming message (agent)
             let avatar = msg.sender.chars().next()
