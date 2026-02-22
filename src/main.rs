@@ -199,6 +199,9 @@ impl GroupFilter {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SplitDragTarget { Dashboard, Detail }
+
 #[derive(PartialEq, Clone, Copy)]
 enum SortMode {
     Name,
@@ -5588,6 +5591,16 @@ fn detail_split(area: &Rect) -> (Constraint, Constraint) {
     }
 }
 
+fn point_in_rect(x: u16, y: u16, area: Rect) -> bool {
+    x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
+}
+
+fn split_pct_from_mouse(x: u16, area: Rect) -> u16 {
+    if area.width == 0 { return 50; }
+    let relative_x = x.saturating_sub(area.x).min(area.width);
+    (((relative_x as u32 * 100) / area.width as u32) as u16).clamp(MIN_SPLIT_PCT, MAX_SPLIT_PCT)
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -5875,14 +5888,20 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
     );
     frame.render_widget(header, outer[0]);
 
-    let (fleet_pct, chat_pct) = dashboard_split(&outer[1]);
+    let (fleet_pct, chat_pct) = dashboard_split(&outer[1], app.dashboard_split_pct);
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([fleet_pct, chat_pct])
         .split(outer[1]);
 
+    app.dashboard_body_area = outer[1];
     app.fleet_area = body[0];
     app.chat_area = body[1];
+    app.dashboard_divider_area = if body[1].width > 0 {
+        Rect::new(body[1].x.saturating_sub(1), outer[1].y, DIVIDER_HIT_WIDTH.min(outer[1].width), outer[1].height)
+    } else {
+        Rect::default()
+    };
     render_fleet_table(frame, app, body[0], app.focus == Focus::Fleet);
     if !is_narrow(&outer[1]) {
         render_chat_panel(frame, app, body[1], app.focus == Focus::Chat, false);
@@ -6430,7 +6449,7 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     frame.render_widget(header, chunks[0]);
 
     // Body: info left, chat right (responsive)
-    let (info_pct, chat_pct) = detail_split(&chunks[1]);
+    let (info_pct, chat_pct) = detail_split(&chunks[1], app.detail_split_pct);
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([info_pct, chat_pct])
@@ -6579,6 +6598,12 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     // Store hit zones
     app.detail_info_area = body[0];
     app.detail_chat_area = body[1];
+    app.detail_body_area = chunks[1];
+    app.detail_divider_area = if body[1].width > 0 {
+        Rect::new(body[1].x.saturating_sub(1), chunks[1].y, DIVIDER_HIT_WIDTH.min(chunks[1].width), chunks[1].height)
+    } else {
+        Rect::default()
+    };
 
     // Agent chat
     render_chat_panel(frame, app, body[1], app.focus == Focus::AgentChat, true);
@@ -8939,9 +8964,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Mouse events
             if let Event::Mouse(mouse) = &ev {
-                if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                    let (mx, my) = (mouse.column, mouse.row);
-                    match app.screen {
+                let (mx, my) = (mouse.column, mouse.row);
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => match app.screen {
                         Screen::Dashboard => {
                             // Click on fleet panel
                             if mx >= app.fleet_area.x
@@ -8950,11 +8975,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 && my < app.fleet_area.y + app.fleet_area.height
                             {
                                 app.focus = Focus::Fleet;
-                                // Calculate which agent row was clicked
-                                if my > app.fleet_row_start_y && app.fleet_row_start_y > 0 {
-                                    let row = (my - app.fleet_row_start_y - 1) as usize; // -1 for header
-                                    if row < app.agents.len() {
-                                        app.selected = row;
+                                let first_data_row_y = app.fleet_row_start_y.saturating_add(FLEET_TABLE_HEADER_ROWS);
+                                if my >= first_data_row_y {
+                                    let row = (my - first_data_row_y) as usize;
+                                    let filtered = app.filtered_agent_indices();
+                                    if let Some(&idx) = filtered.get(row) {
+                                        app.selected = idx;
                                     }
                                 }
                             }
@@ -8983,6 +9009,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         _ => {}
+                    },
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        match app.dragging_split {
+                            Some(SplitDragTarget::Dashboard) if app.screen == Screen::Dashboard => {
+                                app.dashboard_split_pct = Some(split_pct_from_mouse(mx, app.dashboard_body_area));
+                            }
+                            Some(SplitDragTarget::Detail) if app.screen == Screen::AgentDetail => {
+                                app.detail_split_pct = Some(split_pct_from_mouse(mx, app.detail_body_area));
+                            }
+                            _ => {}
+                        }
                     }
                 }
 
@@ -9004,6 +9041,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         _ => {}
                     }
+                    MouseEventKind::ScrollDown => {
+                        if app.screen == Screen::Dashboard && point_in_rect(mx, my, app.chat_area) {
+                            app.chat_scroll = app.chat_scroll.saturating_sub(3);
+                        } else if app.screen == Screen::AgentDetail && point_in_rect(mx, my, app.detail_chat_area) {
+                            app.agent_chat_scroll = app.agent_chat_scroll.saturating_sub(3);
+                        }
+                    }
+                    _ => {}
                 }
             }
 
