@@ -1194,10 +1194,11 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
 
             let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
-            // Step 1: current version
+            // Step 1: current version (stored as prev_version for rollback)
             let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Running, detail: String::new() });
             let cur = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw --version 2>/dev/null || echo '(not installed)'", pfx)).await;
-            let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Pass, detail: cur.trim().to_string() });
+            let prev_version = cur.trim().to_string();
+            let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Pass, detail: prev_version.clone() });
 
             // Pre-flight checks before install
             let _ = tx.send(DiagStep { label: "Pre-flight checks".into(), status: DiagStatus::Running, detail: String::new() });
@@ -2316,11 +2317,12 @@ enum DiagStatus {
     Fail,
     Fixed,
     Skipped,
+    Rollback,
 }
 
 impl DiagStatus {
     fn icon(&self) -> &'static str {
-        match self { DiagStatus::Running => "⏳", DiagStatus::Pass => "✓", DiagStatus::Fail => "✗", DiagStatus::Fixed => "🔧", DiagStatus::Skipped => "⊘" }
+        match self { DiagStatus::Running => "⏳", DiagStatus::Pass => "✓", DiagStatus::Fail => "✗", DiagStatus::Fixed => "🔧", DiagStatus::Skipped => "⊘", DiagStatus::Rollback => "⏪" }
     }
 }
 
@@ -3204,6 +3206,7 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
                     DiagStatus::Fixed => ("🔧", t.status_busy),
                     DiagStatus::Skipped => ("⊘ ", t.text_dim),
                     DiagStatus::Running => ("⏳", t.pending),
+                    DiagStatus::Rollback => ("⏪", t.status_busy),
                 };
                 let detail = if step.detail.is_empty() { String::new() } else { format!(" — {}", step.detail) };
                 lines.push(Line::from(vec![
