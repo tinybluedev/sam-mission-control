@@ -72,13 +72,41 @@ pub struct DbAgent {
     pub current_task_id: Option<i32>,
     pub gateway_port: i32,
     pub gateway_token: Option<String>,
+    pub ssh_user: Option<String>,
 }
 
 /// Load all agents from `mc_fleet_status`, ordered by name.
+
+/// Run schema migrations to ensure required columns exist.
+/// Called on startup — idempotent, safe to run every launch.
+pub async fn run_migrations(pool: &Pool) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    // Ensure ssh_user column exists (added in v1.3)
+    let _ = conn.exec_drop(
+        "ALTER TABLE mc_fleet_status ADD COLUMN IF NOT EXISTS ssh_user VARCHAR(64) DEFAULT NULL",
+        (),
+    ).await;
+    // Ensure mc_operations table exists
+    let _ = conn.exec_drop(
+        r"CREATE TABLE IF NOT EXISTS mc_operations (
+            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            agent VARCHAR(64) NOT NULL,
+            op_type VARCHAR(32) NOT NULL,
+            status ENUM('running','pass','fail','fixed','interrupted') NOT NULL DEFAULT 'running',
+            output TEXT,
+            started_at DATETIME NOT NULL DEFAULT NOW(),
+            completed_at DATETIME
+        )",
+        (),
+    ).await;
+    Ok(())
+}
+
 pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let rows: Vec<mysql_async::Row> = conn.query(
-        "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token FROM mc_fleet_status ORDER BY agent_name",
+        "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token, ssh_user FROM mc_fleet_status ORDER BY agent_name",
     ).await?;
     let agents = rows.into_iter().map(|r| {
         DbAgent {
@@ -95,6 +123,7 @@ pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error>
             current_task_id: r.get::<Option<i32>, _>(10).flatten(),
             gateway_port: r.get::<Option<i32>, _>(11).flatten().unwrap_or(18789),
             gateway_token: r.get::<Option<String>, _>(12).flatten(),
+            ssh_user: r.get::<Option<String>, _>(13).flatten(),
         }
     }).collect();
     Ok(agents)
@@ -382,6 +411,41 @@ mod tests {
         assert!(!sanitized.contains("s3cr3t"));
         assert!(sanitized.contains("***"));
     }
+
+    // ── mc_operations SQL template tests ───────────
+
+    /// `create_operation` uses parameterised placeholders; agent/op_type must not
+    /// appear in the static SQL template.
+    #[test]
+    fn create_operation_query_uses_placeholders() {
+        let injection = "'; DROP TABLE mc_operations; --";
+        let static_query = "INSERT INTO mc_operations (agent, op_type, status, started_at) VALUES (?, ?, 'running', NOW())";
+        assert!(!static_query.contains(injection));
+        assert_eq!(static_query.matches('?').count(), 2);
+    }
+
+    /// `complete_operation` static query must not embed user-supplied values.
+    #[test]
+    fn complete_operation_query_uses_placeholders() {
+        let static_query = "UPDATE mc_operations SET status=?, completed_at=NOW(), output=? WHERE id=?";
+        assert_eq!(static_query.matches('?').count(), 3);
+    }
+
+    /// `mark_stale_operations_interrupted` uses no user-supplied parameters.
+    #[test]
+    fn mark_stale_query_has_no_placeholders() {
+        let static_query = "UPDATE mc_operations SET status='interrupted' WHERE status='running' AND started_at < NOW() - INTERVAL 5 MINUTE";
+        assert!(!static_query.contains('?'));
+        assert!(static_query.contains("5 MINUTE"));
+    }
+
+    /// `load_interrupted_operations` selects only the 'interrupted' status.
+    #[test]
+    fn load_interrupted_query_filters_by_status() {
+        let static_query = "SELECT id, agent, op_type, status, DATE_FORMAT(started_at, '%H:%i'), DATE_FORMAT(completed_at, '%H:%i'), output FROM mc_operations WHERE status='interrupted' ORDER BY id DESC LIMIT 20";
+        assert!(static_query.contains("status='interrupted'"));
+        assert!(static_query.contains("LIMIT 20"));
+    }
 }
 
 // ---- Task Board ----
@@ -517,6 +581,103 @@ pub async fn load_latest_context(pool: &mysql_async::Pool, agent: &str) -> Resul
         context_tokens_max: r.get::<Option<i32>, _>(3).flatten().unwrap_or(1000000),
         context_pct: r.get::<Option<f32>, _>(4).flatten().unwrap_or(0.0),
     }))
+}
+
+// ── Operations ─────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Operation {
+    pub id: i64,
+    pub agent: String,
+    pub op_type: String,
+    pub status: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub output: Option<String>,
+}
+
+
+/// A row from mc_operations, used by `sam log`
+pub struct OperationRecord {
+    pub id: u64,
+    pub agent_name: String,
+    pub op_type: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+}
+
+/// Fetch recent operations from mc_operations
+pub async fn get_operations(
+    pool: &Pool,
+    agent: Option<&str>,
+    tail: u32,
+) -> Result<Vec<OperationRecord>, Box<dyn std::error::Error>> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    let rows: Vec<(u64, String, String, String, Option<String>, String)> = if let Some(a) = agent {
+        conn.exec(
+            "SELECT id, agent, op_type, status, output, DATE_FORMAT(started_at, '%Y-%m-%d %H:%i') FROM mc_operations WHERE agent=? ORDER BY id DESC LIMIT ?",
+            (a, tail),
+        ).await?
+    } else {
+        conn.exec(
+            "SELECT id, agent, op_type, status, output, DATE_FORMAT(started_at, '%Y-%m-%d %H:%i') FROM mc_operations ORDER BY id DESC LIMIT ?",
+            (tail,),
+        ).await?
+    };
+    Ok(rows.into_iter().map(|(id, agent_name, op_type, status, detail, created_at)| {
+        OperationRecord { id, agent_name, op_type, status, detail, created_at }
+    }).collect())
+}
+
+/// Record the start of an operation in `mc_operations`. Returns the new record ID.
+pub async fn create_operation(pool: &Pool, agent: &str, op_type: &str) -> Result<i64, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "INSERT INTO mc_operations (agent, op_type, status, started_at) VALUES (?, ?, 'running', NOW())",
+        (agent, op_type),
+    ).await?;
+    let id: Option<i64> = conn.query_first("SELECT LAST_INSERT_ID()").await?;
+    Ok(id.unwrap_or(0))
+}
+
+/// Update an operation's final status, completion time, and optional output.
+pub async fn complete_operation(pool: &Pool, id: i64, status: &str, output: Option<&str>) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "UPDATE mc_operations SET status=?, completed_at=NOW(), output=? WHERE id=?",
+        (status, output, id),
+    ).await?;
+    Ok(())
+}
+
+/// Mark all `running` operations that started more than 5 minutes ago as `interrupted`.
+/// Returns the number of rows updated.
+pub async fn mark_stale_operations_interrupted(pool: &Pool) -> Result<u64, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "UPDATE mc_operations SET status='interrupted' WHERE status='running' AND started_at < NOW() - INTERVAL 5 MINUTE",
+        (),
+    ).await?;
+    Ok(conn.affected_rows())
+}
+
+/// Load all operations with `status='interrupted'`, most recent first (up to 20).
+pub async fn load_interrupted_operations(pool: &Pool) -> Result<Vec<Operation>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let rows: Vec<mysql_async::Row> = conn.query(
+        "SELECT id, agent, op_type, status, DATE_FORMAT(started_at, '%H:%i'), DATE_FORMAT(completed_at, '%H:%i'), output FROM mc_operations WHERE status='interrupted' ORDER BY id DESC LIMIT 20"
+    ).await?;
+    Ok(rows.into_iter().map(|r| Operation {
+        id: r.get::<Option<i64>, _>(0).flatten().unwrap_or(0),
+        agent: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
+        op_type: r.get::<Option<String>, _>(2).flatten().unwrap_or_default(),
+        status: r.get::<Option<String>, _>(3).flatten().unwrap_or_default(),
+        started_at: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
+        completed_at: r.get::<Option<String>, _>(5).flatten(),
+        output: r.get::<Option<String>, _>(6).flatten(),
+    }).collect())
 }
 
 // ── Spawned Agents ─────────────────────────────────

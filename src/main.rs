@@ -307,6 +307,7 @@ struct App {
     diag_auto_fix: bool,
     diag_title: Option<String>,
     diag_start: Option<Instant>,
+    diag_overlay_scroll: u16,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -354,11 +355,36 @@ struct App {
     ac_matches: Vec<String>,
     ac_selected: usize,
     ac_start_pos: usize,  // cursor position of the '@'
+    // Operation state persistence
+    interrupted_ops: Vec<db::Operation>,
+    diag_task_running: bool,
+}
+
+/// Returns true for npm output lines worth showing in the overlay.
+/// Filters out transitive-dependency deprecation noise and pure whitespace.
+fn npm_line_is_meaningful(line: &str) -> bool {
+    if line.trim().is_empty() { return false; }
+    let lower = line.to_lowercase();
+    // Skip noisy deprecated warnings for transitive deps
+    if lower.contains("npm warn deprecated") { return false; }
+    if lower.contains("npm warn notsup") { return false; }
+    // Always keep error lines
+    if lower.contains("err") { return true; }
+    // Keep final result lines (added/changed/removed/updated X packages)
+    if lower.contains("added") && lower.contains("package") { return true; }
+    if (lower.contains("changed") || lower.contains("updated") || lower.contains("removed")) && lower.contains("package") { return true; }
+    // Keep timing/progress lines
+    if lower.contains("packages in") { return true; }
+    // Keep non-deprecated warnings
+    if lower.starts_with("npm warn") { return true; }
+    false
 }
 
 impl App {
     async fn new(fleet_config: config::FleetConfig) -> Self {
         let pool = db::get_pool();
+        // Run schema migrations on startup (idempotent)
+        let _ = db::run_migrations(&pool).await;
         let self_ip = std::env::var("SAM_SELF_IP").unwrap_or_else(|_| "localhost".into());
         let mut agents = Vec::new();
 
@@ -405,6 +431,10 @@ impl App {
             Err(_) => vec![],
         };
 
+        // Detect operations interrupted by a previous session (started > 5 min ago, still 'running')
+        let _ = db::mark_stale_operations_interrupted(&pool).await;
+        let interrupted_ops = db::load_interrupted_operations(&pool).await.unwrap_or_default();
+
         let tn = ThemeName::Standard;
         let bd = BgDensity::Dark;
 
@@ -431,12 +461,13 @@ impl App {
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
-            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None,
+            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None, diag_overlay_scroll: 0,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
+            interrupted_ops, diag_task_running: false,
         }
     }
 
@@ -1134,6 +1165,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
     out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|| "timeout".into())
 }
 
+
     fn start_oc_update(&mut self) {
         if self.selected >= self.agents.len() { return; }
         let agent = &self.agents[self.selected];
@@ -1142,19 +1174,24 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let name = agent.db_name.clone();
         let is_mac = agent.os.to_lowercase().contains("mac");
         let self_ip = self.self_ip.clone();
-        let gw_port = agent.gateway_port;
-        let db_pool = self.db_pool.clone();
+        let pool_opt = self.db_pool.clone();
 
         self.diag_active = true;
+        self.diag_task_running = true;
         self.diag_auto_fix = false;
         self.diag_title = Some(format!("⬆️  Update — {}", name));
         self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
         self.diag_steps = vec![DiagStep { label: format!("Updating OpenClaw on {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
         let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
         self.diag_rx = Some(rx);
 
         tokio::spawn(async move {
+            let op_id = if let Some(ref pool) = pool_opt {
+                db::create_operation(pool, &name, "oc_update").await.ok()
+            } else { None };
+
             let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
             // Step 1: current version (stored as prev_version for rollback)
@@ -1163,10 +1200,36 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let prev_version = cur.trim().to_string();
             let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Pass, detail: prev_version.clone() });
 
-            // Step 2: stream npm install (stdout + stderr merged via 2>&1)
+            // Pre-flight checks before install
+            let _ = tx.send(DiagStep { label: "Pre-flight checks".into(), status: DiagStatus::Running, detail: String::new() });
+            let preflight_cmd = format!(
+                "{}node --version 2>/dev/null && npm --version 2>/dev/null && df -k $(npm config get prefix 2>/dev/null || echo /usr) | awk 'NR==2{{print $4}}' | xargs -I{{}} bash -c 'if [ {{}} -lt 512000 ]; then echo LOW_DISK; else echo OK_DISK; fi' 2>/dev/null || echo OK_DISK",
+                pfx
+            );
+            let preflight_out = App::ssh_run(&host, &user, &self_ip, &preflight_cmd).await;
+            if preflight_out.contains("LOW_DISK") {
+                let _ = tx.send(DiagStep { label: "Pre-flight checks".into(), status: DiagStatus::Fail, detail: "< 512MB disk space — aborting update".into() });
+                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Aborted — free up disk space first".into() });
+                return;
+            }
+            // Determine install strategy
+            let has_sudo_npm = App::ssh_run(&host, &user, &self_ip, &format!("{}sudo -n npm --version 2>/dev/null && echo HAS_SUDO_NPM || echo NO_SUDO_NPM", pfx)).await.contains("HAS_SUDO_NPM");
+            let npm_prefix = App::ssh_run(&host, &user, &self_ip, &format!("{}npm config get prefix 2>/dev/null", pfx)).await.trim().to_string();
+            let needs_ignore_scripts = App::ssh_run(&host, &user, &self_ip, &format!("{}gcc --version 2>/dev/null && echo HAS_GCC || echo NO_GCC", pfx)).await.contains("NO_GCC");
+            let node_ver = preflight_out.lines().next().unwrap_or("?").trim().to_string();
+            let npm_ver = preflight_out.lines().nth(1).unwrap_or("?").trim().to_string();
+            let _ = tx.send(DiagStep { label: "Pre-flight checks".into(), status: DiagStatus::Pass,
+                detail: format!("node {} | npm {} | prefix: {}", node_ver, npm_ver, npm_prefix.chars().take(30).collect::<String>()) });
+
+            // Step 2: stream npm install with smart flags
             let _ = tx.send(DiagStep { label: "Installing openclaw@latest".into(), status: DiagStatus::Running, detail: "running npm install...".into() });
-            // 2>&1 merges stderr so we capture error messages too
-            let install_cmd = format!("{}sudo npm install -g openclaw@latest 2>&1; echo EXITCODE:$?:DONE", pfx);
+            let ignore_scripts = if needs_ignore_scripts { " --ignore-scripts" } else { "" };
+            let install_cmd = if has_sudo_npm {
+                format!("{}sudo npm install -g openclaw@latest{} 2>&1; echo EXITCODE:$?:DONE", pfx, ignore_scripts)
+            } else {
+                // No sudo or sudo npm broken — install to user prefix
+                format!("{}npm install -g openclaw@latest{} 2>&1; echo EXITCODE:$?:DONE", pfx, ignore_scripts)
+            };
             use tokio::io::AsyncBufReadExt;
             let mut child = if host == "localhost" || host == self_ip {
                 tokio::process::Command::new("bash").args(["-c", &install_cmd])
@@ -1197,7 +1260,10 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
                         if clean.to_lowercase().contains("err") || clean.starts_with("npm ERR") {
                             error_lines.push(clean.chars().take(80).collect());
                         }
-                        let _ = tx.send(DiagStep { label: "  npm".into(), status: DiagStatus::Running, detail: clean.chars().take(70).collect() });
+                        // Only stream meaningful lines; skip deprecated noise / whitespace
+                        if npm_line_is_meaningful(&clean) {
+                            let _ = tx.send(DiagStep { label: "  npm".into(), status: DiagStatus::Running, detail: clean.chars().take(70).collect() });
+                        }
                     }
                 }
                 // If we didn't parse exit code, use process exit status
@@ -1213,6 +1279,17 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             } else {
                 "no output — check npm/sudo permissions".into()
             };
+            // Resolve the "  npm" sub-step so it no longer shows as running
+            let npm_summary: String = if install_ok {
+                last_line.chars().take(60).collect()
+            } else {
+                fail_detail.clone()
+            };
+            let _ = tx.send(DiagStep {
+                label: "  npm".into(),
+                status: if install_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: npm_summary,
+            });
             let _ = tx.send(DiagStep {
                 label: "Installing openclaw@latest".into(),
                 status: if install_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
@@ -1228,79 +1305,24 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let new_v = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw --version 2>/dev/null || echo '?'", pfx)).await;
             let _ = tx.send(DiagStep { label: "New version".into(), status: DiagStatus::Pass, detail: new_v.trim().to_string() });
 
-            // Step 4: restart gateway
+            // Step 4: restart gateway (try full path if openclaw not in PATH)
             let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Running, detail: String::new() });
-            let restart_msg = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)).await;
-            let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Fixed, detail: restart_msg.trim().to_string() });
+            let restart_cmd = format!(
+                "{}openclaw gateway restart 2>&1 | tail -1 || ~/.npm-global/bin/openclaw gateway restart 2>&1 | tail -1 || systemctl --user restart openclaw-gateway 2>&1 | tail -1 || echo 'restart skipped - run manually'",
+                pfx
+            );
+            let restart_msg = App::ssh_run(&host, &user, &self_ip, &restart_cmd).await;
+            let restart_ok = !restart_msg.contains("skipped") && !restart_msg.is_empty();
+            let _ = tx.send(DiagStep {
+                label: "Restarting gateway".into(),
+                status: if restart_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
+                detail: restart_msg.trim().chars().take(70).collect(),
+            });
 
-            // Step 5: verify gateway API responds within 10s
-            let _ = tx.send(DiagStep { label: "Verifying gateway".into(), status: DiagStatus::Running, detail: "checking /health...".into() });
-            let health_cmd = format!("curl -s -m 3 http://localhost:{}/health 2>/dev/null || echo FAIL", gw_port);
-            let mut gw_ok = false;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            while tokio::time::Instant::now() < deadline {
-                let resp = App::ssh_run(&host, &user, &self_ip, &health_cmd).await;
-                if !resp.contains("FAIL") && !resp.is_empty() {
-                    gw_ok = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-
-            if gw_ok {
-                let _ = tx.send(DiagStep { label: "Verifying gateway".into(), status: DiagStatus::Pass, detail: "gateway responding".into() });
-                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
-            } else {
-                // Gateway not responding after update — attempt rollback
-                let _ = tx.send(DiagStep { label: "Verifying gateway".into(), status: DiagStatus::Fail, detail: "not responding after update".into() });
-                let _ = tx.send(DiagStep { label: "Rollback".into(), status: DiagStatus::Rollback, detail: format!("gateway not responding — rolling back to {}", prev_version) });
-
-                let rollback_cmd = format!("{}sudo npm install -g openclaw@{} 2>&1; echo EXITCODE:$?:DONE", pfx, shell::escape(&prev_version));
-                let rb_out = App::ssh_run(&host, &user, &self_ip, &rollback_cmd).await;
-                let rb_ok = rb_out.contains("EXITCODE:0:DONE");
-                let _ = tx.send(DiagStep {
-                    label: "  Rollback install".into(),
-                    status: if rb_ok { DiagStatus::Rollback } else { DiagStatus::Fail },
-                    detail: if rb_ok { format!("reinstalled {}", prev_version) } else { "rollback install failed".into() },
-                });
-
-                // Restart gateway with old version
-                let _ = tx.send(DiagStep { label: "  Restarting gateway".into(), status: DiagStatus::Rollback, detail: "restarting with previous version...".into() });
-                let rb_restart = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)).await;
-                tokio::time::sleep(Duration::from_secs(4)).await;
-
-                // Verify rollback health
-                let rb_resp = App::ssh_run(&host, &user, &self_ip, &health_cmd).await;
-                let rb_gw_ok = !rb_resp.contains("FAIL") && !rb_resp.is_empty();
-                let _ = tx.send(DiagStep {
-                    label: "  Restarting gateway".into(),
-                    status: if rb_gw_ok { DiagStatus::Rollback } else { DiagStatus::Fail },
-                    detail: rb_restart.trim().chars().take(60).collect(),
-                });
-
-                let done_detail = if rb_gw_ok {
-                    format!("Rolled back to {} — gateway restored", prev_version)
-                } else {
-                    format!("Rolled back to {} — gateway still not responding", prev_version)
-                };
-                let _ = tx.send(DiagStep {
-                    label: "DONE".into(),
-                    status: if rb_gw_ok { DiagStatus::Rollback } else { DiagStatus::Fail },
-                    detail: format!("{} — press Esc to close", done_detail),
-                });
-
-                // Log rollback event to mc_operations
-                if let Some(pool) = db_pool {
-                    tokio::spawn(async move {
-                        use mysql_async::prelude::*;
-                        if let Ok(mut conn) = pool.get_conn().await {
-                            let _ = conn.exec_drop(
-                                "INSERT IGNORE INTO mc_operations (agent_name, operation, detail, created_at) VALUES (?, 'rollback', ?, NOW())",
-                                (&name, &done_detail),
-                            ).await;
-                        }
-                    });
-                }
+            let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
+            if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                let status = if install_ok { "completed" } else { "failed" };
+                let _ = db::complete_operation(pool, op_id, status, None).await;
             }
         });
     }
@@ -1313,16 +1335,24 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let name = agent.db_name.clone();
         let location = agent.location.clone();
         let gw_port = agent.gateway_port;
+        let pool_opt = self.db_pool.clone();
         self.diag_active = true;
+        self.diag_task_running = true;
         self.diag_auto_fix = fix;
         self.diag_title = None;
         self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
         self.diag_steps = vec![DiagStep { label: format!("Diagnosing {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.diag_rx = Some(rx);
 
         tokio::spawn(async move {
+            let op_id = if let Some(ref pool) = pool_opt {
+                let op_type = if fix { "diagnostics_fix" } else { "diagnostics" };
+                db::create_operation(pool, &name, op_type).await.ok()
+            } else { None };
+
             let is_mac_check = Command::new("ssh").args([
                 "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), "uname -s"
@@ -1664,6 +1694,9 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
 
             if !ssh_ok {
                 let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cannot proceed without SSH — see details above".into() });
+                if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                    let _ = db::complete_operation(pool, op_id, "failed", Some("SSH unreachable")).await;
+                }
                 return;
             }
 
@@ -1832,8 +1865,10 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             }
 
             // Done
-            let passes = 7; // we'll count from received steps
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "diagnostic complete".into() });
+            if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                let _ = db::complete_operation(pool, op_id, "completed", None).await;
+            }
         });
     }
 
@@ -2180,7 +2215,7 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str, full: bool) -> (Agen
     if host == "localhost" || host == self_ip {
         let os = Command::new("bash").args(["-c", ". /etc/os-release 2>/dev/null && echo \"$NAME $VERSION_ID\" || echo unknown"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         let kern = Command::new("uname").arg("-r").output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-        let oc = Command::new("bash").args(["-c", "openclaw --version 2>/dev/null || echo ?"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let oc = Command::new("bash").args(["-c", "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; openclaw --version 2>/dev/null || echo ?"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         let cpu = Command::new("bash").args(["-c", r#"top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}'"#]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok()).ok().flatten();
         let ram = Command::new("bash").args(["-c", r#"free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}'"#]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok()).ok().flatten();
         let disk = Command::new("bash").args(["-c", r#"df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}'"#]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok()).ok().flatten();
@@ -2188,7 +2223,7 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str, full: bool) -> (Agen
         return (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk, "local".into(), None);
     }
     let tgt = format!("{}@{}", user, host);
-    let script = r#"OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; ACT=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
+    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; ACT=$(openclaw status --json 2>/dev/null || ~/.npm-global/bin/openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new("ssh").args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"bash","-c",script]).output()
@@ -2731,6 +2766,12 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         if app.alert_flash.map(|f| f.elapsed() < Duration::from_secs(5)).unwrap_or(false) {
             Span::styled("  ⚠️ NEW ALERT", Style::default().fg(t.status_offline).bold())
         } else { Span::raw("") },
+        if !app.interrupted_ops.is_empty() {
+            Span::styled(
+                format!("  ⚠ {} interrupted op(s)", app.interrupted_ops.len()),
+                Style::default().fg(t.status_busy).bold(),
+            )
+        } else { Span::raw("") },
         Span::raw("    "),
         Span::styled(chrono_now(), Style::default().fg(t.text_dim)),
         Span::raw("    "),
@@ -3213,6 +3254,7 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
     }
 
     let diag = Paragraph::new(lines)
+        .scroll((app.diag_overlay_scroll, 0))
         .block(Block::default()
             .title(Span::styled(title, Style::default().fg(t.accent).bold()))
             .borders(Borders::ALL).border_type(BorderType::Double)
@@ -4160,6 +4202,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cli::Commands::Onboard { host, user, name }) => {
             return cli::run_onboard(&host, &user, name.as_deref()).await.map_err(|e| e.into());
         }
+        Some(cli::Commands::Log { agent, tail }) => {
+            return cli::run_log(agent.as_deref(), tail).await.map_err(|e| e.into());
+        }
         Some(cli::Commands::Version) => {
             println!("sam v{}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -4445,6 +4490,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.diag_rx = None;
                                 app.diag_start = None;
                                 app.start_refresh(); // re-probe after fix
+                            }
+                            KeyCode::PageUp => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_sub(5);
+                            }
+                            KeyCode::PageDown => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_add(5);
+                            }
+                            KeyCode::Up => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_add(1);
                             }
                             _ => {}
                         }
@@ -4915,6 +4972,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 let self_ip = app.self_ip.clone();
                                                 let latest = latest.clone();
                                                 tokio::spawn(async move {
+                                                    let op_id = db::create_operation(&pool, &db_name, "bulk_update").await.ok();
                                                     let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
                                                     let cmd = format!("{}openclaw --version 2>/dev/null && sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1", pfx);
                                                     let output = if host == "localhost" || host == self_ip {
@@ -4928,6 +4986,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                 .output()
                                                         ).await.ok().and_then(|r| r.ok())
                                                     };
+                                                    let timed_out = output.is_none();
                                                     let response = output.map(|o| {
                                                         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                                                         if s.is_empty() { "(no output)".into() } else { s.chars().take(500).collect::<String>() }
@@ -4940,6 +4999,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                             "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
                                                             (&response, &sender, &db_name),
                                                         ).await;
+                                                    }
+                                                    if let Some(op_id) = op_id {
+                                                        let status = if timed_out { "failed" } else { "completed" };
+                                                        let _ = db::complete_operation(&pool, op_id, status, Some(&response)).await;
                                                     }
                                                 });
                                             }
@@ -5177,7 +5240,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let is_done = step.label == "DONE";
                     app.diag_steps.push(step);
                     if is_done {
-                        // Keep overlay open for user to see results
+                        // Mark task as no longer running (overlay stays open for user to read)
+                        app.diag_task_running = false;
                     }
                 }
             }
@@ -5318,7 +5382,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if app.should_quit { break; }
+        if app.should_quit {
+            // On clean exit: wait up to 3s for any active operation to complete
+            if app.diag_task_running {
+                let wait_start = std::time::Instant::now();
+                while app.diag_task_running && wait_start.elapsed() < Duration::from_secs(3) {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    if let Some(ref mut rx) = app.diag_rx {
+                        while let Ok(step) = rx.try_recv() {
+                            if step.label == "DONE" { app.diag_task_running = false; }
+                            app.diag_steps.push(step);
+                        }
+                    }
+                }
+            }
+            break;
+        }
     }
 
     if let Some(pool) = app.db_pool.take() { pool.disconnect().await?; }
