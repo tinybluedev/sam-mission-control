@@ -2016,8 +2016,8 @@ fn render_splash(frame: &mut Frame, app: &App) {
     let bg = Block::default().style(Style::default().bg(app.bg_density.bg()));
     frame.render_widget(bg, area);
 
-    let ver_line = format!("    v{} — {} agents in fleet", env!("CARGO_PKG_VERSION"), app.agents.len());
-    let online_line = format!("    {} online", app.agents.iter().filter(|a| a.status == AgentStatus::Online).count());
+    let ver_line = format!("v{} — {} agents in fleet", env!("CARGO_PKG_VERSION"), app.agents.len());
+    let online_line = format!("{} online", app.agents.iter().filter(|a| a.status == AgentStatus::Online).count());
     let logo: Vec<&str> = vec![
         "",
         r"    ____    _    __  __ ",
@@ -2027,26 +2027,26 @@ fn render_splash(frame: &mut Frame, app: &App) {
         r"   |____/_/   \_\_|  |_|",
         "",
         "",
-        "    S . A . M   M I S S I O N   C O N T R O L",
+        "S . A . M   M I S S I O N   C O N T R O L",
         "",
         &ver_line,
         &online_line,
         "",
-        "    Strange Artificial Machine — Fleet Orchestration TUI",
+        "Strange Artificial Machine — Fleet Orchestration TUI",
         "",
-        "    Press any key to continue...",
+        "Press any key to continue...",
     ];
 
-    // Animated gradient: cycle through blue shades using elapsed time
+    // Animated gradient: cycle through theme accent colors using elapsed time
     let elapsed_ms = app.splash_start.elapsed().as_millis() as u32;
     let phase = (elapsed_ms / 80) % 6;
     let gradient_colors = [
-        Color::Rgb(40, 140, 220),
-        Color::Rgb(60, 170, 255),
-        Color::Rgb(80, 200, 255),
-        Color::Rgb(100, 220, 255),
-        Color::Rgb(80, 200, 255),
-        Color::Rgb(60, 170, 255),
+        t.accent,
+        t.accent2,
+        t.header_title,
+        t.header_title,
+        t.accent2,
+        t.accent,
     ];
 
     let cy = area.height / 2;
@@ -2056,10 +2056,12 @@ fn render_splash(frame: &mut Frame, app: &App) {
         let y = start_y + i as u16;
         if y >= area.height { break; }
         let color = if i >= 1 && i <= 5 {
-            // Animated gradient on logo lines
+            // Animated gradient on logo lines using theme colors
             gradient_colors[((i as u32 + phase) % 6) as usize]
         } else if i == 8 {
             t.header_title
+        } else if i == logo.len() - 1 {
+            t.text
         } else {
             t.text_dim
         };
@@ -3389,7 +3391,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Splash dismiss
             if app.show_splash {
-                if let Event::Key(_) = &ev { app.show_splash = false; }
+                match &ev {
+                    Event::Key(_) | Event::Mouse(_) => { app.show_splash = false; }
+                    _ => {}
+                }
                 continue;
             }
 
