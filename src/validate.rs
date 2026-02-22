@@ -134,7 +134,7 @@ pub fn validate_deploy_filename(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("File name must not be empty".into());
     }
-    if value.contains('/') || value.contains('\\') || value == "." || value == ".." || value.contains("..") {
+    if value.contains('/') || value.contains('\\') || value == "." || value == ".." {
         return Err("File must be a simple name (no path separators or traversal)".into());
     }
     validate_shell_arg(value)
@@ -338,6 +338,8 @@ mod tests {
     fn deploy_filename_valid() {
         assert!(validate_deploy_filename("SOUL.md").is_ok());
         assert!(validate_deploy_filename("agent-config.json").is_ok());
+        assert!(validate_deploy_filename("file..txt").is_ok());
+        assert!(validate_deploy_filename("..file.txt").is_ok());
     }
 
     #[test]
@@ -345,6 +347,7 @@ mod tests {
         assert!(validate_deploy_filename("../secret").is_err());
         assert!(validate_deploy_filename("a/b.txt").is_err());
         assert!(validate_deploy_filename("a\\b.txt").is_err());
+        assert!(validate_deploy_filename(".").is_err());
         assert!(validate_deploy_filename("..").is_err());
     }
 }

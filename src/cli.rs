@@ -16,7 +16,6 @@
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::path::PathBuf;
 use crate::validate;
 
@@ -655,9 +654,12 @@ print('ok')
     Ok(())
 }
 
+/// Generate a cryptographically secure random hex token.
+///
+/// The returned string length is `byte_len * 2`.
 fn random_hex_token(byte_len: usize) -> Result<String, Box<dyn std::error::Error>> {
     let mut bytes = vec![0_u8; byte_len];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes)?;
     Ok(bytes.into_iter().map(|b| format!("{:02x}", b)).collect())
 }
 
@@ -667,7 +669,7 @@ pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Resul
     use tokio::process::Command;
 
     validate::validate_deploy_filename(file)
-        .map_err(|e| format!("Invalid file name: {}", e))?;
+        .map_err(|e| format!("Cannot deploy file: {}", e))?;
 
     // Resolve source file
     let src_path = source.map(|s| s.to_string()).unwrap_or_else(|| {
@@ -990,8 +992,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
                 issues += 1;
                 if fix {
                     print!("        🔧 Setting bind=lan... ");
-                    let _ = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
-                        "-o", "StrictHostKeyChecking=no",
+                    let _ = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                         &format!("{}@{}", user, ip),
                         "python3 -c \"import json,os;p=os.path.expanduser('~/.openclaw/openclaw.json');c=json.load(open(p));c.setdefault('gateway',{})['bind']='lan';json.dump(c,open(p,'w'),indent=2);print('ok')\""
                     ]).output().await;
