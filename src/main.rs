@@ -55,6 +55,8 @@ struct Agent {
     disk_pct: Option<f32>,
     gateway_port: i32,
     gateway_token: Option<String>,
+    gateway_pid: Option<i32>,
+    gateway_status: GatewayStatus,
     uptime_seconds: i64,
     activity: String,  // What the agent is currently doing
     context_pct: Option<f32>,  // Context window usage %
@@ -64,6 +66,9 @@ struct Agent {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 enum AgentStatus { Online, Busy, Offline, Probing, Unknown }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+enum GatewayStatus { Online, Offline, Restarting, Unknown }
 
 impl std::fmt::Display for AgentStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -121,6 +126,9 @@ enum Focus { Fleet, Chat, AgentChat, Command, Workspace, Services }
 
 #[derive(PartialEq)]
 enum Screen { Dashboard, AgentDetail, TaskBoard, SpawnManager, VpnStatus, Alerts, Help }
+
+#[derive(PartialEq, Clone, Copy)]
+enum GatewayAction { Start, Stop, Restart }
 
 #[derive(PartialEq, Clone, Copy)]
 enum GroupFilter { All, Home, SM, VPS, Mobile, Outdated, Offline }
@@ -185,6 +193,8 @@ struct ProbeResult {
     disk_pct: Option<f32>,
     activity: String,
     context_pct: Option<f32>,
+    gateway_status: GatewayStatus,
+    gateway_pid: Option<i32>,
 }
 
 
@@ -329,6 +339,7 @@ struct App {
     alert_flash: Option<Instant>,
     alerts_scroll: u16,
     gateway_confirm_at: Option<Instant>,
+    gateway_action_confirm: Option<(usize, GatewayAction, Instant)>,
     // Diagnostics (inline doctor/fix)
     diag_active: bool,
     diag_steps: Vec<DiagStep>,
@@ -451,6 +462,8 @@ impl App {
                         cpu_pct: None, ram_pct: None, disk_pct: None,
                         gateway_port: da.gateway_port,
                         gateway_token: da.gateway_token.clone(),
+                        gateway_pid: da.gateway_pid,
+                        gateway_status: if da.gateway_pid.unwrap_or(0) > 0 { GatewayStatus::Online } else { GatewayStatus::Unknown },
                         uptime_seconds: da.uptime_seconds,
                         activity: "idle".into(), context_pct: None,
                         last_probe_at: None,
@@ -493,7 +506,7 @@ impl App {
             spawned_agents: vec![], show_splash: true, splash_start: Instant::now(),
             config_text: None, config_scroll: 0, help_scroll: 0,
             filter_active: false, filter_text: String::new(),
-            alerts: vec![], alert_flash: None, alerts_scroll: 0, gateway_confirm_at: None,
+            alerts: vec![], alert_flash: None, alerts_scroll: 0, gateway_confirm_at: None, gateway_action_confirm: None,
             multi_selected: HashSet::new(),
             spinner_frame: 0, sort_mode: SortMode::Name, group_filter: GroupFilter::All,
             fleet_area: Rect::default(), chat_area: Rect::default(),
@@ -1399,6 +1412,116 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
                 let status = if install_ok { "completed" } else { "failed" };
                 let _ = db::complete_operation(pool, op_id, status, None).await;
             }
+        });
+    }
+
+    fn start_gateway_action(&mut self, action: GatewayAction) {
+        if self.selected >= self.agents.len() { return; }
+        let idx = self.selected;
+        let agent = &self.agents[idx];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let name = agent.db_name.clone();
+        let self_ip = self.self_ip.clone();
+        let pool_opt = self.db_pool.clone();
+        let action_label = match action {
+            GatewayAction::Start => "start",
+            GatewayAction::Stop => "stop",
+            GatewayAction::Restart => "restart",
+        };
+
+        self.agents[idx].gateway_status = if action == GatewayAction::Restart {
+            GatewayStatus::Restarting
+        } else {
+            GatewayStatus::Unknown
+        };
+        self.diag_active = true;
+        self.diag_task_running = true;
+        self.diag_auto_fix = false;
+        self.diag_title = Some(format!("🌐 Gateway {} — {}", action_label, name));
+        self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
+        self.diag_steps = vec![DiagStep { label: format!("Gateway {} on {}...", action_label, name), status: DiagStatus::Running, detail: String::new() }];
+
+        let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
+        self.diag_rx = Some(rx);
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let remote_cmd = format!(
+                "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; openclaw gateway {} 2>&1; echo EXITCODE:$?:DONE",
+                action_label
+            );
+            let mut child = if host == "localhost" || host == self_ip {
+                tokio::process::Command::new("bash")
+                    .args(["-c", &remote_cmd])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            } else {
+                tokio::process::Command::new("ssh")
+                    .args([
+                        "-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), &remote_cmd,
+                    ])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            };
+
+            let _ = tx.send(DiagStep { label: "Gateway command".into(), status: DiagStatus::Running, detail: format!("openclaw gateway {}", action_label) });
+            let mut action_ok = false;
+            let mut last_line = String::new();
+            if let Ok(ref mut child) = child {
+                if let Some(stdout) = child.stdout.take() {
+                    let mut reader = tokio::io::BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let clean = line.trim().to_string();
+                        if clean.is_empty() { continue; }
+                        if clean.starts_with("EXITCODE:") {
+                            action_ok = clean.trim_start_matches("EXITCODE:").trim_end_matches(":DONE") == "0";
+                            continue;
+                        }
+                        last_line = clean.clone();
+                        let _ = tx.send(DiagStep { label: "  output".into(), status: DiagStatus::Running, detail: clean.chars().take(90).collect() });
+                    }
+                }
+                if let Ok(status) = child.wait().await {
+                    if !action_ok { action_ok = status.success(); }
+                }
+            }
+            let _ = tx.send(DiagStep {
+                label: "Gateway command".into(),
+                status: if action_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if last_line.is_empty() { format!("gateway {}", action_label) } else { last_line.clone() },
+            });
+
+            if action == GatewayAction::Restart {
+                let _ = tx.send(DiagStep { label: "Gateway re-check".into(), status: DiagStatus::Running, detail: "waiting 3s before health probe".into() });
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+
+            let pid_out = App::ssh_run(&host, &user, &self_ip, "pgrep -f 'openclaw.*gateway' | head -1").await;
+            let gw_pid = pid_out.trim().parse::<i32>().ok();
+            if let Some(ref pool) = pool_opt {
+                let _ = db::update_gateway_pid(pool, &name, gw_pid).await;
+            }
+            let gateway_online = gw_pid.unwrap_or(0) > 0;
+            let final_status = if action == GatewayAction::Stop {
+                !gateway_online
+            } else {
+                gateway_online
+            };
+            let _ = tx.send(DiagStep {
+                label: "Gateway PID".into(),
+                status: if final_status { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if let Some(pid) = gw_pid { format!("pid {}", pid) } else { "not running".into() },
+            });
+            let _ = tx.send(DiagStep {
+                label: "DONE".into(),
+                status: if action_ok && final_status { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if action_ok && final_status { format!("Gateway {} complete", action_label) } else { format!("Gateway {} may have failed", action_label) },
+            });
         });
     }
 
@@ -2394,8 +2517,8 @@ print('ok')
             let tx = tx.clone();
             let full = self.refresh_cycle % 5 == 0; // full probe every 5th cycle
             tokio::spawn(async move {
-                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx) = probe_agent(&host, &user, &sip, full).await;
-                let _ = tx.send(ProbeResult { index: i, status, os, kernel: kern, oc_version: oc, latency_ms: lat, cpu_pct: cpu, ram_pct: ram, disk_pct: disk, activity: act, context_pct: ctx });
+                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx, gateway_status, gateway_pid) = probe_agent(&host, &user, &sip, full).await;
+                let _ = tx.send(ProbeResult { index: i, status, os, kernel: kern, oc_version: oc, latency_ms: lat, cpu_pct: cpu, ram_pct: ram, disk_pct: disk, activity: act, context_pct: ctx, gateway_status, gateway_pid });
             });
         }
     }
@@ -2413,6 +2536,8 @@ print('ok')
                     self.agents[r.index].cpu_pct = r.cpu_pct;
                     self.agents[r.index].ram_pct = r.ram_pct;
                     self.agents[r.index].disk_pct = r.disk_pct;
+                    self.agents[r.index].gateway_status = r.gateway_status;
+                    self.agents[r.index].gateway_pid = r.gateway_pid;
                     self.agents[r.index].last_seen = now_str();
                     self.agents[r.index].last_probe_at = Some(Instant::now());
                     updates.push((r.index, r.status, r.os, r.kernel, r.oc_version, r.latency_ms));
@@ -2514,7 +2639,7 @@ print('ok')
 
 // ---- SSH Probe ----
 
-async fn probe_agent(host: &str, user: &str, self_ip: &str, full: bool) -> (AgentStatus, String, String, String, Option<u32>, Option<f32>, Option<f32>, Option<f32>, String, Option<f32>) {
+async fn probe_agent(host: &str, user: &str, self_ip: &str, full: bool) -> (AgentStatus, String, String, String, Option<u32>, Option<f32>, Option<f32>, Option<f32>, String, Option<f32>, GatewayStatus, Option<i32>) {
     let start = Instant::now();
     // Fast probe: just SSH echo (connectivity + latency only)
     if !full && host != "localhost" && host != self_ip {
@@ -2525,8 +2650,15 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str, full: bool) -> (Agen
         ).await;
         let ms = start.elapsed().as_millis() as u32;
         return match result {
-            Ok(Ok(o)) if o.status.success() => (AgentStatus::Online, String::new(), String::new(), String::new(), Some(ms), None, None, None, String::new(), None),
-            _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None),
+            Ok(Ok(o)) if o.status.success() => {
+                let gw = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    Command::new("ssh").args(["-o","ConnectTimeout=1","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"pgrep -f 'openclaw.*gateway' | head -1"]).output()
+                ).await.ok().and_then(|r| r.ok())
+                    .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok());
+                (AgentStatus::Online, String::new(), String::new(), String::new(), Some(ms), None, None, None, String::new(), None, if gw.unwrap_or(0) > 0 { GatewayStatus::Online } else { GatewayStatus::Offline }, gw)
+            }
+            _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None, GatewayStatus::Offline, None),
         };
     }
     if host == "localhost" || host == self_ip {
@@ -2537,17 +2669,19 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str, full: bool) -> (Agen
         let ram = Command::new("bash").args(["-c", r#"free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}'"#]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok()).ok().flatten();
         let disk = Command::new("bash").args(["-c", r#"df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}'"#]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok()).ok().flatten();
         let ms = start.elapsed().as_millis() as u32;
-        return (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk, "local".into(), None);
+        let gw_pid = Command::new("bash").args(["-c", "pgrep -f 'openclaw.*gateway' | head -1"]).output().await.ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok());
+        return (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk, "local".into(), None, if gw_pid.unwrap_or(0) > 0 { GatewayStatus::Online } else { GatewayStatus::Offline }, gw_pid);
     }
     let tgt = format!("{}@{}", user, host);
-    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; ACT=$(openclaw status --json 2>/dev/null || ~/.npm-global/bin/openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
+    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); GWPID=$(pgrep -f 'openclaw.*gateway' 2>/dev/null | head -1 || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; echo "GWPID:$GWPID"; ACT=$(openclaw status --json 2>/dev/null || ~/.npm-global/bin/openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new("ssh").args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"bash","-c",script]).output()
     ).await;
     let result = match result {
         Ok(r) => r,
-        Err(_) => return (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None),
+        Err(_) => return (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None, GatewayStatus::Offline, None),
     };
     match result {
         Ok(o) if o.status.success() => {
@@ -2558,18 +2692,19 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str, full: bool) -> (Agen
                 else if let Some(v) = l.strip_prefix("KERN:") { kern = v.trim().into(); }
                 else if let Some(v) = l.strip_prefix("OC:") { oc = v.trim().into(); }
             }
-            let (mut cpu, mut ram, mut disk, mut act, mut ctx) = (None, None, None, String::new(), None);
+            let (mut cpu, mut ram, mut disk, mut act, mut ctx, mut gw_pid) = (None, None, None, String::new(), None, None);
             for l in s.lines() {
                 if let Some(v) = l.strip_prefix("CPU:") { cpu = v.trim().parse::<f32>().ok(); }
                 else if let Some(v) = l.strip_prefix("RAM:") { ram = v.trim().parse::<f32>().ok(); }
                 else if let Some(v) = l.strip_prefix("DISK:") { disk = v.trim().parse::<f32>().ok(); }
+                else if let Some(v) = l.strip_prefix("GWPID:") { gw_pid = v.trim().parse::<i32>().ok(); }
                 else if let Some(v) = l.strip_prefix("ACT:") { act = v.trim().to_string(); }
                 else if let Some(v) = l.strip_prefix("CTX:") { ctx = v.trim().parse::<f32>().ok(); }
             }
             let ms = start.elapsed().as_millis() as u32;
-            (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk, act, ctx)
+            (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk, act, ctx, if gw_pid.unwrap_or(0) > 0 { GatewayStatus::Online } else { GatewayStatus::Offline }, gw_pid)
         }
-        _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None),
+        _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None, GatewayStatus::Offline, None),
     }
 }
 
@@ -3381,6 +3516,11 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         Span::styled(format!("{} {}", a.emoji, a.name), Style::default().fg(t.header_title).bold()),
         Span::raw("  —  "),
         Span::styled(a.status.to_string(), Style::default().fg(st_color)),
+        if a.gateway_status == GatewayStatus::Offline {
+            Span::styled("   GATEWAY OFFLINE", Style::default().fg(Color::Black).bg(Color::Red).bold())
+        } else {
+            Span::raw("")
+        },
         Span::raw("    "),
         Span::styled(match app.focus {
             Focus::AgentChat => " 1:Info 2:▌Chat▐ 3:Files 4:Tasks 5:Svc",
@@ -3781,11 +3921,13 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
     items.push(Line::from(""));
     items.push(Line::from(Span::styled("  ─── Quick Actions ───", Style::default().fg(t.border))));
     items.push(Line::from(Span::styled("  Space  toggle on/off", Style::default().fg(t.text_dim))));
-    items.push(Line::from(Span::styled("  g      restart gateway", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  s      start gateway", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  S      stop gateway (confirm)", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  r      restart gateway (confirm)", Style::default().fg(t.text_dim))));
     items.push(Line::from(Span::styled("  d      run diagnostics", Style::default().fg(t.text_dim))));
     items.push(Line::from(Span::styled("  l      view gateway logs", Style::default().fg(t.text_dim))));
     items.push(Line::from(Span::styled("  e      edit raw config", Style::default().fg(t.text_dim))));
-    items.push(Line::from(Span::styled("  r      reload", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  R      reload", Style::default().fg(t.text_dim))));
 
     let list = Paragraph::new(items)
         .block(Block::default()
@@ -3832,7 +3974,9 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("  Actions", Style::default().fg(t.text_bold).bold())));
-            lines.push(Line::from(Span::styled("  [g] Restart gateway", Style::default().fg(t.accent))));
+            lines.push(Line::from(Span::styled("  [s] Start gateway", Style::default().fg(t.accent))));
+            lines.push(Line::from(Span::styled("  [S] Stop gateway (confirm)", Style::default().fg(t.accent))));
+            lines.push(Line::from(Span::styled("  [r] Restart gateway (confirm)", Style::default().fg(t.accent))));
             lines.push(Line::from(Span::styled("  [l] View recent logs", Style::default().fg(t.accent))));
             lines.push(Line::from(Span::styled("  [e] Edit raw config", Style::default().fg(t.accent))));
             lines.push(Line::from(""));
@@ -4633,7 +4777,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
             Focus::Workspace if app.ws_editing => vec![("^S","save"),("^Z","undo"),("↑↓←→","cursor"),("Esc","discard?")],
             Focus::Workspace => vec![("⏎","view"),("e","edit"),("r","reload"),("Esc","info"),("1-5","tabs")],
-            Focus::Services => vec![("␣","toggle"),("r","reload"),("Esc","info"),("1-5","tabs")],
+            Focus::Services => vec![("␣","toggle"),("s","start"),("S","stop"),("r","restart"),("R","reload"),("Esc","info"),("1-5","tabs")],
             _ => vec![("⏎","detail"),("d","check"),("D","fix"),("U","update"),("w","files"),("t","tasks"),("5","svc"),("Tab","chat"),("Esc","back")],
         },
         Screen::TaskBoard => if app.task_filter_agent.is_some() {
@@ -4780,9 +4924,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if a.oc_version.is_empty() { None } else { Some(a.oc_version.clone()) },
                         *lat,
                     );
+                    let gw_pid = a.gateway_pid;
                     tokio::spawn(async move {
                         let _ = db::update_agent_status_full(&p, &name, &st,
                             os.as_deref(), kern.as_deref(), oc.as_deref(), latency).await;
+                        let _ = db::update_gateway_pid(&p, &name, gw_pid).await;
                     });
                 }
             }
@@ -4967,6 +5113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         cpu_pct: None, ram_pct: None, disk_pct: None,
                                         gateway_port: 18789,
                                         gateway_token: None,
+                                        gateway_pid: None,
+                                        gateway_status: GatewayStatus::Unknown,
                                         uptime_seconds: 0,
                                         activity: "new".into(), context_pct: None,
                                         last_probe_at: None,
@@ -5098,27 +5246,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Up => { if app.svc_selected > 0 { app.svc_selected -= 1; app.svc_detail_scroll = 0; } }
                                 KeyCode::Down => { if app.svc_selected < app.svc_list.len().saturating_sub(1) { app.svc_selected += 1; app.svc_detail_scroll = 0; } }
                                 KeyCode::Char(' ') => app.toggle_service(),
-                                KeyCode::Char('r') => app.start_services_load(),
+                                KeyCode::Char('R') => app.start_services_load(),
+                                KeyCode::Char('s') => app.start_gateway_action(GatewayAction::Start),
+                                KeyCode::Char('S') | KeyCode::Char('r') => {
+                                    let action = if key.code == KeyCode::Char('S') { GatewayAction::Stop } else { GatewayAction::Restart };
+                                    let confirmed = app.gateway_action_confirm
+                                        .map(|(idx, act, at)| idx == app.selected && act == action && at.elapsed().as_secs() < 5)
+                                        .unwrap_or(false);
+                                    if confirmed {
+                                        app.gateway_action_confirm = None;
+                                        app.start_gateway_action(action);
+                                    } else {
+                                        app.gateway_action_confirm = Some((app.selected, action, Instant::now()));
+                                        let name = app.agents.get(app.selected).map(|a| a.name.clone()).unwrap_or_else(|| "?".into());
+                                        let verb = if action == GatewayAction::Stop { "stop" } else { "restart" };
+                                        app.toast(&format!("⚠ Press {} again to {} gateway on {}", if action == GatewayAction::Stop { "S" } else { "r" }, verb, name));
+                                    }
+                                }
                                 KeyCode::Char('d') => app.start_diagnostics(false),
                                 KeyCode::Char('D') => app.start_diagnostics(true),
                                 KeyCode::Char('U') => app.start_oc_update(),
                                 KeyCode::Char('g') => {
-                                    // Restart gateway from services tab
-                                    if let Some(agent) = app.agents.get(app.selected) {
-                                        let host = agent.host.clone();
-                                        let user = agent.ssh_user.clone();
-                                        let name = agent.name.clone();
-                                        let is_mac = agent.os.to_lowercase().contains("mac");
-                                        app.toast(&format!("🔄 Restarting gateway on {}...", name));
-                                        tokio::spawn(async move {
-                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-                                            let cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
-                                            let _ = tokio::process::Command::new("ssh")
-                                                .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                                    &format!("{}@{}", user, host), &cmd])
-                                                .output().await;
-                                        });
-                                    }
+                                    app.start_gateway_action(GatewayAction::Restart);
                                 }
                                 KeyCode::Char('l') => {
                                     // View gateway logs from services tab
@@ -5922,13 +6071,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Receive diagnostic steps (non-blocking)
         if app.diag_active {
             if let Some(ref mut rx) = app.diag_rx {
+                let mut refresh_after_done = false;
                 while let Ok(step) = rx.try_recv() {
                     let is_done = step.label == "DONE";
+                    if step.label == "Gateway PID" && app.selected < app.agents.len() {
+                        let pid = step.detail.strip_prefix("pid ").and_then(|v| v.trim().parse::<i32>().ok());
+                        app.agents[app.selected].gateway_pid = pid;
+                        app.agents[app.selected].gateway_status = if pid.unwrap_or(0) > 0 { GatewayStatus::Online } else { GatewayStatus::Offline };
+                    }
                     app.diag_steps.push(step);
                     if is_done {
                         // Mark task as no longer running (overlay stays open for user to read)
                         app.diag_task_running = false;
+                        if app.diag_title.as_deref().map(|t| t.starts_with("🌐 Gateway")).unwrap_or(false) {
+                            refresh_after_done = true;
+                        }
                     }
+                }
+                if refresh_after_done {
+                    app.start_refresh();
                 }
             }
         }
