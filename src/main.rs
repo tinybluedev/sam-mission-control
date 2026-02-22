@@ -143,6 +143,71 @@ struct ProbeResult {
     disk_pct: Option<f32>,
 }
 
+
+// ── UI Helpers ──────────────────────────────────────
+fn chrono_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let secs = now % 86400;
+    let hours = ((secs / 3600) + 24 - 6) % 24; // UTC-6 for CST
+    let mins = (secs % 3600) / 60;
+    format!("{:02}:{:02}", hours, mins)
+}
+
+fn os_emoji(os: &str) -> &'static str {
+    let os_lower = os.to_lowercase();
+    if os_lower.contains("mac") || os_lower.contains("darwin") { "🍎" }
+    else if os_lower.contains("windows") { "🪟" }
+    else if os_lower.contains("android") { "📱" }
+    else if os_lower.contains("arch") { "🏔" }
+    else if os_lower.contains("fedora") { "🎩" }
+    else if os_lower.contains("ubuntu") { "🟠" }
+    else if os_lower.contains("rhel") || os_lower.contains("alma") || os_lower.contains("rocky") { "🔴" }
+    else if os_lower.contains("linux") { "🐧" }
+    else { "💻" }
+}
+
+fn format_uptime(secs: i64) -> String {
+    if secs <= 0 { return "—".into(); }
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    if days > 0 { format!("{}d {}h", days, hours) }
+    else if hours > 0 { format!("{}h {}m", hours, mins) }
+    else { format!("{}m", mins) }
+}
+
+fn format_last_seen(dt: &str) -> String {
+    // Simple relative time from datetime string
+    if dt.is_empty() { return "—".into(); }
+    // Just show the time portion for now
+    if let Some(time) = dt.split(' ').nth(1) {
+        time[..5].to_string()  // HH:MM
+    } else {
+        dt.to_string()
+    }
+}
+
+fn ping_color(latency: Option<u32>) -> ratatui::style::Color {
+    match latency {
+        Some(ms) if ms < 100 => ratatui::style::Color::Green,
+        Some(ms) if ms < 500 => ratatui::style::Color::Yellow,
+        Some(_) => ratatui::style::Color::Red,
+        None => ratatui::style::Color::DarkGray,
+    }
+}
+
+fn resource_bar(pct: Option<f32>, width: u16) -> String {
+    let p = pct.unwrap_or(0.0);
+    let filled = ((p / 100.0) * width as f32) as usize;
+    let empty = (width as usize).saturating_sub(filled);
+    format!("{}{}",
+        "█".repeat(filled),
+        "░".repeat(empty),
+    )
+}
+
+
 struct App {
     agents: Vec<Agent>,
     fleet_config: Vec<config::AgentConfig>,
@@ -216,7 +281,7 @@ impl App {
                     agents.push(Agent {
                         name: cfg.map(|c| c.display_name().to_string()).unwrap_or_else(|| da.agent_name.clone()),
                         db_name: da.agent_name.clone(),
-                        emoji: cfg.map(|c| c.emoji().to_string()).unwrap_or_else(|| "❓".into()),
+                        emoji: cfg.map(|c| c.emoji().to_string()).unwrap_or_else(|| os_emoji(da.os_info.as_deref().unwrap_or("")).to_string()),
                         host: da.tailscale_ip.unwrap_or("?".into()),
                         location: cfg.map(|c| c.location().to_string()).unwrap_or_else(|| "?".into()),
                         status: AgentStatus::from_str(&da.status),
@@ -677,7 +742,19 @@ fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme) -> Vec<Line<'s
     let mut lines: Vec<Line<'static>> = Vec::new();
     if messages.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("  No messages yet".to_string(), Style::default().fg(t.text_dim))));
+        let empty_art = vec![
+            "",
+            "      ╭───────────────────╮",
+            "      │   📡  Listening... │",
+            "      │                   │",
+            "      │  Tab to chat,     │",
+            "      │  type a message   │",
+            "      │  and hit Enter    │",
+            "      ╰───────────────────╯",
+        ];
+        for l in empty_art {
+            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(t.text_dim))));
+        }
         return lines;
     }
     for msg in messages {
@@ -845,6 +922,9 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
             Span::styled("  ⚠️ NEW ALERT", Style::default().fg(t.status_offline).bold())
         } else { Span::raw("") },
         Span::raw("    "),
+        Span::raw("    "),
+        Span::styled(chrono_now(), Style::default().fg(t.text_dim)),
+        Span::raw("    "),
         Span::styled(match app.focus {
             Focus::Fleet => "▌Fleet▐", Focus::Chat => "▌Chat▐", _ => "▌Fleet▐",
         }, Style::default().fg(t.accent).bold()),
@@ -910,7 +990,7 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
 
     let rows: Vec<Row> = app.agents.iter().enumerate().map(|(i, a)| {
         let sel = i == app.selected && active;
-        let bg = if sel { t.selected_bg } else { app.bg_density.bg() };
+        let bg = if sel { t.selected_bg } else if i % 2 == 1 { ratatui::style::Color::Rgb(20, 22, 28) } else { app.bg_density.bg() };
         let loc_color = match a.location.as_str() {
             "Home" => t.loc_home, "SM" => t.loc_sm, "VPS" => t.loc_vps, "Mobile" => t.loc_mobile, _ => t.text,
         };
@@ -1240,7 +1320,7 @@ fn render_task_board(frame: &mut Frame, app: &App) {
 
     let rows: Vec<Row> = app.tasks.iter().enumerate().map(|(i, task)| {
         let sel = i == app.task_selected;
-        let bg = if sel { t.selected_bg } else { app.bg_density.bg() };
+        let bg = if sel { t.selected_bg } else if i % 2 == 1 { ratatui::style::Color::Rgb(20, 22, 28) } else { app.bg_density.bg() };
         let is_multi = app.multi_selected.contains(&i);
         let cursor = if sel && is_multi { "▶✓" } else if sel { "▶ " } else if is_multi { " ✓" } else { "  " };
 
