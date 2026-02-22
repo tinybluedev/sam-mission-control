@@ -23,7 +23,7 @@ use ratatui::{
     widgets::*,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::stdout;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -350,6 +350,11 @@ struct App {
     svc_config: Option<serde_json::Value>,  // Full openclaw.json
     svc_loading: bool,
     svc_load_rx: Option<mpsc::UnboundedReceiver<Option<serde_json::Value>>>,
+    svc_panel_rx: Option<mpsc::UnboundedReceiver<ServicePanelMsg>>,
+    svc_panel_loading: bool,
+    svc_panel_name: Option<String>,
+    svc_panel_outputs: HashMap<String, String>,
+    svc_panel_errors: HashMap<String, String>,
     config_load_rx: Option<mpsc::UnboundedReceiver<Option<String>>>,
     svc_detail_scroll: u16,
     // Workspace (agent file management)
@@ -502,7 +507,9 @@ impl App {
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
             diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None, diag_overlay_scroll: 0,
             fleet_diag_active: false, fleet_diag_fix: false, fleet_diag_selected: 0, fleet_diag_done: false, fleet_diag_results: vec![], fleet_diag_rx: None,
-            svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
+            svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None,
+            svc_panel_rx: None, svc_panel_loading: false, svc_panel_name: None, svc_panel_outputs: HashMap::new(), svc_panel_errors: HashMap::new(),
+            svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: vec![], ws_cursor: (0, 0), ws_undo_stack: vec![], ws_discard_confirm: false,
             ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
@@ -1146,6 +1153,7 @@ impl App {
                     services.push(ServiceEntry {
                         name: name.clone(), icon: svc_icon(name),
                         enabled, has_channel_config: has_channel, summary,
+                        panel_script: panel_script_from_plugin_entry(val),
                     });
                 }
             }
@@ -1159,6 +1167,7 @@ impl App {
                             name: name.clone(), icon: svc_icon(name),
                             enabled: false, has_channel_config: true,
                             summary: format!("no plugin entry — {}", summary),
+                            panel_script: None,
                         });
                     }
                 }
@@ -1175,6 +1184,7 @@ impl App {
                     name: "gateway".into(), icon: "🌐",
                     enabled: true, has_channel_config: false,
                     summary: format!("mode:{} bind:{} chat:{} auth:{}", mode, bind, if chat {"on"} else {"off"}, if has_token {"token"} else {"none"}),
+                    panel_script: None,
                 });
             }
 
@@ -1187,6 +1197,7 @@ impl App {
                     name: "model".into(), icon: "🧠",
                     enabled: true, has_channel_config: false,
                     summary: format!("{} ({}K ctx)", model.split('/').last().unwrap_or(model), ctx / 1000),
+                    panel_script: None,
                 });
             }
         }
@@ -1201,6 +1212,98 @@ impl App {
             rank(a).cmp(&rank(b))
         });
         self.svc_list = services;
+        self.svc_selected = self.svc_selected.min(self.svc_list.len().saturating_sub(1));
+    }
+
+    fn maybe_start_panel_for_selected_service(&mut self, force: bool) {
+        if self.selected >= self.agents.len() || self.svc_selected >= self.svc_list.len() {
+            return;
+        }
+        let svc = &self.svc_list[self.svc_selected];
+        let Some(script) = svc.panel_script.clone() else { return; };
+        if self.svc_panel_loading {
+            return;
+        }
+        if !force && self.svc_panel_outputs.contains_key(&svc.name) {
+            return;
+        }
+        self.start_service_panel_load(svc.name.clone(), script);
+    }
+
+    fn start_service_panel_load(&mut self, service_name: String, script: String) {
+        if self.selected >= self.agents.len() || self.svc_panel_loading {
+            return;
+        }
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let self_ip = self.self_ip.clone();
+
+        self.svc_panel_loading = true;
+        self.svc_panel_name = Some(service_name.clone());
+        self.svc_panel_errors.remove(&service_name);
+        self.diag_active = true;
+        self.diag_task_running = true;
+        self.diag_auto_fix = false;
+        self.diag_title = Some(format!("🔌 Plugin Panel — {}", service_name));
+        self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
+        self.diag_steps = vec![DiagStep {
+            label: format!("Loading panel for {}", service_name),
+            status: DiagStatus::Running,
+            detail: String::new(),
+        }];
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.svc_panel_rx = Some(rx);
+        tokio::spawn(async move {
+            let _ = tx.send(ServicePanelMsg::Step(DiagStep {
+                label: "Running plugin panel script".into(),
+                status: DiagStatus::Running,
+                detail: "collecting output...".into(),
+            }));
+            let output = if host == "localhost" || host == self_ip {
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    Command::new("bash").args(["-lc", &script]).output(),
+                )
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+            } else {
+                let cmd = format!("bash -lc {}", shell::escape(&script));
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    Command::new("ssh")
+                        .args([
+                            "-o",
+                            "ConnectTimeout=5",
+                            "-o",
+                            "BatchMode=yes",
+                            "-o",
+                            "StrictHostKeyChecking=no",
+                            &format!("{}@{}", user, host),
+                            &cmd,
+                        ])
+                        .output(),
+                )
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+            };
+            let result = match output {
+                Some(o) if o.status.success() => {
+                    let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    Ok(if text.is_empty() { "(no panel output)".to_string() } else { text })
+                }
+                Some(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    Err(if err.is_empty() { "panel command failed".to_string() } else { err })
+                }
+                None => Err("panel command timed out".to_string()),
+            };
+            let _ = tx.send(ServicePanelMsg::Done { service_name, result });
+        });
     }
 
     fn build_channel_summary(&self, name: &str, config: &serde_json::Value) -> String {
@@ -2617,6 +2720,12 @@ struct ServiceEntry {
     enabled: bool,
     has_channel_config: bool,
     summary: String,  // e.g. "2 groups, dmPolicy: pairing"
+    panel_script: Option<String>,
+}
+
+enum ServicePanelMsg {
+    Step(DiagStep),
+    Done { service_name: String, result: Result<String, String> },
 }
 
 /// Diagnostic step result
@@ -2674,6 +2783,17 @@ const SERVICE_ICONS: &[(&str, &str)] = &[
 
 fn svc_icon(name: &str) -> &'static str {
     SERVICE_ICONS.iter().find(|(n, _)| *n == name).map(|(_, i)| *i).unwrap_or("🔌")
+}
+
+fn panel_script_from_plugin_entry(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("panelScript")
+        .or_else(|| entry.get("panel_script"))
+        .or_else(|| entry.get("panel").and_then(|p| p.get("script")))
+        .or_else(|| entry.get("panel").and_then(|p| p.get("command")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 const AGENT_FILES: &[(&str, &str, &str)] = &[
@@ -3784,6 +3904,7 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
     items.push(Line::from(Span::styled("  g      restart gateway", Style::default().fg(t.text_dim))));
     items.push(Line::from(Span::styled("  d      run diagnostics", Style::default().fg(t.text_dim))));
     items.push(Line::from(Span::styled("  l      view gateway logs", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  p      refresh custom panel", Style::default().fg(t.text_dim))));
     items.push(Line::from(Span::styled("  e      edit raw config", Style::default().fg(t.text_dim))));
     items.push(Line::from(Span::styled("  r      reload", Style::default().fg(t.text_dim))));
 
@@ -3914,6 +4035,34 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                 if !has_bot_id && (svc.name == "discord" || svc.name == "telegram") {
                     lines.push(Line::from(Span::styled("  ⚠ No bot ID set", Style::default().fg(Color::Yellow))));
                 }
+            }
+        }
+        if svc.panel_script.is_some() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Custom Panel", Style::default().fg(t.text_bold).bold())));
+            if app.svc_panel_loading && app.svc_panel_name.as_deref() == Some(svc.name.as_str()) {
+                let spinner = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+                lines.push(Line::from(Span::styled(
+                    format!("  {} Loading panel output...", spinner),
+                    Style::default().fg(t.pending),
+                )));
+            } else if let Some(err) = app.svc_panel_errors.get(&svc.name) {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", err),
+                    Style::default().fg(t.status_offline),
+                )));
+            } else if let Some(output) = app.svc_panel_outputs.get(&svc.name) {
+                for line in output.lines().take(24) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", line),
+                        Style::default().fg(t.text),
+                    )));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  Press [p] to load panel output",
+                    Style::default().fg(t.text_dim),
+                )));
             }
         }
         lines
@@ -5095,10 +5244,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                 }
                                 KeyCode::Char('5') => {} // already here
-                                KeyCode::Up => { if app.svc_selected > 0 { app.svc_selected -= 1; app.svc_detail_scroll = 0; } }
-                                KeyCode::Down => { if app.svc_selected < app.svc_list.len().saturating_sub(1) { app.svc_selected += 1; app.svc_detail_scroll = 0; } }
+                                KeyCode::Up => {
+                                    if app.svc_selected > 0 {
+                                        app.svc_selected -= 1;
+                                        app.svc_detail_scroll = 0;
+                                        app.maybe_start_panel_for_selected_service(false);
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if app.svc_selected < app.svc_list.len().saturating_sub(1) {
+                                        app.svc_selected += 1;
+                                        app.svc_detail_scroll = 0;
+                                        app.maybe_start_panel_for_selected_service(false);
+                                    }
+                                }
                                 KeyCode::Char(' ') => app.toggle_service(),
                                 KeyCode::Char('r') => app.start_services_load(),
+                                KeyCode::Char('p') => app.maybe_start_panel_for_selected_service(true),
                                 KeyCode::Char('d') => app.start_diagnostics(false),
                                 KeyCode::Char('D') => app.start_diagnostics(true),
                                 KeyCode::Char('U') => app.start_oc_update(),
@@ -5988,8 +6150,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.svc_config = config;
                 app.parse_services();
                 app.svc_loading = false;
+                app.maybe_start_panel_for_selected_service(false);
                 let count = app.svc_list.len();
                 app.toast(&format!("✓ Loaded {} services", count));
+            }
+        }
+
+        // Receive plugin panel results (non-blocking)
+        let mut panel_msgs = Vec::new();
+        if let Some(ref mut rx) = app.svc_panel_rx {
+            while let Ok(msg) = rx.try_recv() {
+                panel_msgs.push(msg);
+            }
+        }
+        for msg in panel_msgs {
+            match msg {
+                ServicePanelMsg::Step(step) => app.diag_steps.push(step),
+                ServicePanelMsg::Done { service_name, result } => {
+                    app.svc_panel_loading = false;
+                    app.svc_panel_name = None;
+                    app.diag_task_running = false;
+                    match result {
+                        Ok(output) => {
+                            app.svc_panel_errors.remove(&service_name);
+                            app.svc_panel_outputs.insert(service_name.clone(), output);
+                            app.diag_steps.push(DiagStep {
+                                label: "DONE".into(),
+                                status: DiagStatus::Pass,
+                                detail: "panel loaded".into(),
+                            });
+                            app.toast(&format!("✓ Loaded {} panel", service_name));
+                        }
+                        Err(err) => {
+                            app.svc_panel_errors.insert(service_name.clone(), err.clone());
+                            app.diag_steps.push(DiagStep {
+                                label: "DONE".into(),
+                                status: DiagStatus::Fail,
+                                detail: err,
+                            });
+                            app.toast(&format!("⚠ {} panel failed", service_name));
+                        }
+                    }
+                }
             }
         }
 
@@ -6126,10 +6328,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::INPUT_POLL_MS;
+    use super::{panel_script_from_plugin_entry, INPUT_POLL_MS};
 
     #[test]
     fn input_poll_interval_is_low_for_responsive_ui() {
         assert!(INPUT_POLL_MS <= 10);
+    }
+
+    #[test]
+    fn panel_script_supports_camel_and_snake_case_keys() {
+        let camel = serde_json::json!({ "panelScript": "echo camel" });
+        let snake = serde_json::json!({ "panel_script": "echo snake" });
+        assert_eq!(panel_script_from_plugin_entry(&camel).as_deref(), Some("echo camel"));
+        assert_eq!(panel_script_from_plugin_entry(&snake).as_deref(), Some("echo snake"));
+    }
+
+    #[test]
+    fn panel_script_supports_nested_panel_command() {
+        let nested = serde_json::json!({ "panel": { "command": "echo nested" } });
+        assert_eq!(panel_script_from_plugin_entry(&nested).as_deref(), Some("echo nested"));
     }
 }
