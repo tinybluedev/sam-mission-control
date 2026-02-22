@@ -2045,10 +2045,11 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             // ── Step 3: Distribute SSH public key (optional) ──────────────────
             send_step("SSH key", DiagStatus::Running, "checking for local public key".to_string());
             let pub_key = tokio::task::spawn_blocking(|| {
+                let home = dirs::home_dir().unwrap_or_default();
                 let candidates = [
-                    dirs::home_dir().unwrap_or_default().join(".ssh/id_ed25519.pub"),
-                    dirs::home_dir().unwrap_or_default().join(".ssh/id_rsa.pub"),
-                    dirs::home_dir().unwrap_or_default().join(".ssh/id_ecdsa.pub"),
+                    home.join(".ssh/id_ed25519.pub"),
+                    home.join(".ssh/id_rsa.pub"),
+                    home.join(".ssh/id_ecdsa.pub"),
                 ];
                 candidates.iter().find_map(|p| std::fs::read_to_string(p).ok())
             }).await.ok().flatten();
@@ -2175,7 +2176,9 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
                     send_step("Gateway config", DiagStatus::Fail, "failed to generate secure token".to_string());
                     // Rollback if we installed OC
                     if oc_installed_by_us {
-                        let _ = Command::new("ssh").args(ssh_args(&format!("{}sudo npm uninstall -g openclaw 2>/dev/null || true", pfx))).output().await;
+                        let rb_out = Command::new("ssh").args(ssh_args(&format!("{}sudo npm uninstall -g openclaw 2>/dev/null || true", pfx))).output().await;
+                        let rb_ok = rb_out.map(|o| o.status.success()).unwrap_or(false);
+                        send_step("Rollback", DiagStatus::Rollback, if rb_ok { "OpenClaw uninstalled".to_string() } else { "rollback may have failed — check manually".to_string() });
                     }
                     send_step("DONE", DiagStatus::Fail, "Onboarding aborted".to_string());
                     return;
@@ -2211,8 +2214,9 @@ print('ok')
             if !cfg_ok {
                 send_step("Gateway config", DiagStatus::Fail, "could not write openclaw.json".to_string());
                 if oc_installed_by_us {
-                    let _ = Command::new("ssh").args(ssh_args(&format!("{}sudo npm uninstall -g openclaw 2>/dev/null || true", pfx))).output().await;
-                    send_step("Rollback", DiagStatus::Rollback, "OpenClaw uninstalled".to_string());
+                    let rb_out = Command::new("ssh").args(ssh_args(&format!("{}sudo npm uninstall -g openclaw 2>/dev/null || true", pfx))).output().await;
+                    let rb_ok = rb_out.map(|o| o.status.success()).unwrap_or(false);
+                    send_step("Rollback", DiagStatus::Rollback, if rb_ok { "OpenClaw uninstalled".to_string() } else { "rollback may have failed — check manually".to_string() });
                 }
                 send_step("DONE", DiagStatus::Fail, "Onboarding aborted".to_string());
                 return;

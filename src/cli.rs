@@ -655,17 +655,21 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
     }
 
     // Helper: rollback partial OpenClaw install on failure.
-    // (Defined as a sync fn that does async work — called with .await on the returned future.)
     async fn do_rollback(oc_installed: bool, ssh_target: &str, pfx: &str) {
         if oc_installed {
             use tokio::process::Command;
             eprintln!("  ⏪ Rolling back: uninstalling openclaw...");
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30),
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30),
                 Command::new("ssh")
                     .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
                         ssh_target, &format!("{}sudo npm uninstall -g openclaw 2>/dev/null || true", pfx)])
                     .output()
             ).await;
+            match result {
+                Ok(Ok(o)) if o.status.success() => eprintln!("  ✅ rollback: openclaw removed"),
+                Ok(Ok(o)) => eprintln!("  ⚠️  rollback: exit {}", o.status),
+                _ => eprintln!("  ⚠️  rollback: timed out or failed — check manually"),
+            }
         }
     }
 
@@ -700,9 +704,11 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
         n.to_string()
     } else {
         let hn_out = Command::new("ssh").args(ssh_args("hostname")).output().await?;
-        String::from_utf8_lossy(&hn_out.stdout).trim().to_lowercase()
-            .chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' }).collect::<String>()
-            .trim_matches('-').to_string()
+        let raw = String::from_utf8_lossy(&hn_out.stdout).trim().to_lowercase()
+            .chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' }).collect::<String>();
+        // Collapse consecutive hyphens and trim leading/trailing hyphens
+        let collapsed = raw.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+        collapsed.trim_matches('-').to_string()
     };
 
     let escaped_agent = shell::escape(&agent_name);
