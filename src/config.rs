@@ -1,11 +1,25 @@
+//! Configuration loading for S.A.M Mission Control.
+//!
+//! This module handles two configuration files:
+//!
+//! - **`config.toml`** — database credentials, TUI settings, operator identity.
+//!   Loaded by the CLI layer from `~/.config/sam/config.toml`.
+//! - **`fleet.toml`** — list of agents with display names, emojis, locations, and
+//!   SSH usernames. Loaded via [`load_fleet_config`].
+//!
+//! Agent name resolution (display name / alias → canonical name) is provided by
+//! [`resolve_alias`].
+
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Top-level fleet configuration, parsed from `fleet.toml`.
 #[derive(Debug, Deserialize)]
 pub struct FleetConfig {
     pub agent: Vec<AgentConfig>,
 }
 
+/// Configuration for a single agent entry in `fleet.toml`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
     pub name: String,
@@ -16,15 +30,19 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    /// Return the display name, falling back to the agent's `name` field.
     pub fn display_name(&self) -> &str {
         self.display.as_deref().unwrap_or(&self.name)
     }
+    /// Return the emoji prefix, defaulting to `"❓"`.
     pub fn emoji(&self) -> &str {
         self.emoji.as_deref().unwrap_or("❓")
     }
+    /// Return the location label, defaulting to `"Unknown"`.
     pub fn location(&self) -> &str {
         self.location.as_deref().unwrap_or("Unknown")
     }
+    /// Return the SSH username, defaulting to `"root"`.
     pub fn ssh_user(&self) -> &str {
         self.ssh_user.as_deref().unwrap_or("root")
     }

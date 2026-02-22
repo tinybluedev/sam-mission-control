@@ -1,6 +1,13 @@
-use crate::theme::Theme;
+//! Interactive TUI wizard for adding new agents to the fleet.
+//!
+//! The wizard guides the operator through entering an agent name, display name,
+//! emoji, host (Tailscale IP), SSH username, and location. On completion it calls
+//! `sam onboard` to provision the agent over SSH.
+
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use crate::theme::Theme;
+use crate::validate;
 
 #[derive(PartialEq, Clone)]
 pub enum WizardStep {
@@ -40,13 +47,8 @@ impl WizardStep {
 
     pub fn index(&self) -> usize {
         match self {
-            Self::AgentName => 0,
-            Self::DisplayName => 1,
-            Self::Emoji => 2,
-            Self::Host => 3,
-            Self::SshUser => 4,
-            Self::Location => 5,
-            Self::Confirm => 6,
+            Self::AgentName => 0, Self::DisplayName => 1, Self::Emoji => 2,
+            Self::Host => 3, Self::SshUser => 4, Self::Location => 5, Self::Confirm => 6,
         }
     }
 
@@ -105,7 +107,6 @@ impl AgentWizard {
         self.active = true;
     }
 
-    #[allow(dead_code)]
     pub fn current_input(&self) -> &str {
         match self.step {
             WizardStep::AgentName => &self.agent_name,
@@ -122,10 +123,7 @@ impl AgentWizard {
         match self.step {
             WizardStep::AgentName => self.agent_name.push(c),
             WizardStep::DisplayName => self.display_name.push(c),
-            WizardStep::Emoji => {
-                self.emoji.clear();
-                self.emoji.push(c);
-            }
+            WizardStep::Emoji => { self.emoji.clear(); self.emoji.push(c); }
             WizardStep::Host => self.host.push(c),
             WizardStep::SshUser => self.ssh_user.push(c),
             WizardStep::Location => {
@@ -138,19 +136,11 @@ impl AgentWizard {
 
     pub fn pop_char(&mut self) {
         match self.step {
-            WizardStep::AgentName => {
-                self.agent_name.pop();
-            }
-            WizardStep::DisplayName => {
-                self.display_name.pop();
-            }
+            WizardStep::AgentName => { self.agent_name.pop(); }
+            WizardStep::DisplayName => { self.display_name.pop(); }
             WizardStep::Emoji => {}
-            WizardStep::Host => {
-                self.host.pop();
-            }
-            WizardStep::SshUser => {
-                self.ssh_user.pop();
-            }
+            WizardStep::Host => { self.host.pop(); }
+            WizardStep::SshUser => { self.ssh_user.pop(); }
             _ => {}
         }
     }
@@ -159,16 +149,20 @@ impl AgentWizard {
         // Validate current step
         match self.step {
             WizardStep::AgentName => {
-                let name = self.agent_name.trim().to_lowercase().replace(' ', "-");
-                if name.is_empty() {
-                    self.error = Some("Name required".into());
-                    return false;
+                match validate::normalize_agent_name(&self.agent_name) {
+                    Ok(name) => self.agent_name = name,
+                    Err(e) => { self.error = Some(e); return false; }
                 }
-                self.agent_name = name;
             }
             WizardStep::Host => {
-                if self.host.trim().is_empty() {
-                    self.error = Some("Host/IP required".into());
+                if let Err(e) = validate::validate_ip_address(self.host.trim()) {
+                    self.error = Some(e);
+                    return false;
+                }
+            }
+            WizardStep::SshUser => {
+                if let Err(e) = validate::validate_ssh_username(self.ssh_user.trim()) {
+                    self.error = Some(e);
                     return false;
                 }
             }
@@ -217,11 +211,7 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
     // Modal frame
     let inner = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(3),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(8), Constraint::Length(3)])
         .split(modal);
 
     // Header
@@ -230,18 +220,10 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
         Span::raw("  "),
         Span::styled("🚀 New Agent", Style::default().fg(t.header_title).bold()),
         Span::raw("    "),
-        Span::styled(
-            format!("Step {}/7 — {}", step_num, wizard.step.label()),
-            Style::default().fg(t.text_dim),
-        ),
+        Span::styled(format!("Step {}/7 — {}", step_num, wizard.step.label()), Style::default().fg(t.text_dim)),
     ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(t.border_active))
-            .style(Style::default().bg(bg)),
-    );
+    .block(Block::default().borders(Borders::ALL).border_type(t.border_type)
+        .border_style(Style::default().fg(t.border_active)).style(Style::default().bg(bg)));
     frame.render_widget(header, inner[0]);
 
     // Body
@@ -250,22 +232,18 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
 
     // Progress bar
     let steps = ["Name", "Display", "Emoji", "Host", "SSH", "Location", "✓"];
-    let progress: Vec<Span> = steps
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let style = if i < wizard.step.index() {
-                Style::default().fg(t.status_online)
-            } else if i == wizard.step.index() {
-                Style::default().fg(t.accent).bold()
-            } else {
-                Style::default().fg(t.text_dim)
-            };
-            let sep = if i < steps.len() - 1 { " → " } else { "" };
-            Span::styled(format!("{}{}", s, sep), style)
-        })
-        .collect();
-    lines.push(Line::from(vec![Span::raw("  ")]));
+    let progress: Vec<Span> = steps.iter().enumerate().map(|(i, s)| {
+        let style = if i < wizard.step.index() {
+            Style::default().fg(t.status_online)
+        } else if i == wizard.step.index() {
+            Style::default().fg(t.accent).bold()
+        } else {
+            Style::default().fg(t.text_dim)
+        };
+        let sep = if i < steps.len() - 1 { " → " } else { "" };
+        Span::styled(format!("{}{}", s, sep), style)
+    }).collect();
+    lines.push(Line::from(vec![Span::raw("  ")]).into());
     lines.push(Line::from([vec![Span::raw("  ")], progress].concat()));
     lines.push(Line::from(""));
     lines.push(Line::from(""));
@@ -273,11 +251,7 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
     // Current field with all filled values
     let fields = vec![
         ("Agent Name", &wizard.agent_name, WizardStep::AgentName),
-        (
-            "Display Name",
-            &wizard.display_name,
-            WizardStep::DisplayName,
-        ),
+        ("Display Name", &wizard.display_name, WizardStep::DisplayName),
         ("Emoji", &wizard.emoji, WizardStep::Emoji),
         ("Host", &wizard.host, WizardStep::Host),
         ("SSH User", &wizard.ssh_user, WizardStep::SshUser),
@@ -285,66 +259,34 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
 
     for (label, value, step) in &fields {
         let is_current = *step == wizard.step;
-        let val_style = if is_current {
-            Style::default().fg(t.accent).bold()
-        } else {
-            Style::default().fg(t.text)
-        };
-        let label_style = if is_current {
-            Style::default().fg(t.accent).bold()
-        } else {
-            Style::default().fg(t.text_dim)
-        };
+        let val_style = if is_current { Style::default().fg(t.accent).bold() } else { Style::default().fg(t.text) };
+        let label_style = if is_current { Style::default().fg(t.accent).bold() } else { Style::default().fg(t.text_dim) };
         let cursor = if is_current { "▌" } else { "" };
 
         lines.push(Line::from(vec![
             Span::raw("    "),
             Span::styled(format!("{:<14}", label), label_style),
-            Span::styled(
-                if value.is_empty() {
-                    "(type here)"
-                } else {
-                    value
-                },
-                val_style,
-            ),
+            Span::styled(if value.is_empty() { "(type here)" } else { value }, val_style),
             Span::styled(cursor, Style::default().fg(t.accent)),
         ]));
     }
 
     // Location (special — cycle with any key)
     let is_loc = wizard.step == WizardStep::Location;
-    let loc_style = if is_loc {
-        Style::default().fg(t.accent).bold()
-    } else {
-        Style::default().fg(t.text)
-    };
-    let loc_label = if is_loc {
-        Style::default().fg(t.accent).bold()
-    } else {
-        Style::default().fg(t.text_dim)
-    };
+    let loc_style = if is_loc { Style::default().fg(t.accent).bold() } else { Style::default().fg(t.text) };
+    let loc_label = if is_loc { Style::default().fg(t.accent).bold() } else { Style::default().fg(t.text_dim) };
     lines.push(Line::from(vec![
         Span::raw("    "),
         Span::styled(format!("{:<14}", "Location"), loc_label),
-        Span::styled(
-            format!("{} (press any key to cycle)", wizard.location_str()),
-            loc_style,
-        ),
+        Span::styled(format!("{} (press any key to cycle)", wizard.location_str()), loc_style),
     ]));
 
     lines.push(Line::from(""));
 
     // Confirm step shows summary
     if wizard.step == WizardStep::Confirm {
-        lines.push(Line::from(Span::styled(
-            "    ━━━ Ready to create ━━━",
-            Style::default().fg(t.status_online).bold(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "    Press Enter to confirm, Esc to go back",
-            Style::default().fg(t.text_dim),
-        )));
+        lines.push(Line::from(Span::styled("    ━━━ Ready to create ━━━", Style::default().fg(t.status_online).bold())));
+        lines.push(Line::from(Span::styled("    Press Enter to confirm, Esc to go back", Style::default().fg(t.text_dim))));
 
         if let Some(result) = &wizard.ssh_result {
             lines.push(Line::from(""));
@@ -361,21 +303,14 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::raw("    "),
-            Span::styled(
-                format!("⚠️  {}", err),
-                Style::default().fg(t.status_offline).bold(),
-            ),
+            Span::styled(format!("⚠️  {}", err), Style::default().fg(t.status_offline).bold()),
         ]));
     }
 
-    let body = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(t.border_active))
-            .style(Style::default().bg(bg))
-            .padding(Padding::new(1, 1, 0, 0)),
-    );
+    let body = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).border_type(t.border_type)
+            .border_style(Style::default().fg(t.border_active)).style(Style::default().bg(bg))
+            .padding(Padding::new(1, 1, 0, 0)));
     frame.render_widget(body, inner[1]);
 
     // Footer
@@ -386,13 +321,7 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
         Span::styled(footer_text, Style::default().fg(t.text_dim)),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(t.border))
-            .style(Style::default().bg(bg)),
-    );
+    ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(bg)));
     frame.render_widget(footer, inner[2]);
 }
