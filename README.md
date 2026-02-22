@@ -163,6 +163,7 @@ For a deeper dive, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `tui.background` | `dark` | Background style: `dark` or `light` |
 | `tui.refresh_interval` | `30` | Fleet refresh interval in seconds |
 | `tui.chat_poll_interval` | `3` | Chat poll interval in seconds |
+| `tui.vim_mode` | `false` | Enable Vim keybinding mode (`hjkl`, `gg`, `G`, `:q`, `:w`) |
 | `identity.user` | `operator` | Operator display name in chat |
 
 Environment variables are also supported via a `.env` file:
