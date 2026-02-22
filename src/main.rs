@@ -396,7 +396,7 @@ impl App {
             format!(" │ 🔲 {}", self.multi_selected.len())
         } else { String::new() };
         self.status_message = format!(
-            "v1.0 │ {}/{} online{}{} │ sort:{} │ chat({}) │ {}/{} │ /=cmd ?=help",
+            "v1.1 │ {}/{} online{}{} │ sort:{} │ chat({}) │ {}/{} │ /=cmd ?=help",
             on, total, refresh, sel_info, self.sort_mode.label(), chat_count,
             self.theme_name.label(), self.bg_density.label()
         );

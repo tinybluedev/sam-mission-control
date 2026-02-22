@@ -6,7 +6,7 @@ license = "MIT"
 repository = "https://github.com/tinybluedev/sam-mission-control"
 keywords = ["tui", "fleet", "agents", "orchestration", "ssh"]
 categories = ["command-line-utilities"]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 
 [dependencies]
