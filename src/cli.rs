@@ -569,7 +569,7 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
 
     // Step 5: Generate auth token
     print!("  [5/8] Configuring gateway... ");
-    let token: String = (0..24).map(|_| format!("{:02x}", rand_byte())).collect();
+    let token = random_hex_token(24)?;
     let config_script = format!(r#"python3 -c "
 import json,os
 p=os.path.expanduser('~/.openclaw/openclaw.json')
@@ -654,16 +654,22 @@ print('ok')
     Ok(())
 }
 
-fn rand_byte() -> u8 {
-    use std::time::SystemTime;
-    let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-    ((t.subsec_nanos() ^ (t.as_secs() as u32).wrapping_mul(2654435761)) & 0xFF) as u8
+/// Generate a cryptographically secure random hex token.
+///
+/// The returned string length is `byte_len * 2`.
+fn random_hex_token(byte_len: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let mut bytes = vec![0_u8; byte_len];
+    getrandom::fill(&mut bytes)?;
+    Ok(bytes.into_iter().map(|b| format!("{:02x}", b)).collect())
 }
 
 
 /// Deploy workspace file to agent(s)
 pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::process::Command;
+
+    validate::validate_deploy_filename(file)
+        .map_err(|e| format!("Cannot deploy file: {}", e))?;
 
     // Resolve source file
     let src_path = source.map(|s| s.to_string()).unwrap_or_else(|| {
@@ -718,7 +724,7 @@ pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Resul
         let scp_out = tokio::time::timeout(std::time::Duration::from_secs(10),
             Command::new("scp").args([
                 "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                &src_path, &dest
+                "--", &src_path, &dest
             ]).output()
         ).await;
 
@@ -779,8 +785,7 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
 
     // Step 1: Connect to DB
     print!("  [1/4] Connecting to MySQL... ");
-    let encoded_pass = db_pass.replace("$", "%24").replace("@", "%40");
-    let url = format!("mysql://{}:{}@{}:{}/{}", db_user, encoded_pass, db_host, db_port, db_name);
+    let url = crate::db::build_db_url(&db_host, &db_port.to_string(), &db_user, &db_pass, &db_name);
     let pool = mysql_async::Pool::new(url.as_str());
     let mut conn = pool.get_conn().await.map_err(|e| crate::db::sanitize_error(&format!("DB connection failed: {}", e)))?;
     println!("✅");
@@ -923,7 +928,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
         let ssh_ok = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             Command::new("ssh").args([
-                "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                 &format!("{}@{}", user, ip), "echo ok"
             ]).output()
         ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
@@ -937,7 +942,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
 
         // Check 2: OpenClaw installed
         let oc_out = Command::new("ssh").args([
-            "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
             &format!("{}@{}", user, ip),
             &format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx)
         ]).output().await.ok();
@@ -950,7 +955,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
                 let cmd = if is_mac { format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx) }
                           else { "sudo npm install -g openclaw@latest 2>&1 | tail -1".into() };
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(120),
-                    Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                    Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                         &format!("{}@{}", user, ip), &cmd]).output()).await;
                 println!("done");
                 fixed += 1;
@@ -961,7 +966,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
 
         // Check 3: Gateway running
         let gw_out = Command::new("ssh").args([
-            "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
             &format!("{}@{}", user, ip), "ss -tlnp 2>/dev/null | grep 18789 | head -1"
         ]).output().await.ok();
         let gw_line = gw_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
@@ -971,7 +976,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
             if fix {
                 print!("        🔧 Starting gateway... ");
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(15),
-                    Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                    Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                         &format!("{}@{}", user, ip),
                         &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)]).output()).await;
                 println!("done");
@@ -987,12 +992,12 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
                 issues += 1;
                 if fix {
                     print!("        🔧 Setting bind=lan... ");
-                    let _ = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                    let _ = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                         &format!("{}@{}", user, ip),
                         "python3 -c \"import json,os;p=os.path.expanduser('~/.openclaw/openclaw.json');c=json.load(open(p));c.setdefault('gateway',{})['bind']='lan';json.dump(c,open(p,'w'),indent=2);print('ok')\""
                     ]).output().await;
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(15),
-                        Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                        Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                             &format!("{}@{}", user, ip),
                             &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)]).output()).await;
                     println!("done");
@@ -1003,7 +1008,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
 
         // Check 4: chatCompletions enabled
         let cc_out = Command::new("ssh").args([
-            "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
             &format!("{}@{}", user, ip),
             "python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{}).get('http',{}).get('endpoints',{}).get('chatCompletions',{}).get('enabled',False))\""
         ]).output().await.ok();
@@ -1013,7 +1018,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
             issues += 1;
             if fix {
                 print!("        🔧 Enabling chatCompletions... ");
-                let _ = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                let _ = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                     &format!("{}@{}", user, ip),
                     "python3 -c \"import json,os;p=os.path.expanduser('~/.openclaw/openclaw.json');c=json.load(open(p));gw=c.setdefault('gateway',{});h=gw.setdefault('http',{});e=h.setdefault('endpoints',{});e['chatCompletions']={'enabled':True};json.dump(c,open(p,'w'),indent=2);print('ok')\""
                 ]).output().await;
@@ -1030,7 +1035,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
             issues += 1;
             if fix {
                 print!("        🔧 Fetching and storing token... ");
-                let tok_out = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                let tok_out = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                     &format!("{}@{}", user, ip),
                     "python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{}).get('auth',{}).get('token',''))\""
                 ]).output().await.ok();
