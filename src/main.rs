@@ -141,6 +141,7 @@ impl SortMode {
             Self::Latency => "latency",
         }
     }
+    fn arrow(&self) -> &str { "▲" }
 }
 
 struct ProbeResult {
@@ -296,6 +297,7 @@ struct App {
     // Alerts
     alerts: Vec<Alert>,
     alert_flash: Option<Instant>,
+    gateway_confirm_at: Option<Instant>,
     // Diagnostics (inline doctor/fix)
     diag_active: bool,
     diag_steps: Vec<DiagStep>,
@@ -414,7 +416,7 @@ impl App {
             spawned_agents: vec![], show_splash: true, splash_start: Instant::now(),
             config_text: None, config_scroll: 0,
             filter_active: false, filter_text: String::new(),
-            alerts: vec![], alert_flash: None,
+            alerts: vec![], alert_flash: None, gateway_confirm_at: None,
             multi_selected: HashSet::new(),
             spinner_frame: 0, sort_mode: SortMode::Name,
             fleet_area: Rect::default(), chat_area: Rect::default(),
@@ -429,8 +431,14 @@ impl App {
         }
     }
 
-    fn next(&mut self) { if self.selected < self.agents.len() - 1 { self.selected += 1; } }
-    fn previous(&mut self) { if self.selected > 0 { self.selected -= 1; } }
+    fn next(&mut self) {
+        if self.agents.is_empty() { return; }
+        self.selected = (self.selected + 1) % self.agents.len();
+    }
+    fn previous(&mut self) {
+        if self.agents.is_empty() { return; }
+        self.selected = self.selected.checked_sub(1).unwrap_or(self.agents.len() - 1);
+    }
 
     fn toast(&mut self, msg: &str) {
         self.toast_message = Some(msg.to_string());
@@ -2357,9 +2365,13 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
         vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Length(12), Constraint::Min(10)]
     };
     let fleet_title = if app.filter_active {
-        format!(" ◆── Fleet 🔍 {} ──◆ ", app.filter_text)
+        if app.filter_text.is_empty() {
+            " ◆── Fleet 🔍 (type to search) ──◆ ".to_string()
+        } else {
+            format!(" ◆── Fleet 🔍 {} ──◆ ", app.filter_text)
+        }
     } else {
-        " ◆── Fleet ──◆ ".to_string()
+        format!(" ◆── Fleet [{}{}] ──◆ ", app.sort_mode.label(), app.sort_mode.arrow())
     };
     let table = Table::new(rows, widths).header(hrow)
     .block(Block::default().title(Span::styled(fleet_title, Style::default().fg(fb).bold()))
@@ -3365,6 +3377,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     // Build styled key hints (key highlighted, label dim)
     let keys: Vec<(&str, &str)> = match app.screen {
+        Screen::Dashboard if app.filter_active => vec![("type","filter"),("↑↓","navigate"),("⏎","apply"),("Esc","cancel")],
         Screen::Dashboard => match app.focus {
             Focus::Chat => vec![("Tab","fleet"),("⏎","send"),("@","target"),("Esc","back")],
             Focus::Command => vec![("⏎","run"),("Esc","cancel")],
@@ -4116,7 +4129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('c') => app.cycle_theme(),
-                                KeyCode::Char('s') => app.cycle_sort(),
+                                KeyCode::Char('s') => { app.cycle_sort(); app.toast(&format!("Sort: {}{}", app.sort_mode.label(), app.sort_mode.arrow())); }
                                 KeyCode::Char('a') => { app.wizard.open(); }
                                 KeyCode::Char('A') => {
                                     // Select all
@@ -4239,21 +4252,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('g') => {
-                                    // Restart gateway on focused agent
+                                    // Restart gateway on focused agent — requires two presses within 5s
                                     if let Some(agent) = app.agents.get(app.selected) {
-                                        let host = agent.host.clone();
-                                        let user = agent.ssh_user.clone();
                                         let name = agent.name.clone();
-                                        let is_mac = agent.os.to_lowercase().contains("mac");
-                                        app.status_message = format!("🔄 Restarting gateway on {}...", name);
-                                        tokio::spawn(async move {
-                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-                                            let cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
-                                            let _ = tokio::process::Command::new("ssh")
-                                                .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                                    &format!("{}@{}", user, host), &cmd])
-                                                .output().await;
-                                        });
+                                        let confirmed = app.gateway_confirm_at
+                                            .map(|t| t.elapsed().as_secs() < 5)
+                                            .unwrap_or(false);
+                                        if confirmed {
+                                            app.gateway_confirm_at = None;
+                                            let host = agent.host.clone();
+                                            let user = agent.ssh_user.clone();
+                                            let is_mac = agent.os.to_lowercase().contains("mac");
+                                            app.status_message = format!("🔄 Restarting gateway on {}...", name);
+                                            tokio::spawn(async move {
+                                                let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                                let cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
+                                                let _ = tokio::process::Command::new("ssh")
+                                                    .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                        &format!("{}@{}", user, host), &cmd])
+                                                    .output().await;
+                                            });
+                                        } else {
+                                            app.gateway_confirm_at = Some(Instant::now());
+                                            app.toast(&format!("⚠ Press g again to restart gateway on {}", name));
+                                        }
                                     }
                                 }
                                 KeyCode::Char('w') => {
