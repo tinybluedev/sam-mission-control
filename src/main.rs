@@ -1142,6 +1142,8 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let name = agent.db_name.clone();
         let is_mac = agent.os.to_lowercase().contains("mac");
         let self_ip = self.self_ip.clone();
+        let gw_port = agent.gateway_port;
+        let db_pool = self.db_pool.clone();
 
         self.diag_active = true;
         self.diag_auto_fix = false;
@@ -1155,10 +1157,11 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         tokio::spawn(async move {
             let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
-            // Step 1: current version
+            // Step 1: current version (stored as prev_version for rollback)
             let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Running, detail: String::new() });
             let cur = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw --version 2>/dev/null || echo '(not installed)'", pfx)).await;
-            let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Pass, detail: cur.trim().to_string() });
+            let prev_version = cur.trim().to_string();
+            let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Pass, detail: prev_version.clone() });
 
             // Step 2: stream npm install (stdout + stderr merged via 2>&1)
             let _ = tx.send(DiagStep { label: "Installing openclaw@latest".into(), status: DiagStatus::Running, detail: "running npm install...".into() });
@@ -1230,7 +1233,75 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let restart_msg = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)).await;
             let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Fixed, detail: restart_msg.trim().to_string() });
 
-            let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
+            // Step 5: verify gateway API responds within 10s
+            let _ = tx.send(DiagStep { label: "Verifying gateway".into(), status: DiagStatus::Running, detail: "checking /health...".into() });
+            let health_cmd = format!("curl -s -m 3 http://localhost:{}/health 2>/dev/null || echo FAIL", gw_port);
+            let mut gw_ok = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
+                let resp = App::ssh_run(&host, &user, &self_ip, &health_cmd).await;
+                if !resp.contains("FAIL") && !resp.is_empty() {
+                    gw_ok = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+
+            if gw_ok {
+                let _ = tx.send(DiagStep { label: "Verifying gateway".into(), status: DiagStatus::Pass, detail: "gateway responding".into() });
+                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
+            } else {
+                // Gateway not responding after update — attempt rollback
+                let _ = tx.send(DiagStep { label: "Verifying gateway".into(), status: DiagStatus::Fail, detail: "not responding after update".into() });
+                let _ = tx.send(DiagStep { label: "Rollback".into(), status: DiagStatus::Rollback, detail: format!("gateway not responding — rolling back to {}", prev_version) });
+
+                let rollback_cmd = format!("{}sudo npm install -g openclaw@{} 2>&1; echo EXITCODE:$?:DONE", pfx, shell::escape(&prev_version));
+                let rb_out = App::ssh_run(&host, &user, &self_ip, &rollback_cmd).await;
+                let rb_ok = rb_out.contains("EXITCODE:0:DONE");
+                let _ = tx.send(DiagStep {
+                    label: "  Rollback install".into(),
+                    status: if rb_ok { DiagStatus::Rollback } else { DiagStatus::Fail },
+                    detail: if rb_ok { format!("reinstalled {}", prev_version) } else { "rollback install failed".into() },
+                });
+
+                // Restart gateway with old version
+                let _ = tx.send(DiagStep { label: "  Restarting gateway".into(), status: DiagStatus::Rollback, detail: "restarting with previous version...".into() });
+                let rb_restart = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)).await;
+                tokio::time::sleep(Duration::from_secs(4)).await;
+
+                // Verify rollback health
+                let rb_resp = App::ssh_run(&host, &user, &self_ip, &health_cmd).await;
+                let rb_gw_ok = !rb_resp.contains("FAIL") && !rb_resp.is_empty();
+                let _ = tx.send(DiagStep {
+                    label: "  Restarting gateway".into(),
+                    status: if rb_gw_ok { DiagStatus::Rollback } else { DiagStatus::Fail },
+                    detail: rb_restart.trim().chars().take(60).collect(),
+                });
+
+                let done_detail = if rb_gw_ok {
+                    format!("Rolled back to {} — gateway restored", prev_version)
+                } else {
+                    format!("Rolled back to {} — gateway still not responding", prev_version)
+                };
+                let _ = tx.send(DiagStep {
+                    label: "DONE".into(),
+                    status: if rb_gw_ok { DiagStatus::Rollback } else { DiagStatus::Fail },
+                    detail: format!("{} — press Esc to close", done_detail),
+                });
+
+                // Log rollback event to mc_operations
+                if let Some(pool) = db_pool {
+                    tokio::spawn(async move {
+                        use mysql_async::prelude::*;
+                        if let Ok(mut conn) = pool.get_conn().await {
+                            let _ = conn.exec_drop(
+                                "INSERT IGNORE INTO mc_operations (agent_name, operation, detail, created_at) VALUES (?, 'rollback', ?, NOW())",
+                                (&name, &done_detail),
+                            ).await;
+                        }
+                    });
+                }
+            }
         });
     }
 
@@ -2211,11 +2282,12 @@ enum DiagStatus {
     Fail,
     Fixed,
     Skipped,
+    Rollback,
 }
 
 impl DiagStatus {
     fn icon(&self) -> &'static str {
-        match self { DiagStatus::Running => "⏳", DiagStatus::Pass => "✓", DiagStatus::Fail => "✗", DiagStatus::Fixed => "🔧", DiagStatus::Skipped => "⊘" }
+        match self { DiagStatus::Running => "⏳", DiagStatus::Pass => "✓", DiagStatus::Fail => "✗", DiagStatus::Fixed => "🔧", DiagStatus::Skipped => "⊘", DiagStatus::Rollback => "⏪" }
     }
 }
 
@@ -3093,6 +3165,7 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
                     DiagStatus::Fixed => ("🔧", t.status_busy),
                     DiagStatus::Skipped => ("⊘ ", t.text_dim),
                     DiagStatus::Running => ("⏳", t.pending),
+                    DiagStatus::Rollback => ("⏪", t.status_busy),
                 };
                 let detail = if step.detail.is_empty() { String::new() } else { format!(" — {}", step.detail) };
                 lines.push(Line::from(vec![
