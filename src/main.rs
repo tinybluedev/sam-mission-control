@@ -307,6 +307,7 @@ struct App {
     diag_auto_fix: bool,
     diag_title: Option<String>,
     diag_start: Option<Instant>,
+    diag_overlay_scroll: u16,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -357,6 +358,26 @@ struct App {
     // Operation state persistence
     interrupted_ops: Vec<db::Operation>,
     diag_task_running: bool,
+}
+
+/// Returns true for npm output lines worth showing in the overlay.
+/// Filters out transitive-dependency deprecation noise and pure whitespace.
+fn npm_line_is_meaningful(line: &str) -> bool {
+    if line.trim().is_empty() { return false; }
+    let lower = line.to_lowercase();
+    // Skip noisy deprecated warnings for transitive deps
+    if lower.contains("npm warn deprecated") { return false; }
+    if lower.contains("npm warn notsup") { return false; }
+    // Always keep error lines
+    if lower.contains("err") { return true; }
+    // Keep final result lines (added/changed/removed/updated X packages)
+    if lower.contains("added") && lower.contains("package") { return true; }
+    if (lower.contains("changed") || lower.contains("updated") || lower.contains("removed")) && lower.contains("package") { return true; }
+    // Keep timing/progress lines
+    if lower.contains("packages in") { return true; }
+    // Keep non-deprecated warnings
+    if lower.starts_with("npm warn") { return true; }
+    false
 }
 
 impl App {
@@ -438,7 +459,7 @@ impl App {
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
-            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None,
+            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None, diag_overlay_scroll: 0,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
@@ -1142,6 +1163,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
     out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|| "timeout".into())
 }
 
+
     fn start_oc_update(&mut self) {
         if self.selected >= self.agents.len() { return; }
         let agent = &self.agents[self.selected];
@@ -1157,6 +1179,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         self.diag_auto_fix = false;
         self.diag_title = Some(format!("⬆️  Update — {}", name));
         self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
         self.diag_steps = vec![DiagStep { label: format!("Updating OpenClaw on {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
         let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
@@ -1234,7 +1257,10 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
                         if clean.to_lowercase().contains("err") || clean.starts_with("npm ERR") {
                             error_lines.push(clean.chars().take(80).collect());
                         }
-                        let _ = tx.send(DiagStep { label: "  npm".into(), status: DiagStatus::Running, detail: clean.chars().take(70).collect() });
+                        // Only stream meaningful lines; skip deprecated noise / whitespace
+                        if npm_line_is_meaningful(&clean) {
+                            let _ = tx.send(DiagStep { label: "  npm".into(), status: DiagStatus::Running, detail: clean.chars().take(70).collect() });
+                        }
                     }
                 }
                 // If we didn't parse exit code, use process exit status
@@ -1250,6 +1276,17 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             } else {
                 "no output — check npm/sudo permissions".into()
             };
+            // Resolve the "  npm" sub-step so it no longer shows as running
+            let npm_summary: String = if install_ok {
+                last_line.chars().take(60).collect()
+            } else {
+                fail_detail.clone()
+            };
+            let _ = tx.send(DiagStep {
+                label: "  npm".into(),
+                status: if install_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: npm_summary,
+            });
             let _ = tx.send(DiagStep {
                 label: "Installing openclaw@latest".into(),
                 status: if install_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
@@ -1301,6 +1338,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         self.diag_auto_fix = fix;
         self.diag_title = None;
         self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
         self.diag_steps = vec![DiagStep { label: format!("Diagnosing {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -3211,6 +3249,7 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
     }
 
     let diag = Paragraph::new(lines)
+        .scroll((app.diag_overlay_scroll, 0))
         .block(Block::default()
             .title(Span::styled(title, Style::default().fg(t.accent).bold()))
             .borders(Borders::ALL).border_type(BorderType::Double)
@@ -4443,6 +4482,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.diag_rx = None;
                                 app.diag_start = None;
                                 app.start_refresh(); // re-probe after fix
+                            }
+                            KeyCode::PageUp => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_sub(5);
+                            }
+                            KeyCode::PageDown => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_add(5);
+                            }
+                            KeyCode::Up => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_add(1);
                             }
                             _ => {}
                         }
