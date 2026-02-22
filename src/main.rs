@@ -89,6 +89,7 @@ impl AgentStatus {
 #[derive(Clone, Debug)]
 struct Alert {
     time: String,
+    created_at: Instant,
     agent: String,
     emoji: String,
     message: String,
@@ -295,6 +296,7 @@ struct App {
     // Alerts
     alerts: Vec<Alert>,
     alert_flash: Option<Instant>,
+    alerts_scroll: u16,
     // Diagnostics (inline doctor/fix)
     diag_active: bool,
     diag_steps: Vec<DiagStep>,
@@ -411,7 +413,7 @@ impl App {
             spawned_agents: vec![], show_splash: true, splash_start: Instant::now(),
             config_text: None, config_scroll: 0,
             filter_active: false, filter_text: String::new(),
-            alerts: vec![], alert_flash: None,
+            alerts: vec![], alert_flash: None, alerts_scroll: 0,
             multi_selected: HashSet::new(),
             spinner_frame: 0, sort_mode: SortMode::Name,
             fleet_area: Rect::default(), chat_area: Rect::default(),
@@ -1497,7 +1499,7 @@ SAMEOF", path, path, escaped_content);
                 let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("offline"));
                 if !already {
                     self.alerts.push(Alert {
-                        time: now.clone(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
+                        time: now.clone(), created_at: Instant::now(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
                         message: format!("{} went offline", a.name),
                         severity: AlertSeverity::Critical,
                     });
@@ -1509,7 +1511,7 @@ SAMEOF", path, path, escaped_content);
                     let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("disk"));
                     if !already {
                         self.alerts.push(Alert {
-                            time: now.clone(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
+                            time: now.clone(), created_at: Instant::now(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
                             message: format!("{} disk at {:.0}%", a.name, disk),
                             severity: AlertSeverity::Warning,
                         });
@@ -1522,7 +1524,7 @@ SAMEOF", path, path, escaped_content);
                     let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("RAM"));
                     if !already {
                         self.alerts.push(Alert {
-                            time: now.clone(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
+                            time: now.clone(), created_at: Instant::now(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
                             message: format!("{} RAM at {:.0}%", a.name, ram),
                             severity: AlertSeverity::Warning,
                         });
@@ -1610,6 +1612,15 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, Str
 fn now_str() -> String {
     use std::process::Command as C;
     C::new("date").arg("+%H:%M:%S").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("now".into())
+}
+
+fn relative_time(created_at: Instant) -> String {
+    let secs = created_at.elapsed().as_secs();
+    if secs < 60 { "just now".into() }
+    else if secs < 3600 { format!("{}m ago", secs / 60) }
+    else if secs < 86400 { format!("{}h ago", secs / 3600) }
+    else if secs < 2_592_000 { format!("{}d ago", secs / 86400) }
+    else { "30d+ ago".into() }
 }
 
 // ---- Chat Line Rendering ----
@@ -3048,7 +3059,7 @@ fn render_alerts(frame: &mut Frame, app: &App) {
     frame.render_widget(header, outer[0]);
 
     let lines: Vec<Line> = if app.alerts.is_empty() {
-        vec![Line::from(""), Line::from(Span::styled("  No alerts — all systems nominal ✅", Style::default().fg(t.status_online)))]
+        vec![Line::from(""), Line::from(Span::styled("  ✅ All clear — no alerts", Style::default().fg(t.status_online)))]
     } else {
         app.alerts.iter().rev().map(|a| {
             let sev_color = match a.severity {
@@ -3057,7 +3068,7 @@ fn render_alerts(frame: &mut Frame, app: &App) {
                 AlertSeverity::Info => t.accent,
             };
             Line::from(vec![
-                Span::styled(format!("  {} ", a.time), Style::default().fg(t.text_dim)),
+                Span::styled(format!("  {} ", relative_time(a.created_at)), Style::default().fg(t.text_dim)),
                 Span::styled(a.severity.icon(), Style::default()),
                 Span::raw(" "),
                 Span::styled(format!("{} ", a.emoji), Style::default()),
@@ -3067,15 +3078,18 @@ fn render_alerts(frame: &mut Frame, app: &App) {
     };
 
     let alerts = Paragraph::new(lines)
+        .scroll((app.alerts_scroll, 0))
         .block(Block::default().title(Span::styled(" ◆── Alert History ──◆ ", Style::default().fg(t.border_active).bold()))
             .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(t.border_active))
             .style(Style::default().bg(app.bg_density.bg()))
             .padding(Padding::new(1, 1, 1, 0)));
     frame.render_widget(alerts, outer[1]);
 
+    let footer_msg = format!("Esc/q=back │ ↑↓=scroll │ b=bg ({}) │ c=theme ({})",
+        app.bg_density.label(), app.theme_name.label());
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
-        Span::styled("Esc=back │ w=alerts │ q=quit", Style::default().fg(t.text_dim)),
+        Span::styled(footer_msg, Style::default().fg(t.text_dim)),
     ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(footer, outer[2]);
@@ -3752,6 +3766,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Esc | KeyCode::Char('q') => { app.screen = Screen::Dashboard; app.focus = Focus::Fleet; }
                             KeyCode::Char('b') => app.cycle_bg(),
                             KeyCode::Char('c') => app.cycle_theme(),
+                            KeyCode::Up | KeyCode::Char('k') => app.alerts_scroll = app.alerts_scroll.saturating_sub(1),
+                            KeyCode::Down | KeyCode::Char('j') => app.alerts_scroll = app.alerts_scroll.saturating_add(1),
                             _ => {}
                         },
                         Screen::VpnStatus => match key.code {
@@ -4000,6 +4016,7 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                 }
                                 KeyCode::Char('w') => {
                                     app.screen = Screen::Alerts;
+                                    app.alerts_scroll = 0;
                                 }
                                 KeyCode::Char('v') => {
                                     app.screen = Screen::VpnStatus;
