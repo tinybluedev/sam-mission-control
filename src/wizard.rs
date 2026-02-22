@@ -205,7 +205,7 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
         Span::raw("    "),
         Span::styled(format!("Step {}/7 — {}", step_num, wizard.step.label()), Style::default().fg(t.text_dim)),
     ]))
-    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    .block(Block::default().borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(t.border_active)).style(Style::default().bg(bg)));
     frame.render_widget(header, inner[0]);
 
@@ -291,7 +291,7 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
     }
 
     let body = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .block(Block::default().borders(Borders::ALL).border_type(t.border_type)
             .border_style(Style::default().fg(t.border_active)).style(Style::default().bg(bg))
             .padding(Padding::new(1, 1, 0, 0)));
     frame.render_widget(body, inner[1]);
@@ -304,7 +304,7 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
         Span::styled(footer_text, Style::default().fg(t.text_dim)),
-    ])).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(bg)));
     frame.render_widget(footer, inner[2]);
 }
