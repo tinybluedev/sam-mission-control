@@ -24,6 +24,27 @@ pub enum Commands {
         /// Message to send
         message: Vec<String>,
     },
+    /// Full automated setup (DB tables, config, everything)
+    Init {
+        /// MySQL host
+        #[arg(long, default_value = "127.0.0.1")]
+        db_host: String,
+        /// MySQL port
+        #[arg(long, default_value = "3306")]
+        db_port: u16,
+        /// MySQL user
+        #[arg(long, default_value = "root")]
+        db_user: String,
+        /// MySQL password
+        #[arg(long)]
+        db_pass: String,
+        /// Database name
+        #[arg(long, default_value = "quantum_memory")]
+        db_name: String,
+        /// This machine's IP (for self-detection)
+        #[arg(long)]
+        self_ip: Option<String>,
+    },
     /// Run interactive setup wizard
     Setup,
     /// Deploy workspace files to agents
@@ -617,4 +638,130 @@ pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Resul
     pool.disconnect().await?;
     println!("\n  Done.\n");
     Ok(())
+}
+
+
+/// Full automated init — creates everything from scratch
+pub async fn run_init(db_host: &str, db_port: u16, db_user: &str, db_pass: &str, db_name: &str, self_ip: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use mysql_async::prelude::*;
+
+    println!("\n🛰️  S.A.M Mission Control — Auto Init");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    // Step 1: Connect to DB
+    print!("  [1/4] Connecting to MySQL... ");
+    let encoded_pass = db_pass.replace("$", "%24").replace("@", "%40");
+    let url = format!("mysql://{}:{}@{}:{}/{}", db_user, encoded_pass, db_host, db_port, db_name);
+    let pool = mysql_async::Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.map_err(|e| format!("DB connection failed: {}", e))?;
+    println!("✅");
+
+    // Step 2: Create tables
+    print!("  [2/4] Creating tables... ");
+    conn.query_drop(r"
+        CREATE TABLE IF NOT EXISTS mc_fleet_status (
+            agent_name       VARCHAR(64) PRIMARY KEY,
+            hostname         VARCHAR(128),
+            tailscale_ip     VARCHAR(45),
+            status           VARCHAR(16) DEFAULT 'offline',
+            latency_ms       INT UNSIGNED DEFAULT NULL,
+            gateway_port     INT DEFAULT 18789,
+            gateway_token    VARCHAR(128) DEFAULT NULL,
+            current_task_id  INT,
+            last_heartbeat   DATETIME,
+            oc_version       VARCHAR(32),
+            os_info          VARCHAR(128),
+            kernel           VARCHAR(64),
+            capabilities     JSON,
+            token_burn_today INT DEFAULT 0,
+            uptime_seconds   BIGINT DEFAULT 0,
+            updated_at       DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+    ").await?;
+    conn.query_drop(r"
+        CREATE TABLE IF NOT EXISTS mc_chat (
+            id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+            sender       VARCHAR(64) NOT NULL,
+            target       VARCHAR(64),
+            message      TEXT NOT NULL,
+            response     TEXT,
+            status       VARCHAR(16) DEFAULT 'pending',
+            kind         VARCHAR(10) DEFAULT 'global',
+            created_at   DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+            responded_at DATETIME(3),
+            INDEX idx_target_status (target, status),
+            INDEX idx_created (created_at),
+            INDEX idx_kind (kind)
+        )
+    ").await?;
+    conn.query_drop(r"
+        CREATE TABLE IF NOT EXISTS mc_task_routing (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            task_description TEXT NOT NULL,
+            assigned_agent  VARCHAR(64),
+            status          VARCHAR(16) DEFAULT 'queued',
+            priority        INT DEFAULT 5,
+            created_by      VARCHAR(64),
+            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+            assigned_at     DATETIME,
+            completed_at    DATETIME,
+            result          TEXT
+        )
+    ").await?;
+    println!("✅ mc_fleet_status, mc_chat, mc_task_routing");
+
+    // Step 3: Generate config
+    print!("  [3/4] Generating config... ");
+    let self_ip_val = self_ip.unwrap_or("127.0.0.1");
+    let cfg = SamConfig {
+        database: DatabaseConfig {
+            url: Some(format!("mysql://{}:{}@{}:{}/{}", db_user, encoded_pass, db_host, db_port, db_name)),
+            host: Some(db_host.into()),
+            port: Some(db_port),
+            user: Some(db_user.into()),
+            password: Some(db_pass.into()),
+            database: Some(db_name.into()),
+        },
+        tui: TuiConfig::default(),
+        fleet: FleetConfig::default(),
+        identity: IdentityConfig { user: whoami().unwrap_or_else(|| "operator".into()) },
+    };
+    cfg.save()?;
+    
+    // Also write .env for backward compat
+    let env_path = std::path::Path::new(".env");
+    if !env_path.exists() {
+        std::fs::write(env_path, format!(
+            "SAM_DB_URL={}\nSAM_SELF_IP={}\nSAM_USER={}\n",
+            format!("mysql://{}:{}@{}:{}/{}", db_user, encoded_pass, db_host, db_port, db_name),
+            self_ip_val,
+            cfg.identity.user,
+        ))?;
+    }
+    println!("✅ ~/.config/sam/config.toml");
+
+    // Step 4: Detect local machine and self-register
+    print!("  [4/4] Registering this machine... ");
+    let hostname = std::process::Command::new("hostname").output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "localhost".into());
+    conn.exec_drop(
+        "INSERT IGNORE INTO mc_fleet_status (agent_name, tailscale_ip, status) VALUES (?, ?, 'online')",
+        (&hostname.to_lowercase(), self_ip_val),
+    ).await?;
+    println!("✅ {} @ {}", hostname, self_ip_val);
+
+    pool.disconnect().await?;
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  ✅ Ready! Run `sam` to launch Mission Control.");
+    println!("  📡 Add agents: `sam onboard <ip>`");
+    println!();
+
+    Ok(())
+}
+
+fn whoami() -> Option<String> {
+    std::process::Command::new("whoami").output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }

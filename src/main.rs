@@ -1512,6 +1512,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let msg = message.join(" ");
             return cli::send_chat(&agent, &msg).await.map_err(|e| e.into());
         }
+        Some(cli::Commands::Init { db_host, db_port, db_user, db_pass, db_name, self_ip }) => {
+            return cli::run_init(&db_host, db_port, &db_user, &db_pass, &db_name, self_ip.as_deref()).await.map_err(|e| e.into());
+        }
         Some(cli::Commands::Deploy { target, file, source }) => {
             return cli::run_deploy(&target, &file, source.as_deref()).await.map_err(|e| e.into());
         }
