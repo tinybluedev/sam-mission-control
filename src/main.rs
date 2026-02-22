@@ -189,13 +189,14 @@ struct ProbeResult {
 
 
 // ── UI Helpers ──────────────────────────────────────
-fn chrono_now() -> String {
+fn chrono_now_hms() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     let secs = now % 86400;
     let hours = ((secs / 3600) + 24 - 6) % 24; // UTC-6 for CST
     let mins = (secs % 3600) / 60;
-    format!("{:02}:{:02}", hours, mins)
+    let sec = secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, mins, sec)
 }
 
 fn os_emoji(os: &str) -> &'static str {
@@ -219,6 +220,12 @@ fn format_uptime(secs: i64) -> String {
     if days > 0 { format!("{}d {}h", days, hours) }
     else if hours > 0 { format!("{}h {}m", hours, mins) }
     else { format!("{}m", mins) }
+}
+
+fn format_app_uptime(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    if hours > 0 { format!("{}h {}m", hours, mins) } else { format!("{}m", mins) }
 }
 
 fn format_last_seen(dt: &str) -> String {
@@ -262,6 +269,19 @@ fn ping_color(latency: Option<u32>) -> ratatui::style::Color {
         Some(ms) if ms < 500 => ratatui::style::Color::Yellow,
         Some(_) => ratatui::style::Color::Red,
         None => ratatui::style::Color::DarkGray,
+    }
+}
+
+fn db_latency_color(latency: Option<u32>, online: bool, t: &Theme) -> Color {
+    if !online {
+        t.status_offline
+    } else {
+        match latency {
+            Some(ms) if ms < 10 => t.status_online,
+            Some(ms) if ms < 50 => t.status_busy,
+            Some(_) => t.status_offline,
+            None => t.text_dim,
+        }
     }
 }
 
@@ -397,6 +417,10 @@ struct App {
     // Operation state persistence
     interrupted_ops: Vec<db::Operation>,
     diag_task_running: bool,
+    tui_start: Instant,
+    db_latency_ms: Option<u32>,
+    db_online: bool,
+    db_latency_rx: Option<mpsc::UnboundedReceiver<Option<u32>>>,
 }
 
 /// Returns true for npm output lines worth showing in the overlay.
@@ -509,6 +533,10 @@ impl App {
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
             interrupted_ops, diag_task_running: false,
+            tui_start: Instant::now(),
+            db_latency_ms: None,
+            db_online: true,
+            db_latency_rx: None,
         }
     }
 
@@ -2400,6 +2428,35 @@ print('ok')
         }
     }
 
+    fn start_db_latency_probe(&mut self) {
+        let Some(pool) = self.db_pool.clone() else { return; };
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.db_latency_rx = Some(rx);
+        tokio::spawn(async move {
+            use mysql_async::prelude::Queryable;
+            let started = Instant::now();
+            let result = match pool.get_conn().await {
+                Ok(mut conn) => {
+                    if conn.query_drop("SELECT 1").await.is_ok() {
+                        Some(started.elapsed().as_millis() as u32)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    fn active_ops_running(&self) -> usize {
+        let mut count = usize::from(self.diag_task_running);
+        if self.fleet_diag_active {
+            count += self.fleet_diag_results.iter().filter(|r| r.running).count();
+        }
+        count
+    }
+
     fn drain_refresh_results(&mut self) -> Vec<(usize, AgentStatus, String, String, String, Option<u32>)> {
         let mut updates = vec![];
         if let Some(rx) = &mut self.refresh_rx {
@@ -3073,7 +3130,7 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
     let t = &app.theme;
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
+        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3), Constraint::Length(3)])
         .split(frame.area());
 
     // Clear with bg color
@@ -3091,11 +3148,6 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         Span::raw("  "),
         Span::styled("🛰️  S.A.M MISSION CONTROL", Style::default().fg(t.header_title).bold()),
         Span::raw("    "),
-        Span::styled(format!("{}", online), Style::default().fg(t.status_online).bold()),
-        Span::styled(format!("/{} agents", total), Style::default().fg(t.text_dim)),
-        Span::raw("    "),
-        Span::styled(format!("{}% healthy", health_pct), Style::default().fg(health_color)),
-        Span::raw("    "),
         Span::styled(format!("{}tok", total_tokens), Style::default().fg(t.text_dim)),
         Span::raw("    "),
         Span::styled(if live { "● live" } else { "○ stale" }, Style::default().fg(if live { t.status_online } else { t.status_offline })),
@@ -3110,8 +3162,6 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
                 Style::default().fg(t.status_busy).bold(),
             )
         } else { Span::raw("") },
-        Span::raw("    "),
-        Span::styled(chrono_now(), Style::default().fg(t.text_dim)),
         Span::raw("    "),
         Span::styled(match app.focus {
             Focus::Fleet => "▌Fleet▐", Focus::Chat => "▌Chat▐", _ => "▌Fleet▐",
@@ -3134,6 +3184,47 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         render_chat_panel(frame, app, body[1], app.focus == Focus::Chat, false);
     }
     render_footer(frame, app, outer[2]);
+    render_status_bar(frame, app, outer[3], online, total, health_color);
+}
+
+fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, online: usize, total: usize, health_color: Color) {
+    let t = &app.theme;
+    let uptime = format_app_uptime(app.tui_start.elapsed().as_secs());
+    let ops = app.active_ops_running();
+    let pulse = if (app.tui_start.elapsed().as_millis() / 500) % 2 == 0 { "◐" } else { "◓" };
+    let db_text = if app.db_online {
+        match app.db_latency_ms {
+            Some(ms) => format!("DB: {}ms", ms),
+            None => "DB: …".to_string(),
+        }
+    } else {
+        "DB: ✗ offline".to_string()
+    };
+    let db_span = Span::styled(
+        format!("[{}]", db_text),
+        Style::default().fg(db_latency_color(app.db_latency_ms, app.db_online, t)).bold(),
+    );
+    let ops_text = if ops > 0 {
+        format!("[ops: {} {}]", ops, pulse)
+    } else {
+        "[ops: 0 running]".to_string()
+    };
+    let status = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("[{}]", chrono_now_hms()), Style::default().fg(t.text_dim)),
+        Span::raw(" "),
+        Span::styled(format!("[sam uptime: {}]", uptime), Style::default().fg(t.text)),
+        Span::raw(" "),
+        db_span,
+        Span::raw(" "),
+        Span::styled(ops_text, Style::default().fg(if ops > 0 { t.accent } else { t.text_dim })),
+        Span::raw(" "),
+        Span::styled(format!("[↑ {}/{} online]", online, total), Style::default().fg(health_color).bold()),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(t.border_type)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(status, area);
 }
 
 fn mini_bar(pct: Option<f32>, width: usize) -> String {
@@ -4763,6 +4854,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(fleet_config).await;
     app.update_status_bar();
+    app.start_db_latency_probe();
 
     loop {
         // Drain background probe results (non-blocking)
@@ -5903,6 +5995,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.latest_oc_version = ver;
             }
         }
+        app.start_db_latency_probe();
         app.start_refresh();
         }
 
@@ -6007,6 +6100,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(content) = rx.try_recv() {
                 app.ws_content = Some(content);
                 app.ws_content_scroll = 0;
+            }
+        }
+
+        if let Some(ref mut rx) = app.db_latency_rx {
+            while let Ok(latency) = rx.try_recv() {
+                if let Some(ms) = latency {
+                    app.db_latency_ms = Some(ms);
+                    app.db_online = true;
+                } else {
+                    app.db_latency_ms = None;
+                    app.db_online = false;
+                }
             }
         }
 
@@ -6126,10 +6231,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::INPUT_POLL_MS;
+    use super::{db_latency_color, BgDensity, Theme, ThemeName, INPUT_POLL_MS};
 
     #[test]
     fn input_poll_interval_is_low_for_responsive_ui() {
         assert!(INPUT_POLL_MS <= 10);
+    }
+
+    #[test]
+    fn db_latency_color_thresholds_match_status_bar_spec() {
+        let t = Theme::resolve(ThemeName::Standard, BgDensity::Dark);
+        assert_eq!(db_latency_color(Some(3), true, &t), t.status_online);
+        assert_eq!(db_latency_color(Some(25), true, &t), t.status_busy);
+        assert_eq!(db_latency_color(Some(80), true, &t), t.status_offline);
+        assert_eq!(db_latency_color(None, false, &t), t.status_offline);
     }
 }
