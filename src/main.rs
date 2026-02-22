@@ -27,8 +27,7 @@ use std::collections::HashSet;
 use std::io::stdout;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tokio::sync::{mpsc, Semaphore};
-use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use theme::{BgDensity, Theme, ThemeName};
 
@@ -308,6 +307,7 @@ struct App {
     diag_auto_fix: bool,
     diag_title: Option<String>,
     diag_start: Option<Instant>,
+    diag_overlay_scroll: u16,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -355,16 +355,29 @@ struct App {
     ac_matches: Vec<String>,
     ac_selected: usize,
     ac_start_pos: usize,  // cursor position of the '@'
-    // Bulk update confirmation + progress
-    bulk_update_pending: bool,
-    bulk_update_active: bool,
-    bulk_update_targets: Vec<(String, String, String, bool, String)>,  // (db_name, host, ssh_user, is_mac, oc_version)
-    bulk_update_names: Vec<String>,
-    bulk_update_deselected: std::collections::HashSet<usize>,
-    bulk_update_cursor: usize,
-    bulk_update_progress: Vec<BulkUpdateStatus>,
-    bulk_update_details: Vec<String>,
-    bulk_update_rx: Option<mpsc::UnboundedReceiver<(usize, BulkUpdateStatus, String)>>,
+    // Operation state persistence
+    interrupted_ops: Vec<db::Operation>,
+    diag_task_running: bool,
+}
+
+/// Returns true for npm output lines worth showing in the overlay.
+/// Filters out transitive-dependency deprecation noise and pure whitespace.
+fn npm_line_is_meaningful(line: &str) -> bool {
+    if line.trim().is_empty() { return false; }
+    let lower = line.to_lowercase();
+    // Skip noisy deprecated warnings for transitive deps
+    if lower.contains("npm warn deprecated") { return false; }
+    if lower.contains("npm warn notsup") { return false; }
+    // Always keep error lines
+    if lower.contains("err") { return true; }
+    // Keep final result lines (added/changed/removed/updated X packages)
+    if lower.contains("added") && lower.contains("package") { return true; }
+    if (lower.contains("changed") || lower.contains("updated") || lower.contains("removed")) && lower.contains("package") { return true; }
+    // Keep timing/progress lines
+    if lower.contains("packages in") { return true; }
+    // Keep non-deprecated warnings
+    if lower.starts_with("npm warn") { return true; }
+    false
 }
 
 impl App {
@@ -416,6 +429,10 @@ impl App {
             Err(_) => vec![],
         };
 
+        // Detect operations interrupted by a previous session (started > 5 min ago, still 'running')
+        let _ = db::mark_stale_operations_interrupted(&pool).await;
+        let interrupted_ops = db::load_interrupted_operations(&pool).await.unwrap_or_default();
+
         let tn = ThemeName::Standard;
         let bd = BgDensity::Dark;
 
@@ -442,17 +459,13 @@ impl App {
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
-            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None,
+            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None, diag_overlay_scroll: 0,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
-            bulk_update_pending: false, bulk_update_active: false,
-            bulk_update_targets: vec![], bulk_update_names: vec![],
-            bulk_update_deselected: HashSet::new(), bulk_update_cursor: 0,
-            bulk_update_progress: vec![], bulk_update_details: vec![],
-            bulk_update_rx: None,
+            interrupted_ops, diag_task_running: false,
         }
     }
 
@@ -1150,6 +1163,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
     out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|| "timeout".into())
 }
 
+
     fn start_oc_update(&mut self) {
         if self.selected >= self.agents.len() { return; }
         let agent = &self.agents[self.selected];
@@ -1158,17 +1172,24 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let name = agent.db_name.clone();
         let is_mac = agent.os.to_lowercase().contains("mac");
         let self_ip = self.self_ip.clone();
+        let pool_opt = self.db_pool.clone();
 
         self.diag_active = true;
+        self.diag_task_running = true;
         self.diag_auto_fix = false;
         self.diag_title = Some(format!("⬆️  Update — {}", name));
         self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
         self.diag_steps = vec![DiagStep { label: format!("Updating OpenClaw on {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
         let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
         self.diag_rx = Some(rx);
 
         tokio::spawn(async move {
+            let op_id = if let Some(ref pool) = pool_opt {
+                db::create_operation(pool, &name, "oc_update").await.ok()
+            } else { None };
+
             let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
             // Step 1: current version
@@ -1176,10 +1197,36 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let cur = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw --version 2>/dev/null || echo '(not installed)'", pfx)).await;
             let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Pass, detail: cur.trim().to_string() });
 
-            // Step 2: stream npm install (stdout + stderr merged via 2>&1)
+            // Pre-flight checks before install
+            let _ = tx.send(DiagStep { label: "Pre-flight checks".into(), status: DiagStatus::Running, detail: String::new() });
+            let preflight_cmd = format!(
+                "{}node --version 2>/dev/null && npm --version 2>/dev/null && df -k $(npm config get prefix 2>/dev/null || echo /usr) | awk 'NR==2{{print $4}}' | xargs -I{{}} bash -c 'if [ {{}} -lt 512000 ]; then echo LOW_DISK; else echo OK_DISK; fi' 2>/dev/null || echo OK_DISK",
+                pfx
+            );
+            let preflight_out = App::ssh_run(&host, &user, &self_ip, &preflight_cmd).await;
+            if preflight_out.contains("LOW_DISK") {
+                let _ = tx.send(DiagStep { label: "Pre-flight checks".into(), status: DiagStatus::Fail, detail: "< 512MB disk space — aborting update".into() });
+                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Aborted — free up disk space first".into() });
+                return;
+            }
+            // Determine install strategy
+            let has_sudo_npm = App::ssh_run(&host, &user, &self_ip, &format!("{}sudo -n npm --version 2>/dev/null && echo HAS_SUDO_NPM || echo NO_SUDO_NPM", pfx)).await.contains("HAS_SUDO_NPM");
+            let npm_prefix = App::ssh_run(&host, &user, &self_ip, &format!("{}npm config get prefix 2>/dev/null", pfx)).await.trim().to_string();
+            let needs_ignore_scripts = App::ssh_run(&host, &user, &self_ip, &format!("{}gcc --version 2>/dev/null && echo HAS_GCC || echo NO_GCC", pfx)).await.contains("NO_GCC");
+            let node_ver = preflight_out.lines().next().unwrap_or("?").trim().to_string();
+            let npm_ver = preflight_out.lines().nth(1).unwrap_or("?").trim().to_string();
+            let _ = tx.send(DiagStep { label: "Pre-flight checks".into(), status: DiagStatus::Pass,
+                detail: format!("node {} | npm {} | prefix: {}", node_ver, npm_ver, npm_prefix.chars().take(30).collect::<String>()) });
+
+            // Step 2: stream npm install with smart flags
             let _ = tx.send(DiagStep { label: "Installing openclaw@latest".into(), status: DiagStatus::Running, detail: "running npm install...".into() });
-            // 2>&1 merges stderr so we capture error messages too
-            let install_cmd = format!("{}sudo npm install -g openclaw@latest 2>&1; echo EXITCODE:$?:DONE", pfx);
+            let ignore_scripts = if needs_ignore_scripts { " --ignore-scripts" } else { "" };
+            let install_cmd = if has_sudo_npm {
+                format!("{}sudo npm install -g openclaw@latest{} 2>&1; echo EXITCODE:$?:DONE", pfx, ignore_scripts)
+            } else {
+                // No sudo or sudo npm broken — install to user prefix
+                format!("{}npm install -g openclaw@latest{} 2>&1; echo EXITCODE:$?:DONE", pfx, ignore_scripts)
+            };
             use tokio::io::AsyncBufReadExt;
             let mut child = if host == "localhost" || host == self_ip {
                 tokio::process::Command::new("bash").args(["-c", &install_cmd])
@@ -1210,7 +1257,10 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
                         if clean.to_lowercase().contains("err") || clean.starts_with("npm ERR") {
                             error_lines.push(clean.chars().take(80).collect());
                         }
-                        let _ = tx.send(DiagStep { label: "  npm".into(), status: DiagStatus::Running, detail: clean.chars().take(70).collect() });
+                        // Only stream meaningful lines; skip deprecated noise / whitespace
+                        if npm_line_is_meaningful(&clean) {
+                            let _ = tx.send(DiagStep { label: "  npm".into(), status: DiagStatus::Running, detail: clean.chars().take(70).collect() });
+                        }
                     }
                 }
                 // If we didn't parse exit code, use process exit status
@@ -1226,6 +1276,17 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             } else {
                 "no output — check npm/sudo permissions".into()
             };
+            // Resolve the "  npm" sub-step so it no longer shows as running
+            let npm_summary: String = if install_ok {
+                last_line.chars().take(60).collect()
+            } else {
+                fail_detail.clone()
+            };
+            let _ = tx.send(DiagStep {
+                label: "  npm".into(),
+                status: if install_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: npm_summary,
+            });
             let _ = tx.send(DiagStep {
                 label: "Installing openclaw@latest".into(),
                 status: if install_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
@@ -1241,117 +1302,25 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let new_v = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw --version 2>/dev/null || echo '?'", pfx)).await;
             let _ = tx.send(DiagStep { label: "New version".into(), status: DiagStatus::Pass, detail: new_v.trim().to_string() });
 
-            // Step 4: restart gateway
+            // Step 4: restart gateway (try full path if openclaw not in PATH)
             let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Running, detail: String::new() });
-            let restart_msg = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)).await;
-            let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Fixed, detail: restart_msg.trim().to_string() });
+            let restart_cmd = format!(
+                "{}openclaw gateway restart 2>&1 | tail -1 || ~/.npm-global/bin/openclaw gateway restart 2>&1 | tail -1 || systemctl --user restart openclaw-gateway 2>&1 | tail -1 || echo 'restart skipped - run manually'",
+                pfx
+            );
+            let restart_msg = App::ssh_run(&host, &user, &self_ip, &restart_cmd).await;
+            let restart_ok = !restart_msg.contains("skipped") && !restart_msg.is_empty();
+            let _ = tx.send(DiagStep {
+                label: "Restarting gateway".into(),
+                status: if restart_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
+                detail: restart_msg.trim().chars().take(70).collect(),
+            });
 
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
-        });
-    }
-
-    fn start_bulk_update(&mut self) {
-        // Collect selected (non-deselected) indices
-        let index_map: Vec<usize> = self.bulk_update_targets.iter().enumerate()
-            .filter(|(i, _)| !self.bulk_update_deselected.contains(i))
-            .map(|(i, _)| i)
-            .collect();
-
-        if index_map.is_empty() {
-            self.toast("No agents selected for update");
-            self.bulk_update_pending = false;
-            return;
-        }
-
-        let targets: Vec<(String, String, String, bool, String)> = index_map.iter()
-            .map(|&i| self.bulk_update_targets[i].clone())
-            .collect();
-
-        // Reset progress for all entries
-        for s in self.bulk_update_progress.iter_mut() {
-            *s = BulkUpdateStatus::Pending;
-        }
-        for d in self.bulk_update_details.iter_mut() { d.clear(); }
-
-        let (tx, rx) = mpsc::unbounded_channel::<(usize, BulkUpdateStatus, String)>();
-        self.bulk_update_rx = Some(rx);
-        self.bulk_update_active = true;
-        self.bulk_update_pending = false;
-
-        let latest = self.latest_oc_version.clone();
-        let pool = self.db_pool.clone();
-        let sender = self.user();
-        let self_ip = self.self_ip.clone();
-        let max_concurrent = std::env::var("MAX_CONCURRENT_UPDATES")
-            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3);
-
-        tokio::spawn(async move {
-            let sem = Arc::new(Semaphore::new(max_concurrent));
-            let mut handles = Vec::new();
-
-            for (slot, orig_idx) in index_map.into_iter().enumerate() {
-                let (db_name, host, ssh_user, is_mac, old_ver) = targets[slot].clone();
-                let tx = tx.clone();
-                let sem = sem.clone();
-                let latest = latest.clone();
-                let pool = pool.clone();
-                let sender = sender.clone();
-                let self_ip = self_ip.clone();
-
-                let handle = tokio::spawn(async move {
-                    let _permit = sem.acquire().await.ok();
-                    let _ = tx.send((orig_idx, BulkUpdateStatus::Running, String::new()));
-
-                    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-                    let cmd = format!(
-                        "{}openclaw --version 2>/dev/null && sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1",
-                        pfx
-                    );
-
-                    let output = if host == "localhost" || host == self_ip {
-                        tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
-                    } else {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(120),
-                            tokio::process::Command::new("ssh")
-                                .args(["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                                    &format!("{}@{}", ssh_user, host), &cmd])
-                                .output()
-                        ).await.ok().and_then(|r| r.ok())
-                    };
-
-                    let (status, detail) = match output {
-                        Some(o) if o.status.success() => {
-                            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                            (BulkUpdateStatus::Done, s.chars().take(80).collect::<String>())
-                        }
-                        Some(o) => {
-                            let s = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                            let s = if s.is_empty() { String::from_utf8_lossy(&o.stdout).trim().to_string() } else { s };
-                            (BulkUpdateStatus::Failed, s.chars().take(80).collect::<String>())
-                        }
-                        None => (BulkUpdateStatus::Failed, "Timeout".into()),
-                    };
-
-                    if let Some(pool) = pool {
-                        let msg = format!("🔄 update {} → {}", old_ver, latest);
-                        let _ = crate::db::send_direct(&pool, &sender, &db_name, &msg).await;
-                        if let Ok(mut conn) = pool.get_conn().await {
-                            use mysql_async::prelude::*;
-                            let response = detail.clone();
-                            let _ = conn.exec_drop(
-                                "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
-                                (&response, &sender, &db_name),
-                            ).await;
-                        }
-                    }
-
-                    let _ = tx.send((orig_idx, status, detail));
-                });
-                handles.push(handle);
+            if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                let status = if install_ok { "completed" } else { "failed" };
+                let _ = db::complete_operation(pool, op_id, status, None).await;
             }
-
-            for h in handles { let _ = h.await; }
         });
     }
 
@@ -1363,16 +1332,24 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let name = agent.db_name.clone();
         let location = agent.location.clone();
         let gw_port = agent.gateway_port;
+        let pool_opt = self.db_pool.clone();
         self.diag_active = true;
+        self.diag_task_running = true;
         self.diag_auto_fix = fix;
         self.diag_title = None;
         self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
         self.diag_steps = vec![DiagStep { label: format!("Diagnosing {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.diag_rx = Some(rx);
 
         tokio::spawn(async move {
+            let op_id = if let Some(ref pool) = pool_opt {
+                let op_type = if fix { "diagnostics_fix" } else { "diagnostics" };
+                db::create_operation(pool, &name, op_type).await.ok()
+            } else { None };
+
             let is_mac_check = Command::new("ssh").args([
                 "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), "uname -s"
@@ -1714,6 +1691,9 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
 
             if !ssh_ok {
                 let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cannot proceed without SSH — see details above".into() });
+                if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                    let _ = db::complete_operation(pool, op_id, "failed", Some("SSH unreachable")).await;
+                }
                 return;
             }
 
@@ -1882,8 +1862,10 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             }
 
             // Done
-            let passes = 7; // we'll count from received steps
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "diagnostic complete".into() });
+            if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                let _ = db::complete_operation(pool, op_id, "completed", None).await;
+            }
         });
     }
 
@@ -2340,14 +2322,6 @@ impl DiagStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum BulkUpdateStatus {
-    Pending,
-    Running,
-    Done,
-    Failed,
-}
-
 const SERVICE_ICONS: &[(&str, &str)] = &[
     ("telegram", "📱"), ("discord", "🎮"), ("signal", "🔒"), ("whatsapp", "💬"),
     ("slack", "💼"), ("irc", "📟"), ("matrix", "🔷"), ("imessage", "🍎"),
@@ -2787,6 +2761,12 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         Span::styled(if app.refreshing { "⟳ refreshing" } else { "" }, Style::default().fg(t.accent)),
         if app.alert_flash.map(|f| f.elapsed() < Duration::from_secs(5)).unwrap_or(false) {
             Span::styled("  ⚠️ NEW ALERT", Style::default().fg(t.status_offline).bold())
+        } else { Span::raw("") },
+        if !app.interrupted_ops.is_empty() {
+            Span::styled(
+                format!("  ⚠ {} interrupted op(s)", app.interrupted_ops.len()),
+                Style::default().fg(t.status_busy).bold(),
+            )
         } else { Span::raw("") },
         Span::raw("    "),
         Span::styled(chrono_now(), Style::default().fg(t.text_dim)),
@@ -3269,129 +3249,13 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
     }
 
     let diag = Paragraph::new(lines)
+        .scroll((app.diag_overlay_scroll, 0))
         .block(Block::default()
             .title(Span::styled(title, Style::default().fg(t.accent).bold()))
             .borders(Borders::ALL).border_type(BorderType::Double)
             .border_style(Style::default().fg(if app.diag_auto_fix { t.status_busy } else { t.accent }))
             .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(diag, popup);
-}
-
-fn render_bulk_update_overlay(frame: &mut Frame, app: &App) {
-    let t = &app.theme;
-    let area = frame.area();
-    let latest = &app.latest_oc_version;
-    let total = app.bulk_update_targets.len();
-    let selected_count = total - app.bulk_update_deselected.len();
-
-    let w = ((area.width as f32 * 0.65) as u16).max(62).min(area.width.saturating_sub(4));
-    let h_content = total as u16 + 8;
-    let h = h_content.min(area.height.saturating_sub(4)).max(10);
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = (area.height.saturating_sub(h)) / 2;
-    let popup = Rect::new(x, y, w, h);
-
-    frame.render_widget(Clear, popup);
-
-    let title = if app.bulk_update_active {
-        let done_count = app.bulk_update_progress.iter().enumerate()
-            .filter(|(i, _)| !app.bulk_update_deselected.contains(i))
-            .filter(|(_, s)| matches!(s, BulkUpdateStatus::Done | BulkUpdateStatus::Failed))
-            .count();
-        format!(" Updating {}/{} agents ", done_count, selected_count)
-    } else {
-        let ver_label = if latest.is_empty() { "latest".to_string() } else { latest.clone() };
-        format!(" Bulk Update — {} agent{} to {} [Y/n] ", selected_count, if selected_count == 1 { "" } else { "s" }, ver_label)
-    };
-
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(""));
-
-    for (i, name) in app.bulk_update_names.iter().enumerate() {
-        let is_deselected = app.bulk_update_deselected.contains(&i);
-        let is_cursor = i == app.bulk_update_cursor && !app.bulk_update_active;
-        let (_, _, _, _, oc_ver) = &app.bulk_update_targets[i];
-        let ver_label = if latest.is_empty() { "latest" } else { latest.as_str() };
-
-        let (status_str, status_color) = if app.bulk_update_active {
-            match &app.bulk_update_progress[i] {
-                BulkUpdateStatus::Pending if is_deselected => ("  ⊘ skipped".to_string(), t.text_dim),
-                BulkUpdateStatus::Pending => ("  ⧖ queued".to_string(), t.text_dim),
-                BulkUpdateStatus::Running => {
-                    let c = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
-                    (format!("  {} running...", c), t.pending)
-                }
-                BulkUpdateStatus::Done => ("  ✓ done".to_string(), t.status_online),
-                BulkUpdateStatus::Failed => {
-                    let detail = &app.bulk_update_details[i];
-                    let msg = if detail.is_empty() { "failed".to_string() } else { detail.chars().take(40).collect::<String>() };
-                    (format!("  ✗ {}", msg), t.status_offline)
-                }
-            }
-        } else {
-            let s = format!("  {} → {}", oc_ver, ver_label);
-            let c = if is_deselected { t.text_dim } else { t.text };
-            (s, c)
-        };
-
-        let checkbox = if is_deselected { "[ ]" } else { "[✓]" };
-        let prefix = if is_cursor { "▶" } else { " " };
-        let name_style = if is_cursor {
-            Style::default().fg(t.accent).bold()
-        } else if is_deselected {
-            Style::default().fg(t.text_dim)
-        } else {
-            Style::default().fg(t.text)
-        };
-        let cb_color = if is_cursor { t.accent } else { t.text_dim };
-
-        if app.bulk_update_active {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {}  ", prefix), Style::default().fg(t.accent)),
-                Span::styled(name.clone(), name_style),
-                Span::styled(status_str, Style::default().fg(status_color)),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {} {} ", prefix, checkbox), Style::default().fg(cb_color)),
-                Span::styled(name.clone(), name_style),
-                Span::styled(status_str, Style::default().fg(status_color)),
-            ]));
-        }
-    }
-
-    lines.push(Line::from(""));
-    if app.bulk_update_active {
-        let done_count = app.bulk_update_progress.iter().enumerate()
-            .filter(|(i, _)| !app.bulk_update_deselected.contains(i))
-            .filter(|(_, s)| matches!(s, BulkUpdateStatus::Done | BulkUpdateStatus::Failed))
-            .count();
-        if done_count >= selected_count {
-            lines.push(Line::from(Span::styled("  Done — press Esc to close", Style::default().fg(t.text_dim))));
-        } else {
-            lines.push(Line::from(Span::styled("  Updating… press Esc to dismiss", Style::default().fg(t.text_dim))));
-        }
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("  Y", Style::default().fg(t.status_online).bold()),
-            Span::styled(" confirm · ", Style::default().fg(t.text_dim)),
-            Span::styled("N/Esc", Style::default().fg(t.status_offline).bold()),
-            Span::styled(" cancel · ", Style::default().fg(t.text_dim)),
-            Span::styled("Space", Style::default().fg(t.accent).bold()),
-            Span::styled(" toggle · ", Style::default().fg(t.text_dim)),
-            Span::styled("↑↓", Style::default().fg(t.accent).bold()),
-            Span::styled(" navigate", Style::default().fg(t.text_dim)),
-        ]));
-    }
-
-    let border_color = if app.bulk_update_active { t.status_busy } else { t.accent };
-    let p = Paragraph::new(lines)
-        .block(Block::default()
-            .title(Span::styled(title, Style::default().fg(t.accent).bold()))
-            .borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(Style::default().fg(border_color))
-            .style(Style::default().bg(app.bg_density.bg())));
-    frame.render_widget(p, popup);
 }
 
 fn render_services(frame: &mut Frame, app: &App, area: Rect) {
@@ -4436,9 +4300,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if app.wizard.active {
                 wizard::render_wizard(f, &app.wizard, &app.theme, app.bg_density.bg());
             }
-            if app.bulk_update_pending || app.bulk_update_active {
-                render_bulk_update_overlay(f, &app);
-            }
             } // close else for show_splash
         })?;
 
@@ -4612,45 +4473,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => {}
                         }
                     } else {
-                    // Bulk update overlay intercepts all keys when active
-                    if app.bulk_update_pending || app.bulk_update_active {
-                        match key.code {
-                            KeyCode::Esc => {
-                                // Allow close if not mid-run or if all done
-                                let all_done = app.bulk_update_targets.iter().enumerate()
-                                    .filter(|(i, _)| !app.bulk_update_deselected.contains(i))
-                                    .all(|(i, _)| matches!(app.bulk_update_progress.get(i), Some(BulkUpdateStatus::Done) | Some(BulkUpdateStatus::Failed)));
-                                if !app.bulk_update_active || all_done {
-                                    app.bulk_update_pending = false;
-                                    app.bulk_update_active = false;
-                                    app.bulk_update_rx = None;
-                                }
-                            }
-                            KeyCode::Char('n') | KeyCode::Char('N') if !app.bulk_update_active => {
-                                app.bulk_update_pending = false;
-                            }
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if app.bulk_update_pending && !app.bulk_update_active => {
-                                app.start_bulk_update();
-                            }
-                            KeyCode::Up | KeyCode::Char('k') if !app.bulk_update_active => {
-                                if app.bulk_update_cursor > 0 { app.bulk_update_cursor -= 1; }
-                            }
-                            KeyCode::Down | KeyCode::Char('j') if !app.bulk_update_active => {
-                                if app.bulk_update_cursor < app.bulk_update_targets.len().saturating_sub(1) {
-                                    app.bulk_update_cursor += 1;
-                                }
-                            }
-                            KeyCode::Char(' ') if !app.bulk_update_active => {
-                                let idx = app.bulk_update_cursor;
-                                if app.bulk_update_deselected.contains(&idx) {
-                                    app.bulk_update_deselected.remove(&idx);
-                                } else {
-                                    app.bulk_update_deselected.insert(idx);
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else {
                     // Diagnostic overlay intercepts all keys when active
                     if app.diag_active {
                         match key.code {
@@ -4660,6 +4482,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.diag_rx = None;
                                 app.diag_start = None;
                                 app.start_refresh(); // re-probe after fix
+                            }
+                            KeyCode::PageUp => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_sub(5);
+                            }
+                            KeyCode::PageDown => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_add(5);
+                            }
+                            KeyCode::Up => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_add(1);
                             }
                             _ => {}
                         }
@@ -5103,39 +4937,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('u') => {
-                                    // Show bulk update confirmation overlay
+                                    // Bulk update OC on outdated agents (or selected)
                                     let latest = app.latest_oc_version.clone();
-                                    let iter: Vec<(&Agent, usize)> = if app.multi_selected.is_empty() {
-                                        app.agents.iter().enumerate()
-                                            .filter(|(_, a)| a.status == AgentStatus::Online)
-                                            .filter(|(_, a)| latest.is_empty() || !a.oc_version.contains(&latest))
-                                            .map(|(i, a)| (a, i))
+                                    let targets: Vec<(String, String, String, bool, String)> = if app.multi_selected.is_empty() {
+                                        app.agents.iter()
+                                            .filter(|a| a.status == AgentStatus::Online)
+                                            .filter(|a| latest.is_empty() || !a.oc_version.contains(&latest))
+                                            .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"), a.oc_version.clone()))
                                             .collect()
                                     } else {
                                         app.multi_selected.iter()
-                                            .filter_map(|&i| app.agents.get(i).map(|a| (a, i)))
-                                            .filter(|(a, _)| a.status == AgentStatus::Online)
+                                            .filter_map(|&i| app.agents.get(i))
+                                            .filter(|a| a.status == AgentStatus::Online)
+                                            .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"), a.oc_version.clone()))
                                             .collect()
                                     };
-                                    let (targets, names): (Vec<_>, Vec<_>) = iter.iter()
-                                        .map(|(a, _)| (
-                                            (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"), a.oc_version.clone()),
-                                            a.name.clone(),
-                                        ))
-                                        .unzip();
                                     if targets.is_empty() {
                                         app.toast("✓ All agents already on latest version");
                                     } else {
-                                        let n = targets.len();
-                                        app.bulk_update_targets = targets;
-                                        app.bulk_update_names = names;
-                                        app.bulk_update_deselected = std::collections::HashSet::new();
-                                        app.bulk_update_cursor = 0;
-                                        app.bulk_update_progress = (0..n).map(|_| BulkUpdateStatus::Pending).collect();
-                                        app.bulk_update_details = (0..n).map(|_| String::new()).collect();
-                                        app.bulk_update_pending = true;
-                                        app.bulk_update_active = false;
-                                        app.bulk_update_rx = None;
+                                        let count = targets.len();
+                                        app.toast(&format!("🔄 Updating {} agents to {}...", count, if latest.is_empty() { "latest".into() } else { latest.clone() }));
+                                        for (db_name, host, ssh_user, is_mac, old_ver) in targets {
+                                            if let Some(pool) = &app.db_pool {
+                                                let pool = pool.clone();
+                                                let sender = app.user();
+                                                let self_ip = app.self_ip.clone();
+                                                let latest = latest.clone();
+                                                tokio::spawn(async move {
+                                                    let op_id = db::create_operation(&pool, &db_name, "bulk_update").await.ok();
+                                                    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                                    let cmd = format!("{}openclaw --version 2>/dev/null && sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1", pfx);
+                                                    let output = if host == "localhost" || host == self_ip {
+                                                        tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                                                    } else {
+                                                        tokio::time::timeout(
+                                                            std::time::Duration::from_secs(120),
+                                                            tokio::process::Command::new("ssh")
+                                                                .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                                    &format!("{}@{}", ssh_user, host), &cmd])
+                                                                .output()
+                                                        ).await.ok().and_then(|r| r.ok())
+                                                    };
+                                                    let timed_out = output.is_none();
+                                                    let response = output.map(|o| {
+                                                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                                        if s.is_empty() { "(no output)".into() } else { s.chars().take(500).collect::<String>() }
+                                                    }).unwrap_or_else(|| "Timeout".into());
+                                                    let msg = format!("🔄 update {} → {}", old_ver, latest);
+                                                    let _ = crate::db::send_direct(&pool, &sender, &db_name, &msg).await;
+                                                    if let Ok(mut conn) = pool.get_conn().await {
+                                                        use mysql_async::prelude::*;
+                                                        let _ = conn.exec_drop(
+                                                            "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                                                            (&response, &sender, &db_name),
+                                                        ).await;
+                                                    }
+                                                    if let Some(op_id) = op_id {
+                                                        let status = if timed_out { "failed" } else { "completed" };
+                                                        let _ = db::complete_operation(&pool, op_id, status, Some(&response)).await;
+                                                    }
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                                 KeyCode::Char('U') => app.start_oc_update(),
@@ -5327,8 +5190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                     }
-                    } // close else if diag_active
-                    } // close else if bulk_update_pending/active
+                    } // close else for diag_active
             }
         }
 
@@ -5363,32 +5225,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.last_task_poll = Instant::now();
         }
 
-        // Receive bulk update progress (non-blocking)
-        if app.bulk_update_active {
-            if let Some(ref mut rx) = app.bulk_update_rx {
-                while let Ok((idx, status, detail)) = rx.try_recv() {
-                    if idx < app.bulk_update_progress.len() {
-                        app.bulk_update_details[idx] = detail;
-                        app.bulk_update_progress[idx] = status;
-                    }
-                }
-            }
-            // Check if all selected agents are done
-            let selected_count = app.bulk_update_targets.len() - app.bulk_update_deselected.len();
-            let done_count = app.bulk_update_targets.iter().enumerate()
-                .filter(|(i, _)| !app.bulk_update_deselected.contains(i))
-                .filter(|(i, _)| matches!(app.bulk_update_progress.get(*i), Some(BulkUpdateStatus::Done) | Some(BulkUpdateStatus::Failed)))
-                .count();
-            if selected_count > 0 && done_count >= selected_count {
-                let ok_count = app.bulk_update_targets.iter().enumerate()
-                    .filter(|(i, _)| !app.bulk_update_deselected.contains(i))
-                    .filter(|(i, _)| matches!(app.bulk_update_progress.get(*i), Some(BulkUpdateStatus::Done)))
-                    .count();
-                app.toast(&format!("✅ Bulk update complete: {}/{} succeeded", ok_count, selected_count));
-                app.bulk_update_active = false;
-            }
-        }
-
         // Receive diagnostic steps (non-blocking)
         if app.diag_active {
             if let Some(ref mut rx) = app.diag_rx {
@@ -5396,7 +5232,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let is_done = step.label == "DONE";
                     app.diag_steps.push(step);
                     if is_done {
-                        // Keep overlay open for user to see results
+                        // Mark task as no longer running (overlay stays open for user to read)
+                        app.diag_task_running = false;
                     }
                 }
             }
@@ -5537,7 +5374,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if app.should_quit { break; }
+        if app.should_quit {
+            // On clean exit: wait up to 3s for any active operation to complete
+            if app.diag_task_running {
+                let wait_start = std::time::Instant::now();
+                while app.diag_task_running && wait_start.elapsed() < Duration::from_secs(3) {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    if let Some(ref mut rx) = app.diag_rx {
+                        while let Ok(step) = rx.try_recv() {
+                            if step.label == "DONE" { app.diag_task_running = false; }
+                            app.diag_steps.push(step);
+                        }
+                    }
+                }
+            }
+            break;
+        }
     }
 
     if let Some(pool) = app.db_pool.take() { pool.disconnect().await?; }
