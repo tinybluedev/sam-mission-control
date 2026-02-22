@@ -114,7 +114,7 @@ struct ChatLine {
 }
 
 #[derive(PartialEq, Clone)]
-enum Focus { Fleet, Chat, AgentChat, Command }
+enum Focus { Fleet, Chat, AgentChat, Command, Workspace }
 
 #[derive(PartialEq)]
 enum Screen { Dashboard, AgentDetail, TaskBoard, SpawnManager, VpnStatus, Alerts, Help }
@@ -288,6 +288,15 @@ struct App {
     // Alerts
     alerts: Vec<Alert>,
     alert_flash: Option<Instant>,
+    // Workspace (agent file management)
+    ws_files: Vec<WorkspaceFile>,
+    ws_selected: usize,
+    ws_content: Option<String>,
+    ws_content_scroll: u16,
+    ws_editing: bool,
+    ws_edit_buffer: String,
+    ws_crons: Vec<CronEntry>,
+    ws_loading: bool,
     // Filter
     filter_active: bool,
     filter_text: String,
@@ -385,7 +394,9 @@ impl App {
             fleet_area: Rect::default(), chat_area: Rect::default(),
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
-            theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(), chat_poll_rx: None, chat_polling: false, ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
+            theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
+            ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0,
+            ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
         }
     }
 
@@ -920,6 +931,167 @@ impl App {
         }
     }
 
+    /// Load workspace files for focused agent via SSH
+    async fn load_workspace(&mut self) {
+        if self.selected >= self.agents.len() { return; }
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        self.ws_loading = true;
+        self.ws_content = None;
+        self.ws_content_scroll = 0;
+
+        // Build file list and check existence via single SSH command
+        let check_cmd = AGENT_FILES.iter()
+            .map(|(name, _, _)| format!("f=\"$(find ~ -maxdepth 3 -name '{}' -path '*/clawd/{}' 2>/dev/null | head -1)\"; if [ -n \"$f\" ]; then echo \"EXISTS:{}:$(stat -c%s \"$f\" 2>/dev/null || stat -f%z \"$f\" 2>/dev/null):$f\"; else echo \"MISSING:{}\"; fi", name, name, name, name))
+            .collect::<Vec<_>>().join("; ");
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new("ssh").args([
+                "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), &check_cmd,
+            ]).output()
+        ).await;
+
+        let mut files = Vec::new();
+        if let Ok(Ok(o)) = output {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            for line in stdout.lines() {
+                if let Some(rest) = line.strip_prefix("EXISTS:") {
+                    let parts: Vec<&str> = rest.splitn(3, ':').collect();
+                    if parts.len() >= 3 {
+                        let name = parts[0];
+                        let size: u64 = parts[1].parse().unwrap_or(0);
+                        let path = parts[2];
+                        if let Some((_, _, icon)) = AGENT_FILES.iter().find(|(n, _, _)| *n == name) {
+                            files.push(WorkspaceFile {
+                                name: name.to_string(), path: path.to_string(),
+                                icon, exists: true, size_bytes: Some(size),
+                            });
+                        }
+                    }
+                } else if let Some(name) = line.strip_prefix("MISSING:") {
+                    if let Some((_, _, icon)) = AGENT_FILES.iter().find(|(n, _, _)| *n == name) {
+                        files.push(WorkspaceFile {
+                            name: name.to_string(), path: String::new(),
+                            icon, exists: false, size_bytes: None,
+                        });
+                    }
+                }
+            }
+        }
+        if files.is_empty() {
+            // Fallback: show all files as unknown
+            for (name, _, icon) in AGENT_FILES {
+                files.push(WorkspaceFile {
+                    name: name.to_string(), path: String::new(),
+                    icon, exists: false, size_bytes: None,
+                });
+            }
+        }
+        self.ws_files = files;
+        self.ws_loading = false;
+
+        // Load crons
+        self.load_crons().await;
+    }
+
+    /// Load cron jobs from agent's OpenClaw gateway
+    async fn load_crons(&mut self) {
+        if self.selected >= self.agents.len() { return; }
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(8),
+            Command::new("ssh").args([
+                "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host),
+                "openclaw cron list --json 2>/dev/null || echo '[]'",
+            ]).output()
+        ).await;
+
+        let mut crons = Vec::new();
+        if let Ok(Ok(o)) = output {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout.trim()) {
+                for item in arr {
+                    crons.push(CronEntry {
+                        id: item["id"].as_str().unwrap_or("").to_string(),
+                        schedule: item["schedule"].as_str().unwrap_or("").to_string(),
+                        description: item["description"].as_str().unwrap_or(
+                            item["prompt"].as_str().unwrap_or("(no description)")
+                        ).to_string(),
+                        enabled: item["enabled"].as_bool().unwrap_or(true),
+                    });
+                }
+            }
+        }
+        self.ws_crons = crons;
+    }
+
+    /// Fetch file content via SSH
+    async fn load_file_content(&mut self) {
+        if self.ws_selected >= self.ws_files.len() { return; }
+        let file = &self.ws_files[self.ws_selected];
+        if !file.exists || file.path.is_empty() {
+            self.ws_content = Some("(file not found on agent)".to_string());
+            return;
+        }
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let path = file.path.clone();
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(8),
+            Command::new("ssh").args([
+                "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), &format!("cat '{}'", path),
+            ]).output()
+        ).await;
+
+        self.ws_content = match output {
+            Ok(Ok(o)) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).to_string()),
+            Ok(Ok(o)) => Some(format!("Error: {}", String::from_utf8_lossy(&o.stderr))),
+            _ => Some("(timeout reading file)".to_string()),
+        };
+        self.ws_content_scroll = 0;
+    }
+
+    /// Save edited file content back to agent via SSH
+    async fn save_file_content(&mut self) {
+        if self.ws_selected >= self.ws_files.len() { return; }
+        let file = &self.ws_files[self.ws_selected];
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let path = if file.path.is_empty() {
+            // Create new file in default workspace
+            format!("~/CLAUDE/clawd/{}", file.name)
+        } else {
+            file.path.clone()
+        };
+
+        let escaped_content = self.ws_edit_buffer.replace("'", "'\''");
+        let cmd = format!("mkdir -p $(dirname '{}') && cat > '{}' << 'SAMEOF'
+{}
+SAMEOF", path, path, escaped_content);
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new("ssh").args([
+                "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), &cmd,
+            ]).output()
+        ).await;
+
+        self.ws_editing = false;
+        self.ws_content = Some(self.ws_edit_buffer.clone());
+    }
+
     fn start_refresh(&mut self) {
         if self.refreshing { return; }
         self.refreshing = true;
@@ -1103,6 +1275,38 @@ fn now_str() -> String {
 // ---- Chat Line Rendering ----
 
 const BRAILLE_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Agent workspace file metadata
+#[derive(Clone, Debug)]
+struct WorkspaceFile {
+    name: String,
+    path: String,
+    icon: &'static str,
+    exists: bool,
+    size_bytes: Option<u64>,
+}
+
+/// Cron job entry from OpenClaw
+#[derive(Clone, Debug)]
+struct CronEntry {
+    id: String,
+    schedule: String,
+    description: String,
+    enabled: bool,
+}
+
+const AGENT_FILES: &[(&str, &str, &str)] = &[
+    ("SOUL.md", "soul", "🧬"),
+    ("IDENTITY.md", "identity", "🪪"),
+    ("AGENTS.md", "agents", "📋"),
+    ("MEMORY.md", "memory", "🧠"),
+    ("USER.md", "user", "👤"),
+    ("HEARTBEAT.md", "heartbeat", "💓"),
+    ("TOOLS.md", "tools", "🔧"),
+    ("HEARTBEAT_TASKS.md", "tasks", "📝"),
+    ("RECALL.md", "recall", "🔍"),
+    ("CHECKPOINT.md", "checkpoint", "📌"),
+];
+
 /// Result of a background chat poll
 struct ChatPollResult {
     global: Vec<ChatLine>,
@@ -1755,8 +1959,9 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         Span::styled(a.status.to_string(), Style::default().fg(st_color)),
         Span::raw("    "),
         Span::styled(match app.focus {
-            Focus::AgentChat => "▌Chat▐",
-            _ => "▌Info▐",
+            Focus::AgentChat => "  Info  ▌Chat▐  Files ",
+            Focus::Workspace => "  Info   Chat  ▌Files▐",
+            _ => " ▌Info▐  Chat   Files ",
         }, Style::default().fg(t.accent).bold()),
     ]))
     .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
@@ -1820,7 +2025,11 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(ib))
         .style(Style::default().bg(app.bg_density.bg()))
         .padding(Padding::new(1, 1, 1, 0)));
-    frame.render_widget(detail, body[0]);
+    if app.focus == Focus::Workspace {
+        render_workspace(frame, app, body[0]);
+    } else {
+        frame.render_widget(detail, body[0]);
+    }
 
     // Store hit zones
     app.detail_info_area = body[0];
@@ -1831,6 +2040,118 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
 
     // Footer
     render_footer(frame, app, chunks[2]);
+}
+
+fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
+    let t = &app.theme;
+
+    let split = Layout::default().direction(Direction::Horizontal)
+        .constraints([Constraint::Length(28), Constraint::Min(40)])
+        .split(area);
+
+    // Left: file list + crons
+    let mut items: Vec<Line> = Vec::new();
+    items.push(Line::from(Span::styled("  📁 Agent Files", Style::default().fg(t.header_title).bold())));
+    items.push(Line::from(""));
+
+    for (i, f) in app.ws_files.iter().enumerate() {
+        let selected = i == app.ws_selected;
+        let prefix = if selected { " ▸ " } else { "   " };
+        let status = if f.exists {
+            let sz = f.size_bytes.map(|s| {
+                if s > 1024 { format!(" {}K", s / 1024) } else { format!(" {}B", s) }
+            }).unwrap_or_default();
+            format!("✓{}", sz)
+        } else {
+            "✗ missing".to_string()
+        };
+        let name_style = if selected {
+            Style::default().fg(Color::Black).bg(t.accent).bold()
+        } else if f.exists {
+            Style::default().fg(t.text)
+        } else {
+            Style::default().fg(t.text_dim)
+        };
+        items.push(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(t.accent)),
+            Span::styled(format!("{} ", f.icon), Style::default()),
+            Span::styled(format!("{:<18}", f.name), name_style),
+            Span::styled(status, Style::default().fg(if f.exists { t.status_online } else { t.text_dim })),
+        ]));
+    }
+
+    // Crons section
+    if !app.ws_crons.is_empty() {
+        items.push(Line::from(""));
+        items.push(Line::from(Span::styled("  ⏰ Cron Jobs", Style::default().fg(t.header_title).bold())));
+        items.push(Line::from(""));
+        for cron in &app.ws_crons {
+            let icon = if cron.enabled { "●" } else { "○" };
+            let color = if cron.enabled { t.status_online } else { t.text_dim };
+            let desc: String = if cron.description.len() > 22 {
+                format!("{}…", &cron.description[..21])
+            } else {
+                cron.description.clone()
+            };
+            items.push(Line::from(vec![
+                Span::styled(format!("   {} ", icon), Style::default().fg(color)),
+                Span::styled(format!("{:<8}", cron.schedule), Style::default().fg(t.text_dim)),
+                Span::styled(desc, Style::default().fg(t.text)),
+            ]));
+        }
+    }
+
+    if app.ws_loading {
+        items.clear();
+        items.push(Line::from(""));
+        items.push(Line::from(Span::styled("  Loading workspace...", Style::default().fg(t.pending))));
+    }
+
+    // Keybind hints
+    items.push(Line::from(""));
+    items.push(Line::from(Span::styled("  ↑↓ select  Enter view", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  e edit  Tab→chat", Style::default().fg(t.text_dim))));
+
+    let file_panel = Paragraph::new(items)
+        .block(Block::default()
+            .title(Span::styled(" Workspace ", Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(t.border_type)
+            .border_style(Style::default().fg(t.border_active))
+            .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(file_panel, split[0]);
+
+    // Right: file content viewer
+    let content_text = if let Some(ref content) = app.ws_content {
+        let lines: Vec<Line> = content.lines().enumerate().map(|(i, line)| {
+            Line::from(vec![
+                Span::styled(format!("{:>4} │ ", i + 1), Style::default().fg(t.text_dim)),
+                Span::styled(line.to_string(), Style::default().fg(t.text)),
+            ])
+        }).collect();
+        lines
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("  Select a file and press Enter to view", Style::default().fg(t.text_dim))),
+            Line::from(""),
+            Line::from(Span::styled("  Press 'e' to edit the selected file", Style::default().fg(t.text_dim))),
+        ]
+    };
+
+    let file_title = if app.ws_selected < app.ws_files.len() {
+        format!(" {} {} ", app.ws_files[app.ws_selected].icon, app.ws_files[app.ws_selected].name)
+    } else {
+        " File Viewer ".to_string()
+    };
+
+    let viewer = Paragraph::new(content_text)
+        .scroll((app.ws_content_scroll, 0))
+        .block(Block::default()
+            .title(Span::styled(file_title, Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(t.border_type)
+            .border_style(Style::default().fg(t.border))
+            .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(viewer, split[1]);
 }
 
 fn render_vpn_status(frame: &mut Frame, app: &App) {
@@ -2544,6 +2865,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => { app.config_text = None; }
                         },
                         Screen::AgentDetail => match app.focus {
+                            Focus::Workspace => match key.code {
+                                KeyCode::Esc => app.focus = Focus::Fleet,
+                                KeyCode::Tab => app.focus = Focus::Fleet,
+                                KeyCode::Up => { if app.ws_selected > 0 { app.ws_selected -= 1; } }
+                                KeyCode::Down => { if app.ws_selected < app.ws_files.len().saturating_sub(1) { app.ws_selected += 1; } }
+                                KeyCode::Enter => app.load_file_content().await,
+                                KeyCode::Char('e') => {
+                                    if let Some(ref c) = app.ws_content {
+                                        app.ws_edit_buffer = c.clone();
+                                        app.ws_editing = true;
+                                    } else {
+                                        app.load_file_content().await;
+                                    }
+                                }
+                                KeyCode::Char('r') => app.load_workspace().await,
+                                KeyCode::PageUp => app.ws_content_scroll = app.ws_content_scroll.saturating_add(5),
+                                KeyCode::PageDown => app.ws_content_scroll = app.ws_content_scroll.saturating_sub(5),
+                                KeyCode::Char('q') => app.should_quit = true,
+                                _ => {}
+                            },
                             Focus::AgentChat => if app.ac_visible {
                                 match key.code {
                                     KeyCode::Up => { if app.ac_selected > 0 { app.ac_selected -= 1; } else { app.ac_selected = app.ac_matches.len().saturating_sub(1); } }
@@ -2557,7 +2898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 match key.code {
                                     KeyCode::Esc => app.focus = Focus::Fleet,
-                                    KeyCode::Tab => app.focus = Focus::Fleet,
+                                    KeyCode::Tab => { app.focus = Focus::Workspace; app.load_workspace().await; }
                                     KeyCode::Enter => app.send_agent_message().await,
                                     KeyCode::Backspace => { app.agent_chat_input.pop(); app.update_autocomplete(); }
                                     KeyCode::Char(c) => { app.agent_chat_input.push(c); app.update_autocomplete(); }
@@ -2569,6 +2910,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => match key.code {
                                 KeyCode::Esc => { app.screen = Screen::Dashboard; app.focus = Focus::Fleet; }
                                 KeyCode::Tab => app.focus = Focus::AgentChat,
+                                KeyCode::Char('w') => { app.focus = Focus::Workspace; app.load_workspace().await; }
                                 KeyCode::Char('q') => app.should_quit = true,
                                 KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
