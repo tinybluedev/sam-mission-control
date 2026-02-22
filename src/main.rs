@@ -307,6 +307,9 @@ struct App {
     diag_auto_fix: bool,
     diag_title: Option<String>,
     diag_start: Option<Instant>,
+    diag_cancel_prompt: bool,
+    diag_abort: Option<tokio::task::AbortHandle>,
+    bg_operations: Vec<BgOperation>,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -432,6 +435,7 @@ impl App {
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
             diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None,
+            diag_cancel_prompt: false, diag_abort: None, bg_operations: vec![],
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
@@ -1148,11 +1152,12 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         self.diag_title = Some(format!("⬆️  Update — {}", name));
         self.diag_start = Some(Instant::now());
         self.diag_steps = vec![DiagStep { label: format!("Updating OpenClaw on {}...", name), status: DiagStatus::Running, detail: String::new() }];
+        self.diag_cancel_prompt = false;
 
         let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
         self.diag_rx = Some(rx);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
             // Step 1: current version
@@ -1232,6 +1237,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
 
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
         });
+        self.diag_abort = Some(handle.abort_handle());
     }
 
     fn start_diagnostics(&mut self, fix: bool) {
@@ -1244,14 +1250,15 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let gw_port = agent.gateway_port;
         self.diag_active = true;
         self.diag_auto_fix = fix;
-        self.diag_title = None;
+        self.diag_title = Some(format!("{} — {}", if fix { "🔧 Fix" } else { "🔍 Diagnostics" }, name));
         self.diag_start = Some(Instant::now());
         self.diag_steps = vec![DiagStep { label: format!("Diagnosing {}...", name), status: DiagStatus::Running, detail: String::new() }];
+        self.diag_cancel_prompt = false;
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.diag_rx = Some(rx);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let is_mac_check = Command::new("ssh").args([
                 "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), "uname -s"
@@ -1764,6 +1771,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let passes = 7; // we'll count from received steps
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "diagnostic complete".into() });
         });
+        self.diag_abort = Some(handle.abort_handle());
     }
 
     /// Toggle a service plugin enabled/disabled via SSH
@@ -2194,6 +2202,15 @@ struct ServiceEntry {
     enabled: bool,
     has_channel_config: bool,
     summary: String,  // e.g. "2 groups, dmPolicy: pairing"
+}
+
+/// A diagnostic/update operation running in the background (overlay dismissed)
+struct BgOperation {
+    title: String,
+    rx: mpsc::UnboundedReceiver<DiagStep>,
+    steps: Vec<DiagStep>,
+    start: Instant,
+    abort: tokio::task::AbortHandle,
 }
 
 /// Diagnostic step result
@@ -2641,6 +2658,7 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
     let total_tokens: i32 = app.agents.iter().map(|a| a.token_burn).sum();
     let health_pct = if total > 0 { online * 100 / total } else { 0 };
     let health_color = if health_pct >= 80 { t.status_online } else if health_pct >= 50 { t.status_busy } else { t.status_offline };
+    let bg_ops = app.bg_operations.len() + if app.diag_active { 1 } else { 0 };
 
     let header = Paragraph::new(Line::from(vec![
         Span::raw("  "),
@@ -2656,6 +2674,10 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         Span::styled(if live { "● live" } else { "○ stale" }, Style::default().fg(if live { t.status_online } else { t.status_offline })),
         Span::raw("    "),
         Span::styled(if app.refreshing { "⟳ refreshing" } else { "" }, Style::default().fg(t.accent)),
+        if bg_ops > 0 {
+            let c = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+            Span::styled(format!("  {} [{} op{}]", c, bg_ops, if bg_ops == 1 { "" } else { "s" }), Style::default().fg(t.status_busy).bold())
+        } else { Span::raw("") },
         if app.alert_flash.map(|f| f.elapsed() < Duration::from_secs(5)).unwrap_or(false) {
             Span::styled("  ⚠️ NEW ALERT", Style::default().fg(t.status_offline).bold())
         } else { Span::raw("") },
@@ -2919,6 +2941,11 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         AgentStatus::Online => t.status_online, AgentStatus::Busy => t.status_busy,
         AgentStatus::Offline => t.status_offline, _ => t.text_dim,
     };
+    let bg_ops = app.bg_operations.len() + if app.diag_active { 1 } else { 0 };
+    let bg_ops_span = if bg_ops > 0 {
+        let c = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+        Span::styled(format!("    {} [{} op{}]", c, bg_ops, if bg_ops == 1 { "" } else { "s" }), Style::default().fg(t.status_busy).bold())
+    } else { Span::raw("") };
     let header = Paragraph::new(Line::from(vec![
         Span::raw("  "),
         Span::styled(format!("{} {}", a.emoji, a.name), Style::default().fg(t.header_title).bold()),
@@ -2931,6 +2958,7 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
             Focus::Services => " 1:Info 2:Chat 3:Files 4:Tasks 5:▌Svc▐",
             _ => " 1:▌Info▐ 2:Chat 3:Files 4:Tasks 5:Svc",
         }, Style::default().fg(t.accent).bold()),
+        bg_ops_span,
     ]))
     .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
@@ -3134,6 +3162,15 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
         let color = if failed == 0 { t.status_online } else { t.status_offline };
         lines.push(Line::from(Span::styled(summary, Style::default().fg(color).bold())));
         lines.push(Line::from(Span::styled("  Press Esc or q to close", Style::default().fg(t.text_dim))));
+    } else if app.diag_cancel_prompt {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  Operation in progress — ", Style::default().fg(t.status_busy).bold()),
+            Span::styled(" K ", Style::default().fg(Color::Black).bg(t.accent).bold()),
+            Span::styled(" keep running in background  ", Style::default().fg(t.text_dim)),
+            Span::styled(" A ", Style::default().fg(Color::Black).bg(t.status_offline).bold()),
+            Span::styled(" abort", Style::default().fg(t.text_dim)),
+        ]));
     } else if total_steps > 0 {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("  Press Esc or q to cancel", Style::default().fg(t.text_dim))));
@@ -4365,13 +4402,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                     // Diagnostic overlay intercepts all keys when active
                     if app.diag_active {
+                        let is_done = app.diag_steps.iter().any(|s| s.label == "DONE");
                         match key.code {
-                            KeyCode::Esc | KeyCode::Char('q') => {
+                            KeyCode::Esc | KeyCode::Char('q') if is_done || app.diag_cancel_prompt => {
+                                // Close overlay (abort if cancel prompt was showing)
+                                if app.diag_cancel_prompt {
+                                    if let Some(abort) = app.diag_abort.take() { abort.abort(); }
+                                    app.toast("🛑 Operation aborted");
+                                }
                                 app.diag_active = false;
                                 app.diag_steps.clear();
                                 app.diag_rx = None;
                                 app.diag_start = None;
+                                app.diag_cancel_prompt = false;
                                 app.start_refresh(); // re-probe after fix
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                // Operation still running — show cancel prompt
+                                app.diag_cancel_prompt = true;
+                            }
+                            KeyCode::Char('k') | KeyCode::Char('K') if app.diag_cancel_prompt => {
+                                // Keep running in background
+                                if let (Some(rx), Some(abort)) = (app.diag_rx.take(), app.diag_abort.take()) {
+                                    let title = app.diag_title.clone().unwrap_or_else(|| "Operation".to_string());
+                                    app.bg_operations.push(BgOperation {
+                                        title,
+                                        rx,
+                                        steps: app.diag_steps.clone(),
+                                        start: app.diag_start.unwrap_or_else(Instant::now),
+                                        abort,
+                                    });
+                                }
+                                app.diag_active = false;
+                                app.diag_steps.clear();
+                                app.diag_start = None;
+                                app.diag_cancel_prompt = false;
+                                let bg_count = app.bg_operations.len();
+                                app.toast(&format!("⏳ Running in background  [{} op{}]", bg_count, if bg_count == 1 { "" } else { "s" }));
+                            }
+                            KeyCode::Char('a') | KeyCode::Char('A') if app.diag_cancel_prompt => {
+                                // Abort operation
+                                if let Some(abort) = app.diag_abort.take() { abort.abort(); }
+                                app.diag_active = false;
+                                app.diag_steps.clear();
+                                app.diag_rx = None;
+                                app.diag_start = None;
+                                app.diag_cancel_prompt = false;
+                                app.toast("🛑 Operation aborted");
+                                app.start_refresh();
                             }
                             _ => {}
                         }
@@ -5106,6 +5184,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if is_done {
                         // Keep overlay open for user to see results
                     }
+                }
+            }
+        }
+
+        // Poll background operations and toast on completion
+        {
+            let mut completed: Vec<(usize, bool)> = Vec::new(); // (index, normally_done)
+            for (i, op) in app.bg_operations.iter_mut().enumerate() {
+                loop {
+                    match op.rx.try_recv() {
+                        Ok(step) => {
+                            let done = step.label == "DONE";
+                            op.steps.push(step);
+                            if done { completed.push((i, true)); break; }
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            // Task was aborted — remove silently
+                            completed.push((i, false));
+                            break;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                    }
+                }
+            }
+            for (i, normally_done) in completed.into_iter().rev() {
+                let op = app.bg_operations.remove(i);
+                if normally_done {
+                    let failed = op.steps.iter().any(|s| s.status == DiagStatus::Fail);
+                    let icon = if failed { "⚠️" } else { "✅" };
+                    app.toast(&format!("{} {} complete", icon, op.title));
                 }
             }
         }
