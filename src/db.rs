@@ -87,6 +87,16 @@ pub async fn run_migrations(pool: &Pool) -> Result<(), mysql_async::Error> {
         "ALTER TABLE mc_fleet_status ADD COLUMN IF NOT EXISTS ssh_user VARCHAR(64) DEFAULT NULL",
         (),
     ).await;
+    // Ensure mem_free_mb column exists (added for OOM prevention monitoring)
+    let _ = conn.exec_drop(
+        "ALTER TABLE mc_fleet_status ADD COLUMN IF NOT EXISTS mem_free_mb INT DEFAULT NULL",
+        (),
+    ).await;
+    // Ensure swap_mb column exists (added for swap health monitoring)
+    let _ = conn.exec_drop(
+        "ALTER TABLE mc_fleet_status ADD COLUMN IF NOT EXISTS swap_mb INT DEFAULT NULL",
+        (),
+    ).await;
     // Ensure mc_operations table exists
     let _ = conn.exec_drop(
         r"CREATE TABLE IF NOT EXISTS mc_operations (
@@ -100,6 +110,18 @@ pub async fn run_migrations(pool: &Pool) -> Result<(), mysql_async::Error> {
         )",
         (),
     ).await;
+    Ok(())
+}
+
+/// Update an agent's memory and swap metrics.
+pub async fn update_resource_metrics(
+    pool: &Pool, agent_name: &str, mem_free_mb: Option<i64>, swap_mb: Option<i64>,
+) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "UPDATE mc_fleet_status SET mem_free_mb=COALESCE(?,mem_free_mb), swap_mb=COALESCE(?,swap_mb), updated_at=NOW() WHERE agent_name=?",
+        (mem_free_mb, swap_mb, agent_name),
+    ).await?;
     Ok(())
 }
 
