@@ -745,9 +745,11 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
 
     let prompt = |label: &str, default: &str| -> String {
         print!("  {} [{}]: ", label, default);
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
         let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
+        if io::stdin().read_line(&mut input).is_err() {
+            return default.to_string();
+        }
         let v = input.trim().to_string();
         if v.is_empty() { default.to_string() } else { v }
     };
@@ -758,9 +760,11 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
     let db_user = db_user.map(|s| s.to_string()).unwrap_or_else(|| prompt("MySQL user", "root"));
     let db_pass = db_pass.map(|s| s.to_string()).unwrap_or_else(|| {
         print!("  MySQL password: ");
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
         let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
+        if io::stdin().read_line(&mut input).is_err() {
+            return String::new();
+        }
         input.trim().to_string()
     });
     let db_name = db_name.map(|s| s.to_string()).unwrap_or_else(|| prompt("Database name", "sam_fleet"));
