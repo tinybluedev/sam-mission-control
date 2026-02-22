@@ -63,6 +63,29 @@ impl WizardStep {
             Self::Confirm => "Confirm",
         }
     }
+
+    pub fn placeholder(&self) -> &str {
+        match self {
+            Self::AgentName => "e.g. alpha-01",
+            Self::DisplayName => "e.g. Alpha Node",
+            Self::Emoji => "e.g. 🤖",
+            Self::Host => "e.g. 100.64.0.1 or hostname",
+            Self::SshUser => "e.g. papasmurf",
+            Self::Location | Self::Confirm => "",
+        }
+    }
+
+    pub fn hint(&self) -> &str {
+        match self {
+            Self::AgentName => "Lowercase letters, digits and hyphens; spaces become hyphens",
+            Self::DisplayName => "Human-readable label shown in the fleet UI",
+            Self::Emoji => "Single emoji representing this agent",
+            Self::Host => "Tailscale IP (100.x.x.x) or plain hostname",
+            Self::SshUser => "SSH username on the remote host (default: papasmurf)",
+            Self::Location => "← → or any key to cycle: Home / SM / VPS / Mobile",
+            Self::Confirm => "Tab to test SSH connection before confirming",
+        }
+    }
 }
 
 pub struct AgentWizard {
@@ -90,7 +113,7 @@ impl AgentWizard {
             display_name: String::new(),
             emoji: "🤖".into(),
             host: String::new(),
-            ssh_user: "admin".into(),
+            ssh_user: "papasmurf".into(),
             location: 0,
             error: None,
             ssh_result: None,
@@ -152,6 +175,12 @@ impl AgentWizard {
                 match validate::normalize_agent_name(&self.agent_name) {
                     Ok(name) => self.agent_name = name,
                     Err(e) => { self.error = Some(e); return false; }
+                }
+            }
+            WizardStep::Emoji => {
+                if self.emoji.is_empty() {
+                    self.error = Some("Emoji must not be empty".into());
+                    return false;
                 }
             }
             WizardStep::Host => {
@@ -263,10 +292,16 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
         let label_style = if is_current { Style::default().fg(t.accent).bold() } else { Style::default().fg(t.text_dim) };
         let cursor = if is_current { "▌" } else { "" };
 
+        let (display_value, effective_style) = if value.is_empty() {
+            (step.placeholder(), Style::default().fg(t.text_dim))
+        } else {
+            (value.as_str(), val_style)
+        };
+
         lines.push(Line::from(vec![
             Span::raw("    "),
             Span::styled(format!("{:<14}", label), label_style),
-            Span::styled(if value.is_empty() { "(type here)" } else { value }, val_style),
+            Span::styled(display_value, effective_style),
             Span::styled(cursor, Style::default().fg(t.accent)),
         ]));
     }
@@ -278,10 +313,19 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
     lines.push(Line::from(vec![
         Span::raw("    "),
         Span::styled(format!("{:<14}", "Location"), loc_label),
-        Span::styled(format!("{} (press any key to cycle)", wizard.location_str()), loc_style),
+        Span::styled(wizard.location_str(), loc_style),
+        Span::styled(if is_loc { " ▌" } else { "" }, Style::default().fg(t.accent)),
     ]));
 
+    // Hint line for the current step
     lines.push(Line::from(""));
+    let hint = wizard.step.hint();
+    if !hint.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(hint, Style::default().fg(t.text_dim)),
+        ]));
+    }
 
     // Confirm step shows summary
     if wizard.step == WizardStep::Confirm {
@@ -290,10 +334,17 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
 
         if let Some(result) = &wizard.ssh_result {
             lines.push(Line::from(""));
+            let ssh_color = if result.starts_with("✅") {
+                t.status_online
+            } else if result.starts_with("❌") {
+                t.status_offline
+            } else {
+                t.text_dim
+            };
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled("SSH: ", Style::default().fg(t.text_bold).bold()),
-                Span::styled(result.as_str(), Style::default().fg(t.response)),
+                Span::styled(result.as_str(), Style::default().fg(ssh_color)),
             ]));
         }
     }
