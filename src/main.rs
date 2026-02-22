@@ -10,7 +10,6 @@ mod db;
 mod theme;
 mod validate;
 mod shell;
->>>>>>> d3b3cfc (security: add shell escape utility and use it in SSH broadcast fallback)
 
 use clap::Parser;
 use dotenvy;
