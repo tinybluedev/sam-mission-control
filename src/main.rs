@@ -302,6 +302,9 @@ struct App {
     theme: Theme,
     // Routing
     routed_msg_ids: std::collections::HashSet<i64>,
+    // Background chat poll
+    chat_poll_rx: Option<mpsc::UnboundedReceiver<ChatPollResult>>,
+    chat_polling: bool,
     // Autocomplete
     ac_visible: bool,
     ac_matches: Vec<String>,
@@ -382,7 +385,7 @@ impl App {
             fleet_area: Rect::default(), chat_area: Rect::default(),
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
-            theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(), ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
+            theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(), chat_poll_rx: None, chat_polling: false, ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
         }
     }
 
@@ -917,61 +920,6 @@ impl App {
         }
     }
 
-    async fn poll_chat(&mut self) {
-        let mut to_route: Vec<(String, String)> = Vec::new();
-        if let Some(pool) = &self.db_pool {
-            // Global chat for dashboard
-            if let Ok(msgs) = db::load_global_chat(pool, 100).await {
-                for m in &msgs {
-                    if m.status == "responded" && m.sender != self.user()
-                        && !self.routed_msg_ids.contains(&m.id)
-                    {
-                        if let Some(ref resp) = m.response {
-                            if resp.contains('@') {
-                                self.routed_msg_ids.insert(m.id);
-                                to_route.push((m.sender.clone(), resp.clone()));
-                            }
-                        }
-                    }
-                }
-                self.chat_history = msgs.iter().map(|m| ChatLine {
-                    sender: m.sender.clone(), target: m.target.clone(),
-                    message: m.message.clone(), response: m.response.clone(),
-                    time: m.created_at.clone(), status: m.status.clone(),
-                    kind: m.kind.clone(),
-                }).collect();
-            }
-            // Agent-specific chat (if on detail screen)
-            if self.screen == Screen::AgentDetail && self.selected < self.agents.len() {
-                let agent = &self.agents[self.selected].db_name;
-                if let Ok(msgs) = db::load_agent_chat(pool, agent, 100).await {
-                    for m in &msgs {
-                        if m.status == "responded" && m.sender != self.user()
-                            && !self.routed_msg_ids.contains(&m.id)
-                        {
-                            if let Some(ref resp) = m.response {
-                                if resp.contains('@') {
-                                    self.routed_msg_ids.insert(m.id);
-                                    to_route.push((m.sender.clone(), resp.clone()));
-                                }
-                            }
-                        }
-                    }
-                    self.agent_chat_history = msgs.iter().map(|m| ChatLine {
-                        sender: m.sender.clone(), target: m.target.clone(),
-                        message: m.message.clone(), response: m.response.clone(),
-                        time: m.created_at.clone(), status: m.status.clone(),
-                        kind: m.kind.clone(),
-                    }).collect();
-                }
-            }
-        }
-        // Route agent @mentions (outside db_pool borrow)
-        for (sender, response) in to_route {
-            self.route_agent_mentions(&sender, &response).await;
-        }
-    }
-
     fn start_refresh(&mut self) {
         if self.refreshing { return; }
         self.refreshing = true;
@@ -1155,6 +1103,14 @@ fn now_str() -> String {
 // ---- Chat Line Rendering ----
 
 const BRAILLE_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Result of a background chat poll
+struct ChatPollResult {
+    global: Vec<ChatLine>,
+    agent: Option<Vec<ChatLine>>,
+    to_route: Vec<(String, String)>,
+    new_routed_ids: Vec<i64>,
+}
+
 /// Minimum content width (chars) for message word-wrap, preventing extremely narrow wrapping.
 const MIN_WRAP_WIDTH: usize = 10;
 /// Approximate lines rendered per chat message (header + body + blank), used to estimate
@@ -3059,13 +3015,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.last_task_poll = Instant::now();
         }
 
-        // Poll chat every 3s — spawn so it doesn't block
+        // Receive background chat poll results (non-blocking)
+        let mut poll_results: Vec<ChatPollResult> = Vec::new();
+        if let Some(ref mut rx) = app.chat_poll_rx {
+            while let Ok(result) = rx.try_recv() {
+                poll_results.push(result);
+            }
+        }
+        for result in poll_results {
+            app.chat_history = result.global;
+            if let Some(agent_msgs) = result.agent {
+                app.agent_chat_history = agent_msgs;
+            }
+            for id in &result.new_routed_ids {
+                app.routed_msg_ids.insert(*id);
+            }
+            for (sender, response) in result.to_route {
+                app.route_agent_mentions(&sender, &response).await;
+            }
+            app.chat_polling = false;
+        }
+
+        // Spawn background chat poll (never blocks main loop)
         let has_pending = app.chat_history.iter().chain(app.agent_chat_history.iter())
-            .any(|m| matches!(m.status.as_str(), "pending" | "connecting" | "thinking" | "streaming" | "processing"));
+            .any(|m| matches!(m.status.as_str(), "pending" | "connecting" | "thinking" | "streaming" | "processing" | "routing"));
         let poll_interval = if has_pending { Duration::from_millis(400) } else { Duration::from_secs(3) };
-        if app.last_chat_poll.elapsed() > poll_interval {
-            app.poll_chat().await;
-            app.last_chat_poll = Instant::now();
+        if !app.chat_polling && app.last_chat_poll.elapsed() > poll_interval {
+            if let Some(pool) = app.db_pool.clone() {
+                app.chat_polling = true;
+                app.last_chat_poll = Instant::now();
+                let (tx, rx) = mpsc::unbounded_channel();
+                app.chat_poll_rx = Some(rx);
+                let user = app.user();
+                let routed = app.routed_msg_ids.clone();
+                let on_detail = app.screen == Screen::AgentDetail && app.selected < app.agents.len();
+                let agent_name = if on_detail { Some(app.agents[app.selected].db_name.clone()) } else { None };
+
+                tokio::spawn(async move {
+                    let mut to_route: Vec<(String, String)> = Vec::new();
+                    let mut new_routed = Vec::new();
+
+                    // Global chat
+                    let global = if let Ok(msgs) = db::load_global_chat(&pool, 100).await {
+                        for m in &msgs {
+                            if m.status == "responded" && m.sender != user && !routed.contains(&m.id) {
+                                if let Some(ref resp) = m.response {
+                                    if resp.contains('@') {
+                                        new_routed.push(m.id);
+                                        to_route.push((m.sender.clone(), resp.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        msgs.iter().map(|m| ChatLine {
+                            sender: m.sender.clone(), target: m.target.clone(),
+                            message: m.message.clone(), response: m.response.clone(),
+                            time: m.created_at.clone(), status: m.status.clone(),
+                            kind: m.kind.clone(),
+                        }).collect()
+                    } else { vec![] };
+
+                    // Agent chat
+                    let agent = if let Some(ref name) = agent_name {
+                        if let Ok(msgs) = db::load_agent_chat(&pool, name, 100).await {
+                            for m in &msgs {
+                                if m.status == "responded" && m.sender != user && !routed.contains(&m.id) {
+                                    if let Some(ref resp) = m.response {
+                                        if resp.contains('@') {
+                                            new_routed.push(m.id);
+                                            to_route.push((m.sender.clone(), resp.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                            Some(msgs.iter().map(|m| ChatLine {
+                                sender: m.sender.clone(), target: m.target.clone(),
+                                message: m.message.clone(), response: m.response.clone(),
+                                time: m.created_at.clone(), status: m.status.clone(),
+                                kind: m.kind.clone(),
+                            }).collect())
+                        } else { None }
+                    } else { None };
+
+                    let _ = tx.send(ChatPollResult { global, agent, to_route, new_routed_ids: new_routed });
+                });
+
+                // Record routed IDs (we'll also get them from the result, but pre-mark to avoid dupes)
+            }
         }
 
         if app.should_quit { break; }
