@@ -2536,8 +2536,12 @@ print('ok')
                     self.agents[r.index].cpu_pct = r.cpu_pct;
                     self.agents[r.index].ram_pct = r.ram_pct;
                     self.agents[r.index].disk_pct = r.disk_pct;
-                    self.agents[r.index].gateway_status = r.gateway_status;
-                    self.agents[r.index].gateway_pid = r.gateway_pid;
+                    if r.gateway_status != GatewayStatus::Unknown {
+                        self.agents[r.index].gateway_status = r.gateway_status;
+                    }
+                    if r.gateway_pid.is_some() {
+                        self.agents[r.index].gateway_pid = r.gateway_pid;
+                    }
                     self.agents[r.index].last_seen = now_str();
                     self.agents[r.index].last_probe_at = Some(Instant::now());
                     updates.push((r.index, r.status, r.os, r.kernel, r.oc_version, r.latency_ms));
@@ -2650,14 +2654,7 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str, full: bool) -> (Agen
         ).await;
         let ms = start.elapsed().as_millis() as u32;
         return match result {
-            Ok(Ok(o)) if o.status.success() => {
-                let gw = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    Command::new("ssh").args(["-o","ConnectTimeout=1","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"pgrep -f 'openclaw.*gateway' | head -1"]).output()
-                ).await.ok().and_then(|r| r.ok())
-                    .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok());
-                (AgentStatus::Online, String::new(), String::new(), String::new(), Some(ms), None, None, None, String::new(), None, if gw.unwrap_or(0) > 0 { GatewayStatus::Online } else { GatewayStatus::Offline }, gw)
-            }
+            Ok(Ok(o)) if o.status.success() => (AgentStatus::Online, String::new(), String::new(), String::new(), Some(ms), None, None, None, String::new(), None, GatewayStatus::Unknown, None),
             _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None, GatewayStatus::Offline, None),
         };
     }
@@ -5266,9 +5263,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('d') => app.start_diagnostics(false),
                                 KeyCode::Char('D') => app.start_diagnostics(true),
                                 KeyCode::Char('U') => app.start_oc_update(),
-                                KeyCode::Char('g') => {
-                                    app.start_gateway_action(GatewayAction::Restart);
-                                }
                                 KeyCode::Char('l') => {
                                     // View gateway logs from services tab
                                     if let Some(agent) = app.agents.get(app.selected) {
