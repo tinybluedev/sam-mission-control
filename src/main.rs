@@ -3968,7 +3968,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Focus::Workspace if app.ws_editing => vec![("^S","save"),("Esc","cancel edit")],
             Focus::Workspace => vec![("⏎","view"),("e","edit"),("r","reload"),("Esc","info"),("1-5","tabs")],
             Focus::Services => vec![("␣","toggle"),("r","reload"),("Esc","info"),("1-5","tabs")],
-            _ => vec![("⏎","detail"),("d","check"),("D","fix"),("w","files"),("t","tasks"),("5","svc"),("Tab","chat"),("Esc","back")],
+            _ => vec![("⏎","detail"),("d","check"),("D","fix"),("U","update"),("w","files"),("t","tasks"),("5","svc"),("Tab","chat"),("Esc","back")],
         },
         Screen::TaskBoard => if app.task_filter_agent.is_some() {
             vec![("n","new"),("d","done"),("c","clear"),("1-5","tabs"),("Esc","back")]
