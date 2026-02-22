@@ -4862,21 +4862,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !updates.is_empty() {
             // Write to DB in background
             if let Some(pool) = &app.db_pool {
-                for (idx, _status, _os, _kern, _oc, lat, change_detail) in &updates {
-                    let a = &app.agents[*idx];
+                for (idx, _status, _os, _kern, _oc, lat, change_detail) in updates {
+                    let a = &app.agents[idx];
                     let p = pool.clone();
                     let (name, st, os, kern, oc, latency) = (
                         a.db_name.clone(), a.status.to_db_str().to_string(),
                         if a.os.is_empty() { None } else { Some(a.os.clone()) },
                         if a.kernel.is_empty() { None } else { Some(a.kernel.clone()) },
                         if a.oc_version.is_empty() { None } else { Some(a.oc_version.clone()) },
-                        *lat,
+                        lat,
                     );
                     tokio::spawn(async move {
                         let _ = db::update_agent_status_full(&p, &name, &st,
                             os.as_deref(), kern.as_deref(), oc.as_deref(), latency).await;
                     });
-                    if let Some(detail) = change_detail.clone() {
+                    if let Some(detail) = change_detail {
                         let p = pool.clone();
                         let agent_name = a.db_name.clone();
                         tokio::spawn(async move {
