@@ -25,7 +25,9 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::stdout;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -369,6 +371,8 @@ struct App {
     // Filter
     filter_active: bool,
     filter_text: String,
+    vim_mode: bool,
+    vim_pending: Option<char>,
     // Config viewer
     config_text: Option<String>,
     config_scroll: u16,
@@ -417,6 +421,32 @@ fn npm_line_is_meaningful(line: &str) -> bool {
     // Keep non-deprecated warnings
     if lower.starts_with("npm warn") { return true; }
     false
+}
+
+async fn try_clipboard_command(bin: &str, args: &[&str], text: &str) -> bool {
+    let mut child = match Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).await.is_err() {
+            return false;
+        }
+    }
+    child.wait().await.map(|s| s.success()).unwrap_or(false)
+}
+
+async fn copy_to_clipboard(text: String) -> bool {
+    try_clipboard_command("pbcopy", &[], &text).await
+        || try_clipboard_command("wl-copy", &[], &text).await
+        || try_clipboard_command("xclip", &["-selection", "clipboard"], &text).await
+        || try_clipboard_command("xsel", &["--clipboard", "--input"], &text).await
 }
 
 impl App {
@@ -493,6 +523,7 @@ impl App {
             spawned_agents: vec![], show_splash: true, splash_start: Instant::now(),
             config_text: None, config_scroll: 0, help_scroll: 0,
             filter_active: false, filter_text: String::new(),
+            vim_mode: false, vim_pending: None,
             alerts: vec![], alert_flash: None, alerts_scroll: 0, gateway_confirm_at: None,
             multi_selected: HashSet::new(),
             spinner_frame: 0, sort_mode: SortMode::Name, group_filter: GroupFilter::All,
@@ -531,9 +562,101 @@ impl App {
         };
     }
 
+    fn filtered_jump_top(&mut self) {
+        let indices = self.filtered_agent_indices();
+        if let Some(&i) = indices.first() { self.selected = i; }
+    }
+
+    fn filtered_jump_bottom(&mut self) {
+        let indices = self.filtered_agent_indices();
+        if let Some(&i) = indices.last() { self.selected = i; }
+    }
+
+    fn filtered_step_by(&mut self, delta: isize) {
+        let indices = self.filtered_agent_indices();
+        if indices.is_empty() { return; }
+        let pos = indices.iter().position(|&i| i == self.selected).unwrap_or(0) as isize;
+        let max = indices.len().saturating_sub(1) as isize;
+        let next = (pos + delta).clamp(0, max) as usize;
+        self.selected = indices[next];
+    }
+
+    fn move_tab_left(&mut self) {
+        if self.screen != Screen::AgentDetail { return; }
+        self.focus = match self.focus {
+            Focus::Fleet => Focus::Services,
+            Focus::AgentChat => Focus::Fleet,
+            Focus::Workspace => Focus::AgentChat,
+            Focus::Services => Focus::Workspace,
+            _ => self.focus.clone(),
+        };
+        if self.focus == Focus::Workspace {
+            self.start_workspace_load();
+        } else if self.focus == Focus::Services {
+            self.start_services_load();
+        }
+    }
+
+    fn move_tab_right(&mut self) {
+        if self.screen != Screen::AgentDetail { return; }
+        self.focus = match self.focus {
+            Focus::Fleet => Focus::AgentChat,
+            Focus::AgentChat => Focus::Workspace,
+            Focus::Workspace => Focus::Services,
+            Focus::Services => Focus::Fleet,
+            _ => self.focus.clone(),
+        };
+        if self.focus == Focus::Workspace {
+            self.start_workspace_load();
+        } else if self.focus == Focus::Services {
+            self.start_services_load();
+        }
+    }
+
+    fn copy_selected_agent_info(&mut self) {
+        let Some(agent) = self.agents.get(self.selected) else { return; };
+        let text = format!(
+            "{} ({})\nHost: {}\nStatus: {}\nOpenClaw: {}\nLocation: {}\nSSH User: {}",
+            agent.name, agent.db_name, agent.host, agent.status, agent.oc_version, agent.location, agent.ssh_user
+        );
+        tokio::spawn(async move {
+            let _ = copy_to_clipboard(text).await;
+        });
+        self.toast("📋 Copied agent info");
+    }
+
     fn toast(&mut self, msg: &str) {
         self.toast_message = Some(msg.to_string());
         self.toast_at = Some(Instant::now());
+    }
+
+    fn run_local_command(&mut self, raw: &str) -> bool {
+        match raw.trim() {
+            ":q" => {
+                self.should_quit = true;
+                true
+            }
+            ":w" => {
+                if self.screen == Screen::AgentDetail && self.focus == Focus::Workspace && self.ws_editing {
+                    self.start_file_save();
+                } else {
+                    self.toast("No active file edit");
+                }
+                true
+            }
+            ":set vim" => {
+                self.vim_mode = true;
+                self.toast("Vim mode enabled");
+                true
+            }
+            ":set novim" => {
+                self.vim_mode = false;
+                self.vim_pending = None;
+                self.toast("Vim mode disabled");
+                true
+            }
+            _ => false,
+        }
     }
 
     fn user(&self) -> String { std::env::var("SAM_USER").unwrap_or_else(|_| "operator".into()) }
@@ -4595,6 +4718,7 @@ fn render_help(frame: &mut Frame, app: &App) {
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
+    let vim_badge = " [VIM]";
 
     // Breadcrumb
     let crumb = match app.screen {
@@ -4655,6 +4779,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("  ", Style::default()),
         Span::styled(&crumb, Style::default().fg(t.accent).bold()),
     ];
+    if app.vim_mode {
+        left_spans.push(Span::styled(vim_badge, Style::default().fg(Color::Black).bg(t.status_busy).bold()));
+    }
 
     // Build right side
     let mut right_spans: Vec<Span> = Vec::new();
@@ -4670,7 +4797,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     right_spans.push(Span::raw("  "));
 
     // Calculate padding between left and right
-    let left_len: usize = crumb.len() + 2;
+    let left_len: usize = crumb.len() + 2 + if app.vim_mode { vim_badge.len() } else { 0 };
     let right_len: usize = if !toast_text.is_empty() {
         toast_text.len() + 2
     } else {
@@ -4762,6 +4889,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut app = App::new(fleet_config).await;
+    app.vim_mode = sam_config.tui.vim_mode;
     app.update_status_bar();
 
     loop {
@@ -5066,6 +5194,157 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => {}
                         }
                     } else {
+                    if app.vim_mode {
+                        let mut handled = false;
+                        match key.code {
+                            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                match app.screen {
+                                    Screen::Dashboard if app.focus == Focus::Fleet => app.filtered_step_by(5),
+                                    Screen::AgentDetail if app.focus == Focus::Services => app.svc_selected = app.svc_selected.saturating_add(5).min(app.svc_list.len().saturating_sub(1)),
+                                    Screen::AgentDetail if app.focus == Focus::Workspace && !app.ws_editing => app.ws_selected = app.ws_selected.saturating_add(5).min(app.ws_files.len().saturating_sub(1)),
+                                    Screen::TaskBoard if !app.task_input_active => app.task_selected = app.task_selected.saturating_add(5).min(app.tasks.len().saturating_sub(1)),
+                                    _ => {}
+                                }
+                                handled = true;
+                            }
+                            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                match app.screen {
+                                    Screen::Dashboard if app.focus == Focus::Fleet => app.filtered_step_by(-5),
+                                    Screen::AgentDetail if app.focus == Focus::Services => app.svc_selected = app.svc_selected.saturating_sub(5),
+                                    Screen::AgentDetail if app.focus == Focus::Workspace && !app.ws_editing => app.ws_selected = app.ws_selected.saturating_sub(5),
+                                    Screen::TaskBoard if !app.task_input_active => app.task_selected = app.task_selected.saturating_sub(5),
+                                    _ => {}
+                                }
+                                handled = true;
+                            }
+                            KeyCode::Char(':') if key.modifiers.is_empty()
+                                && ((app.screen == Screen::Dashboard && app.focus == Focus::Fleet)
+                                    || (app.screen == Screen::AgentDetail && (app.focus == Focus::Fleet || app.focus == Focus::Services || (app.focus == Focus::Workspace && !app.ws_editing)))) => {
+                                app.focus = Focus::Command;
+                                app.command_input = ":".into();
+                                handled = true;
+                            }
+                            KeyCode::Char('/') if key.modifiers.is_empty() && app.screen == Screen::Dashboard && app.focus == Focus::Fleet => {
+                                app.filter_active = true;
+                                app.filter_text.clear();
+                                handled = true;
+                            }
+                            KeyCode::Char('h') if key.modifiers.is_empty()
+                                && app.screen == Screen::AgentDetail
+                                && (app.focus == Focus::Fleet || app.focus == Focus::Services || (app.focus == Focus::Workspace && !app.ws_editing)) => {
+                                app.move_tab_left();
+                                handled = true;
+                            }
+                            KeyCode::Char('l') if key.modifiers.is_empty()
+                                && app.screen == Screen::AgentDetail
+                                && (app.focus == Focus::Fleet || app.focus == Focus::Services || (app.focus == Focus::Workspace && !app.ws_editing)) => {
+                                app.move_tab_right();
+                                handled = true;
+                            }
+                            KeyCode::Char('n') if key.modifiers.is_empty() && app.screen == Screen::Dashboard && app.focus == Focus::Fleet && !app.filter_text.is_empty() => {
+                                app.next();
+                                handled = true;
+                            }
+                            KeyCode::Char('N') if key.modifiers.is_empty() && app.screen == Screen::Dashboard && app.focus == Focus::Fleet && !app.filter_text.is_empty() => {
+                                app.previous();
+                                handled = true;
+                            }
+                            KeyCode::Char('i') if key.modifiers.is_empty() && app.screen == Screen::AgentDetail && app.focus == Focus::Workspace && !app.ws_editing => {
+                                if let Some(ref c) = app.ws_content {
+                                    app.ws_edit_buffer = c.lines().map(|l| l.to_string()).collect();
+                                    if app.ws_edit_buffer.is_empty() { app.ws_edit_buffer.push(String::new()); }
+                                    app.ws_cursor = (0, 0);
+                                    app.ws_undo_stack.clear();
+                                    app.ws_discard_confirm = false;
+                                    app.ws_editing = true;
+                                } else {
+                                    app.start_file_load();
+                                }
+                                handled = true;
+                            }
+                            KeyCode::Char('v') if key.modifiers.is_empty() && app.screen == Screen::Dashboard && app.focus == Focus::Fleet => {
+                                if app.multi_selected.contains(&app.selected) {
+                                    app.multi_selected.remove(&app.selected);
+                                } else {
+                                    app.multi_selected.insert(app.selected);
+                                }
+                                handled = true;
+                            }
+                            KeyCode::Char('g') if key.modifiers.is_empty()
+                                && ((app.screen == Screen::Dashboard && app.focus == Focus::Fleet)
+                                    || (app.screen == Screen::AgentDetail && app.focus == Focus::Services)
+                                    || (app.screen == Screen::AgentDetail && app.focus == Focus::Workspace && !app.ws_editing)
+                                    || (app.screen == Screen::TaskBoard && !app.task_input_active)) => {
+                                if app.vim_pending == Some('g') {
+                                    match app.screen {
+                                        Screen::Dashboard if app.focus == Focus::Fleet => app.filtered_jump_top(),
+                                        Screen::AgentDetail if app.focus == Focus::Services => app.svc_selected = 0,
+                                        Screen::AgentDetail if app.focus == Focus::Workspace && !app.ws_editing => app.ws_selected = 0,
+                                        Screen::TaskBoard if !app.task_input_active => app.task_selected = 0,
+                                        _ => {}
+                                    }
+                                    app.vim_pending = None;
+                                } else {
+                                    app.vim_pending = Some('g');
+                                }
+                                handled = true;
+                            }
+                            KeyCode::Char('G') if key.modifiers.is_empty()
+                                && ((app.screen == Screen::Dashboard && app.focus == Focus::Fleet)
+                                    || (app.screen == Screen::AgentDetail && app.focus == Focus::Services)
+                                    || (app.screen == Screen::AgentDetail && app.focus == Focus::Workspace && !app.ws_editing)
+                                    || (app.screen == Screen::TaskBoard && !app.task_input_active)) => {
+                                match app.screen {
+                                    Screen::Dashboard if app.focus == Focus::Fleet => app.filtered_jump_bottom(),
+                                    Screen::AgentDetail if app.focus == Focus::Services => app.svc_selected = app.svc_list.len().saturating_sub(1),
+                                    Screen::AgentDetail if app.focus == Focus::Workspace && !app.ws_editing => app.ws_selected = app.ws_files.len().saturating_sub(1),
+                                    Screen::TaskBoard if !app.task_input_active => app.task_selected = app.tasks.len().saturating_sub(1),
+                                    _ => {}
+                                }
+                                app.vim_pending = None;
+                                handled = true;
+                            }
+                            KeyCode::Char('d') if key.modifiers.is_empty()
+                                && ((app.screen == Screen::Dashboard && app.focus == Focus::Fleet)
+                                    || (app.screen == Screen::AgentDetail && (app.focus == Focus::Fleet || app.focus == Focus::Services))) => {
+                                if app.vim_pending == Some('d') {
+                                    app.start_diagnostics(false);
+                                    app.vim_pending = None;
+                                } else {
+                                    app.vim_pending = Some('d');
+                                }
+                                handled = true;
+                            }
+                            KeyCode::Char('D') if key.modifiers.is_empty()
+                                && app.vim_pending == Some('d')
+                                && ((app.screen == Screen::Dashboard && app.focus == Focus::Fleet)
+                                    || (app.screen == Screen::AgentDetail && (app.focus == Focus::Fleet || app.focus == Focus::Services))) => {
+                                app.start_diagnostics(true);
+                                app.vim_pending = None;
+                                handled = true;
+                            }
+                            KeyCode::Char('y') if key.modifiers.is_empty()
+                                && ((app.screen == Screen::Dashboard && app.focus == Focus::Fleet)
+                                    || (app.screen == Screen::AgentDetail && (app.focus == Focus::Fleet || app.focus == Focus::Services || (app.focus == Focus::Workspace && !app.ws_editing)))) => {
+                                if app.vim_pending == Some('y') {
+                                    app.copy_selected_agent_info();
+                                    app.vim_pending = None;
+                                } else {
+                                    app.vim_pending = Some('y');
+                                }
+                                handled = true;
+                            }
+                            _ => {
+                                app.vim_pending = None;
+                            }
+                        }
+                        if handled && !matches!(key.code, KeyCode::Char('g' | 'G' | 'd' | 'D' | 'y')) {
+                            app.vim_pending = None;
+                        }
+                        if handled {
+                            continue;
+                        }
+                    }
                     match app.screen {
                         Screen::SpawnManager => { if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc { app.screen = Screen::Dashboard; } },
                     Screen::Help => match key.code {
@@ -5788,6 +6067,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let cmd = app.command_input.clone();
                                         app.command_input.clear();
                                         app.focus = Focus::Fleet;
+                                        if app.run_local_command(&cmd) { continue; }
                                         app.status_message = format!("⚡ Running '{}' on all agents...", &cmd);
 
                                         // Fan out to selected agents (or all online if none selected)

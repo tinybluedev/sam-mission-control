@@ -188,11 +188,13 @@ pub struct TuiConfig {
     pub refresh_interval: u64,
     #[serde(default = "default_chat_poll")]
     pub chat_poll_interval: u64,
+    #[serde(default)]
+    pub vim_mode: bool,
 }
 
 impl Default for TuiConfig {
     fn default() -> Self {
-        Self { theme: default_theme(), background: default_bg(), refresh_interval: default_refresh(), chat_poll_interval: default_chat_poll() }
+        Self { theme: default_theme(), background: default_bg(), refresh_interval: default_refresh(), chat_poll_interval: default_chat_poll(), vim_mode: false }
     }
 }
 
@@ -1144,4 +1146,21 @@ pub async fn run_log(agent: Option<&str>, tail: u32) -> Result<(), Box<dyn std::
 
     pool.disconnect().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SamConfig;
+
+    #[test]
+    fn tui_vim_mode_defaults_to_false() {
+        let cfg: SamConfig = toml::from_str("[tui]\n").expect("config should parse");
+        assert!(!cfg.tui.vim_mode);
+    }
+
+    #[test]
+    fn tui_vim_mode_reads_true_from_config() {
+        let cfg: SamConfig = toml::from_str("[tui]\nvim_mode = true\n").expect("config should parse");
+        assert!(cfg.tui.vim_mode);
+    }
 }
