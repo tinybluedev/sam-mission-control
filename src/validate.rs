@@ -127,6 +127,19 @@ pub fn validate_shell_arg(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a deploy file name used for remote workspace writes.
+///
+/// Accepts only simple filenames (no path separators or traversal segments).
+pub fn validate_deploy_filename(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("File name must not be empty".into());
+    }
+    if value.contains('/') || value.contains('\\') || value == "." || value == ".." || value.contains("..") {
+        return Err("File must be a simple name (no path separators or traversal)".into());
+    }
+    validate_shell_arg(value)
+}
+
 // ---- Unit tests ----
 
 #[cfg(test)]
@@ -317,5 +330,21 @@ mod tests {
         assert!(validate_shell_arg("$(cmd)").is_err());
         assert!(validate_shell_arg("val>out").is_err());
         assert!(validate_shell_arg("val<in").is_err());
+    }
+
+    // ── validate_deploy_filename ────────────────────────────────────────────
+
+    #[test]
+    fn deploy_filename_valid() {
+        assert!(validate_deploy_filename("SOUL.md").is_ok());
+        assert!(validate_deploy_filename("agent-config.json").is_ok());
+    }
+
+    #[test]
+    fn deploy_filename_rejects_path_and_traversal() {
+        assert!(validate_deploy_filename("../secret").is_err());
+        assert!(validate_deploy_filename("a/b.txt").is_err());
+        assert!(validate_deploy_filename("a\\b.txt").is_err());
+        assert!(validate_deploy_filename("..").is_err());
     }
 }
