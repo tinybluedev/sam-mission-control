@@ -22,7 +22,9 @@ use ratatui::{prelude::*, widgets::*};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::stdout;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -454,6 +456,8 @@ struct App {
     // Filter
     filter_active: bool,
     filter_text: String,
+    vim_mode: bool,
+    vim_pending: Option<char>,
     // Config viewer
     config_text: Option<String>,
     config_scroll: u16,
@@ -520,6 +524,32 @@ fn npm_line_is_meaningful(line: &str) -> bool {
         return true;
     }
     false
+}
+
+async fn try_clipboard_command(bin: &str, args: &[&str], text: &str) -> bool {
+    let mut child = match Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).await.is_err() {
+            return false;
+        }
+    }
+    child.wait().await.map(|s| s.success()).unwrap_or(false)
+}
+
+async fn copy_to_clipboard(text: String) -> bool {
+    try_clipboard_command("pbcopy", &[], &text).await
+        || try_clipboard_command("wl-copy", &[], &text).await
+        || try_clipboard_command("xclip", &["-selection", "clipboard"], &text).await
+        || try_clipboard_command("xsel", &["--clipboard", "--input"], &text).await
 }
 
 impl App {
@@ -734,6 +764,69 @@ impl App {
             Some(0) | None => indices[indices.len() - 1],
             Some(p) => indices[p - 1],
         };
+    }
+
+    fn filtered_jump_top(&mut self) {
+        let indices = self.filtered_agent_indices();
+        if let Some(&i) = indices.first() { self.selected = i; }
+    }
+
+    fn filtered_jump_bottom(&mut self) {
+        let indices = self.filtered_agent_indices();
+        if let Some(&i) = indices.last() { self.selected = i; }
+    }
+
+    fn filtered_step_by(&mut self, delta: isize) {
+        let indices = self.filtered_agent_indices();
+        if indices.is_empty() { return; }
+        let pos = indices.iter().position(|&i| i == self.selected).unwrap_or(0) as isize;
+        let max = indices.len().saturating_sub(1) as isize;
+        let next = (pos + delta).clamp(0, max) as usize;
+        self.selected = indices[next];
+    }
+
+    fn move_tab_left(&mut self) {
+        if self.screen != Screen::AgentDetail { return; }
+        self.focus = match self.focus {
+            Focus::Fleet => Focus::Services,
+            Focus::AgentChat => Focus::Fleet,
+            Focus::Workspace => Focus::AgentChat,
+            Focus::Services => Focus::Workspace,
+            _ => self.focus.clone(),
+        };
+        if self.focus == Focus::Workspace {
+            self.start_workspace_load();
+        } else if self.focus == Focus::Services {
+            self.start_services_load();
+        }
+    }
+
+    fn move_tab_right(&mut self) {
+        if self.screen != Screen::AgentDetail { return; }
+        self.focus = match self.focus {
+            Focus::Fleet => Focus::AgentChat,
+            Focus::AgentChat => Focus::Workspace,
+            Focus::Workspace => Focus::Services,
+            Focus::Services => Focus::Fleet,
+            _ => self.focus.clone(),
+        };
+        if self.focus == Focus::Workspace {
+            self.start_workspace_load();
+        } else if self.focus == Focus::Services {
+            self.start_services_load();
+        }
+    }
+
+    fn copy_selected_agent_info(&mut self) {
+        let Some(agent) = self.agents.get(self.selected) else { return; };
+        let text = format!(
+            "{} ({})\nHost: {}\nStatus: {}\nOpenClaw: {}\nLocation: {}\nSSH User: {}",
+            agent.name, agent.db_name, agent.host, agent.status, agent.oc_version, agent.location, agent.ssh_user
+        );
+        tokio::spawn(async move {
+            let _ = copy_to_clipboard(text).await;
+        });
+        self.toast("📋 Copied agent info");
     }
 
     fn toast(&mut self, msg: &str) {
@@ -8142,6 +8235,7 @@ fn render_help(frame: &mut Frame, app: &App) {
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
+    let vim_badge = " [VIM]";
 
     // Breadcrumb
     let crumb = match app.screen {
@@ -8279,6 +8373,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("  ", Style::default()),
         Span::styled(&crumb, Style::default().fg(t.accent).bold()),
     ];
+    if app.vim_mode {
+        left_spans.push(Span::styled(vim_badge, Style::default().fg(Color::Black).bg(t.status_busy).bold()));
+    }
 
     // Build right side
     let mut right_spans: Vec<Span> = Vec::new();
@@ -8305,7 +8402,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     right_spans.push(Span::raw("  "));
 
     // Calculate padding between left and right
-    let left_len: usize = crumb.len() + 2;
+    let left_len: usize = crumb.len() + 2 + if app.vim_mode { vim_badge.len() } else { 0 };
     let right_len: usize = if !toast_text.is_empty() {
         toast_text.len() + 2
     } else {
@@ -8441,6 +8538,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut app = App::new(fleet_config).await;
+    app.vim_mode = sam_config.tui.vim_mode;
     app.update_status_bar();
 
     loop {
