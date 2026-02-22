@@ -351,7 +351,10 @@ struct App {
     ws_content: Option<String>,
     ws_content_scroll: u16,
     ws_editing: bool,
-    ws_edit_buffer: String,
+    ws_edit_buffer: Vec<String>,
+    ws_cursor: (usize, usize),   // (line, col)
+    ws_undo_stack: Vec<(Vec<String>, (usize, usize))>,
+    ws_discard_confirm: bool,
     ws_crons: Vec<CronEntry>,
     ws_loading: bool,
     ws_load_rx: Option<mpsc::UnboundedReceiver<(Vec<WorkspaceFile>, Vec<CronEntry>)>>,
@@ -493,7 +496,8 @@ impl App {
             diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None, diag_overlay_scroll: 0,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
-            ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
+            ws_editing: false, ws_edit_buffer: vec![], ws_cursor: (0, 0), ws_undo_stack: vec![], ws_discard_confirm: false,
+            ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
             interrupted_ops, diag_task_running: false,
@@ -2319,6 +2323,12 @@ print('ok')
         self.ws_content_scroll = 0;
     }
 
+    /// Push current edit state onto undo stack (single-level: clears before pushing)
+    fn ws_push_undo(&mut self) {
+        self.ws_undo_stack.clear();
+        self.ws_undo_stack.push((self.ws_edit_buffer.clone(), self.ws_cursor));
+    }
+
     /// Save edited file content back to agent via SSH (non-blocking)
     fn start_file_save(&mut self) {
         if self.ws_selected >= self.ws_files.len() { return; }
@@ -2332,10 +2342,18 @@ print('ok')
             file.path.clone()
         };
 
-        let escaped_content = self.ws_edit_buffer.replace("'", "'\''");
-        let cmd = format!("mkdir -p $(dirname '{}') && cat > '{}' << 'SAMEOF'
-{}
-SAMEOF", path, path, escaped_content);
+        let content = self.ws_edit_buffer.join("\n");
+
+        // Validate JSON before saving .json files
+        if file.name.ends_with(".json") {
+            if let Err(e) = serde_json::from_str::<serde_json::Value>(&content) {
+                self.toast(&format!("✗ JSON error: {}", e));
+                return;
+            }
+        }
+
+        let escaped_content = content.replace("'", "'\''");
+        let cmd = format!("mkdir -p $(dirname '{}') && cat > '{}' << 'SAMEOF'\n{}\nSAMEOF", path, path, escaped_content);
 
         tokio::spawn(async move {
             let _ = tokio::time::timeout(
@@ -2348,7 +2366,9 @@ SAMEOF", path, path, escaped_content);
         });
 
         self.ws_editing = false;
-        self.ws_content = Some(self.ws_edit_buffer.clone());
+        self.ws_discard_confirm = false;
+        self.ws_undo_stack.clear();
+        self.ws_content = Some(content.clone());
         let fname = if self.ws_selected < self.ws_files.len() { self.ws_files[self.ws_selected].name.clone() } else { "file".into() };
         self.toast(&format!("✓ Saved {}", fname));
     }
@@ -3988,11 +4008,28 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
 
     // Right: file content viewer / editor
     let content_text = if app.ws_editing {
-        app.ws_edit_buffer.lines().enumerate().map(|(i, line)| {
-            Line::from(vec![
-                Span::styled(format!("{:>4} │ ", i + 1), Style::default().fg(t.text_dim)),
-                Span::styled(line.to_string(), Style::default().fg(t.text)),
-            ])
+        let (cur_line, cur_col) = app.ws_cursor;
+        app.ws_edit_buffer.iter().enumerate().map(|(i, line)| {
+            let gutter = Span::styled(format!("{:>4} │ ", i + 1), Style::default().fg(t.text_dim));
+            if i == cur_line {
+                // Highlight the cursor character (or end-of-line)
+                let chars: Vec<char> = line.chars().collect();
+                let col = cur_col.min(chars.len());
+                let before: String = chars[..col].iter().collect();
+                let cursor_char: String = if col < chars.len() { chars[col].to_string() } else { " ".to_string() };
+                let after: String = if col < chars.len() { chars[col + 1..].iter().collect() } else { String::new() };
+                Line::from(vec![
+                    gutter,
+                    Span::styled(before, Style::default().fg(t.text)),
+                    Span::styled(cursor_char, Style::default().fg(Color::Black).bg(t.status_busy)),
+                    Span::styled(after, Style::default().fg(t.text)),
+                ])
+            } else {
+                Line::from(vec![
+                    gutter,
+                    Span::styled(line.clone(), Style::default().fg(t.text)),
+                ])
+            }
         }).collect::<Vec<_>>()
     } else if let Some(ref content) = app.ws_content {
         let lines: Vec<Line> = content.lines().enumerate().map(|(i, line)| {
@@ -4013,7 +4050,8 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
 
     let file_title = if app.ws_editing {
         let name = if app.ws_selected < app.ws_files.len() {
-            format!(" ✏ EDITING: {} ", app.ws_files[app.ws_selected].name)
+            let (ln, col) = app.ws_cursor;
+            format!(" ✏ EDITING: {} — {}:{} ", app.ws_files[app.ws_selected].name, ln + 1, col + 1)
         } else {
             " ✏ EDITING ".to_string()
         };
@@ -4024,14 +4062,49 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
         " File Viewer ".to_string()
     };
 
+    let viewer_scroll = if app.ws_editing {
+        let cur_line = app.ws_cursor.0 as u16;
+        // Auto-scroll to keep cursor in view (inner height ≈ area height - 2 borders)
+        let inner_h = split[1].height.saturating_sub(2);
+        if cur_line >= app.ws_content_scroll + inner_h {
+            cur_line.saturating_sub(inner_h.saturating_sub(1))
+        } else if cur_line < app.ws_content_scroll {
+            cur_line
+        } else {
+            app.ws_content_scroll
+        }
+    } else {
+        app.ws_content_scroll
+    };
+
     let viewer = Paragraph::new(content_text)
-        .scroll((app.ws_content_scroll, 0))
+        .scroll((viewer_scroll, 0))
         .block(Block::default()
             .title(Span::styled(file_title, Style::default().fg(if app.ws_editing { t.status_busy } else { t.accent }).bold()))
             .borders(Borders::ALL).border_type(t.border_type)
             .border_style(Style::default().fg(if app.ws_editing { t.status_busy } else { t.border }))
             .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(viewer, split[1]);
+
+    // Discard-confirm overlay
+    if app.ws_discard_confirm {
+        let w: u16 = 46;
+        let h: u16 = 5;
+        let x = split[1].x + split[1].width.saturating_sub(w) / 2;
+        let y = split[1].y + split[1].height.saturating_sub(h) / 2;
+        let rect = Rect::new(x, y, w.min(split[1].width), h.min(split[1].height));
+        frame.render_widget(Clear, rect);
+        let msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled("  Discard unsaved changes?", Style::default().fg(t.status_offline).bold())),
+            Line::from(Span::styled("  Press Esc again to confirm, any key to cancel", Style::default().fg(t.text_dim))),
+        ])
+        .block(Block::default()
+            .borders(Borders::ALL).border_type(t.border_type)
+            .border_style(Style::default().fg(t.status_offline))
+            .style(Style::default().bg(app.bg_density.bg())));
+        frame.render_widget(msg, rect);
+    }
 }
 
 fn render_vpn_status(frame: &mut Frame, app: &App) {
@@ -4549,7 +4622,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         },
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
-            Focus::Workspace if app.ws_editing => vec![("^S","save"),("Esc","cancel edit")],
+            Focus::Workspace if app.ws_editing => vec![("^S","save"),("^Z","undo"),("↑↓←→","cursor"),("Esc","discard?")],
             Focus::Workspace => vec![("⏎","view"),("e","edit"),("r","reload"),("Esc","info"),("1-5","tabs")],
             Focus::Services => vec![("␣","toggle"),("r","reload"),("Esc","info"),("1-5","tabs")],
             _ => vec![("⏎","detail"),("d","check"),("D","fix"),("U","update"),("w","files"),("t","tasks"),("5","svc"),("Tab","chat"),("Esc","back")],
@@ -5082,12 +5155,131 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 _ => {}
                             },
                             Focus::Workspace => if app.ws_editing {
+                                // Any key except Esc resets discard confirm prompt
+                                if !matches!(key.code, KeyCode::Esc) { app.ws_discard_confirm = false; }
                                 match key.code {
-                                    KeyCode::Esc => { app.ws_editing = false; }
+                                    KeyCode::Esc => {
+                                        if app.ws_discard_confirm {
+                                            // Second Esc: discard changes
+                                            app.ws_editing = false;
+                                            app.ws_discard_confirm = false;
+                                            app.ws_undo_stack.clear();
+                                            if let Some(ref c) = app.ws_content {
+                                                app.ws_edit_buffer = c.lines().map(|l| l.to_string()).collect();
+                                            }
+                                            app.ws_cursor = (0, 0);
+                                        } else {
+                                            // First Esc: ask for confirmation
+                                            app.ws_discard_confirm = true;
+                                            app.toast("Press Esc again to discard changes");
+                                        }
+                                    }
                                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => app.start_file_save(),
-                                    KeyCode::Enter => { app.ws_edit_buffer.push('\n'); }
-                                    KeyCode::Backspace => { app.ws_edit_buffer.pop(); }
-                                    KeyCode::Char(c) => { app.ws_edit_buffer.push(c); }
+                                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        if let Some((buf, cur)) = app.ws_undo_stack.pop() {
+                                            app.ws_edit_buffer = buf;
+                                            app.ws_cursor = cur;
+                                            // clamp cursor
+                                            let ln = app.ws_cursor.0.min(app.ws_edit_buffer.len().saturating_sub(1));
+                                            let col = app.ws_cursor.1.min(app.ws_edit_buffer.get(ln).map(|l| l.chars().count()).unwrap_or(0));
+                                            app.ws_cursor = (ln, col);
+                                        }
+                                    }
+                                    KeyCode::Up => {
+                                        if app.ws_cursor.0 > 0 {
+                                            let new_line = app.ws_cursor.0 - 1;
+                                            let max_col = app.ws_edit_buffer.get(new_line).map(|l| l.chars().count()).unwrap_or(0);
+                                            app.ws_cursor = (new_line, app.ws_cursor.1.min(max_col));
+                                        }
+                                    }
+                                    KeyCode::Down => {
+                                        if app.ws_cursor.0 + 1 < app.ws_edit_buffer.len() {
+                                            let new_line = app.ws_cursor.0 + 1;
+                                            let max_col = app.ws_edit_buffer.get(new_line).map(|l| l.chars().count()).unwrap_or(0);
+                                            app.ws_cursor = (new_line, app.ws_cursor.1.min(max_col));
+                                        }
+                                    }
+                                    KeyCode::Left => {
+                                        let (ln, col) = app.ws_cursor;
+                                        if col > 0 {
+                                            app.ws_cursor.1 = col - 1;
+                                        } else if ln > 0 {
+                                            let prev_len = app.ws_edit_buffer.get(ln - 1).map(|l| l.chars().count()).unwrap_or(0);
+                                            app.ws_cursor = (ln - 1, prev_len);
+                                        }
+                                    }
+                                    KeyCode::Right => {
+                                        let (ln, col) = app.ws_cursor;
+                                        let line_len = app.ws_edit_buffer.get(ln).map(|l| l.chars().count()).unwrap_or(0);
+                                        if col < line_len {
+                                            app.ws_cursor.1 = col + 1;
+                                        } else if ln + 1 < app.ws_edit_buffer.len() {
+                                            app.ws_cursor = (ln + 1, 0);
+                                        }
+                                    }
+                                    KeyCode::Home => { app.ws_cursor.1 = 0; }
+                                    KeyCode::End => {
+                                        let ln = app.ws_cursor.0;
+                                        let line_len = app.ws_edit_buffer.get(ln).map(|l| l.chars().count()).unwrap_or(0);
+                                        app.ws_cursor.1 = line_len;
+                                    }
+                                    KeyCode::Enter => {
+                                        app.ws_push_undo();
+                                        let (ln, col) = app.ws_cursor;
+                                        if ln < app.ws_edit_buffer.len() {
+                                            let rest: String = app.ws_edit_buffer[ln].chars().skip(col).collect();
+                                            app.ws_edit_buffer[ln] = app.ws_edit_buffer[ln].chars().take(col).collect();
+                                            app.ws_edit_buffer.insert(ln + 1, rest);
+                                            app.ws_cursor = (ln + 1, 0);
+                                        } else {
+                                            app.ws_edit_buffer.push(String::new());
+                                            app.ws_cursor = (app.ws_edit_buffer.len() - 1, 0);
+                                        }
+                                    }
+                                    KeyCode::Backspace => {
+                                        app.ws_push_undo();
+                                        let (ln, col) = app.ws_cursor;
+                                        if col > 0 && ln < app.ws_edit_buffer.len() {
+                                            let line = &mut app.ws_edit_buffer[ln];
+                                            let mut chars: Vec<char> = line.chars().collect();
+                                            chars.remove(col - 1);
+                                            *line = chars.into_iter().collect();
+                                            app.ws_cursor.1 = col - 1;
+                                        } else if col == 0 && ln > 0 {
+                                            let cur_line = app.ws_edit_buffer.remove(ln);
+                                            let prev_len = app.ws_edit_buffer[ln - 1].chars().count();
+                                            app.ws_edit_buffer[ln - 1].push_str(&cur_line);
+                                            app.ws_cursor = (ln - 1, prev_len);
+                                        }
+                                    }
+                                    KeyCode::Delete => {
+                                        app.ws_push_undo();
+                                        let (ln, col) = app.ws_cursor;
+                                        if ln < app.ws_edit_buffer.len() {
+                                            let line_len = app.ws_edit_buffer[ln].chars().count();
+                                            if col < line_len {
+                                                let line = &mut app.ws_edit_buffer[ln];
+                                                let mut chars: Vec<char> = line.chars().collect();
+                                                chars.remove(col);
+                                                *line = chars.into_iter().collect();
+                                            } else if ln + 1 < app.ws_edit_buffer.len() {
+                                                let next_line = app.ws_edit_buffer.remove(ln + 1);
+                                                app.ws_edit_buffer[ln].push_str(&next_line);
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char(c) => {
+                                        app.ws_push_undo();
+                                        let (ln, col) = app.ws_cursor;
+                                        if app.ws_edit_buffer.is_empty() { app.ws_edit_buffer.push(String::new()); }
+                                        let ln = ln.min(app.ws_edit_buffer.len() - 1);
+                                        let line = &mut app.ws_edit_buffer[ln];
+                                        let mut chars: Vec<char> = line.chars().collect();
+                                        let col = col.min(chars.len());
+                                        chars.insert(col, c);
+                                        *line = chars.into_iter().collect();
+                                        app.ws_cursor = (ln, col + 1);
+                                    }
                                     _ => {}
                                 }
                             } else { match key.code {
@@ -5107,7 +5299,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Enter => app.start_file_load(),
                                 KeyCode::Char('e') => {
                                     if let Some(ref c) = app.ws_content {
-                                        app.ws_edit_buffer = c.clone();
+                                        app.ws_edit_buffer = c.lines().map(|l| l.to_string()).collect();
+                                        if app.ws_edit_buffer.is_empty() { app.ws_edit_buffer.push(String::new()); }
+                                        app.ws_cursor = (0, 0);
+                                        app.ws_undo_stack.clear();
+                                        app.ws_discard_confirm = false;
                                         app.ws_editing = true;
                                     } else {
                                         app.start_file_load();
