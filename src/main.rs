@@ -54,6 +54,8 @@ struct Agent {
     disk_pct: Option<f32>,
     gateway_port: i32,
     gateway_token: Option<String>,
+    gateway_pid: Option<i32>,
+    gateway_status: GatewayStatus,
     uptime_seconds: i64,
     activity: String,         // What the agent is currently doing
     context_pct: Option<f32>, // Context window usage %
@@ -69,6 +71,9 @@ enum AgentStatus {
     Probing,
     Unknown,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+enum GatewayStatus { Online, Offline, Restarting, Unknown }
 
 impl std::fmt::Display for AgentStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -247,6 +252,8 @@ struct ProbeResult {
     disk_pct: Option<f32>,
     activity: String,
     context_pct: Option<f32>,
+    gateway_status: GatewayStatus,
+    gateway_pid: Option<i32>,
 }
 
 // ── UI Helpers ──────────────────────────────────────
@@ -440,6 +447,7 @@ struct App {
     alert_flash: Option<Instant>,
     alerts_scroll: u16,
     gateway_confirm_at: Option<Instant>,
+    gateway_action_confirm: Option<(usize, GatewayAction, Instant)>,
     // Diagnostics (inline doctor/fix)
     diag_active: bool,
     diag_steps: Vec<DiagStep>,
@@ -640,6 +648,8 @@ impl App {
                         disk_pct: None,
                         gateway_port: da.gateway_port,
                         gateway_token: da.gateway_token.clone(),
+                        gateway_pid: da.gateway_pid,
+                        gateway_status: if da.gateway_pid.unwrap_or(0) > 0 { GatewayStatus::Online } else { GatewayStatus::Unknown },
                         uptime_seconds: da.uptime_seconds,
                         activity: "idle".into(),
                         context_pct: None,
@@ -2507,6 +2517,116 @@ PY"#, escaped_model);
                 let status = if install_ok { "completed" } else { "failed" };
                 let _ = db::complete_operation(pool, op_id, status, None).await;
             }
+        });
+    }
+
+    fn start_gateway_action(&mut self, action: GatewayAction) {
+        if self.selected >= self.agents.len() { return; }
+        let idx = self.selected;
+        let agent = &self.agents[idx];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let name = agent.db_name.clone();
+        let self_ip = self.self_ip.clone();
+        let pool_opt = self.db_pool.clone();
+        let action_label = match action {
+            GatewayAction::Start => "start",
+            GatewayAction::Stop => "stop",
+            GatewayAction::Restart => "restart",
+        };
+
+        self.agents[idx].gateway_status = if action == GatewayAction::Restart {
+            GatewayStatus::Restarting
+        } else {
+            GatewayStatus::Unknown
+        };
+        self.diag_active = true;
+        self.diag_task_running = true;
+        self.diag_auto_fix = false;
+        self.diag_title = Some(format!("🌐 Gateway {} — {}", action_label, name));
+        self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
+        self.diag_steps = vec![DiagStep { label: format!("Gateway {} on {}...", action_label, name), status: DiagStatus::Running, detail: String::new() }];
+
+        let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
+        self.diag_rx = Some(rx);
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let remote_cmd = format!(
+                "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; openclaw gateway {} 2>&1; echo EXITCODE:$?:DONE",
+                action_label
+            );
+            let mut child = if host == "localhost" || host == self_ip {
+                tokio::process::Command::new("bash")
+                    .args(["-c", &remote_cmd])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            } else {
+                tokio::process::Command::new("ssh")
+                    .args([
+                        "-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), &remote_cmd,
+                    ])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            };
+
+            let _ = tx.send(DiagStep { label: "Gateway command".into(), status: DiagStatus::Running, detail: format!("openclaw gateway {}", action_label) });
+            let mut action_ok = false;
+            let mut last_line = String::new();
+            if let Ok(ref mut child) = child {
+                if let Some(stdout) = child.stdout.take() {
+                    let mut reader = tokio::io::BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let clean = line.trim().to_string();
+                        if clean.is_empty() { continue; }
+                        if clean.starts_with("EXITCODE:") {
+                            action_ok = clean.trim_start_matches("EXITCODE:").trim_end_matches(":DONE") == "0";
+                            continue;
+                        }
+                        last_line = clean.clone();
+                        let _ = tx.send(DiagStep { label: "  output".into(), status: DiagStatus::Running, detail: clean.chars().take(90).collect() });
+                    }
+                }
+                if let Ok(status) = child.wait().await {
+                    if !action_ok { action_ok = status.success(); }
+                }
+            }
+            let _ = tx.send(DiagStep {
+                label: "Gateway command".into(),
+                status: if action_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if last_line.is_empty() { format!("gateway {}", action_label) } else { last_line.clone() },
+            });
+
+            if action == GatewayAction::Restart {
+                let _ = tx.send(DiagStep { label: "Gateway re-check".into(), status: DiagStatus::Running, detail: "waiting 3s before health probe".into() });
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+
+            let pid_out = App::ssh_run(&host, &user, &self_ip, "pgrep -f 'openclaw.*gateway' | head -1").await;
+            let gw_pid = pid_out.trim().parse::<i32>().ok();
+            if let Some(ref pool) = pool_opt {
+                let _ = db::update_gateway_pid(pool, &name, gw_pid).await;
+            }
+            let gateway_online = gw_pid.unwrap_or(0) > 0;
+            let final_status = if action == GatewayAction::Stop {
+                !gateway_online
+            } else {
+                gateway_online
+            };
+            let _ = tx.send(DiagStep {
+                label: "Gateway PID".into(),
+                status: if final_status { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if let Some(pid) = gw_pid { format!("pid {}", pid) } else { "not running".into() },
+            });
+            let _ = tx.send(DiagStep {
+                label: "DONE".into(),
+                status: if action_ok && final_status { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: if action_ok && final_status { format!("Gateway {} complete", action_label) } else { format!("Gateway {} may have failed", action_label) },
+            });
         });
     }
 
@@ -4905,6 +5025,12 @@ PY",
                     self.agents[r.index].cpu_pct = r.cpu_pct;
                     self.agents[r.index].ram_pct = r.ram_pct;
                     self.agents[r.index].disk_pct = r.disk_pct;
+                    if r.gateway_status != GatewayStatus::Unknown {
+                        self.agents[r.index].gateway_status = r.gateway_status;
+                    }
+                    if r.gateway_pid.is_some() {
+                        self.agents[r.index].gateway_pid = r.gateway_pid;
+                    }
                     self.agents[r.index].last_seen = now_str();
                     self.agents[r.index].last_probe_at = Some(Instant::now());
                     updates.push((
@@ -5200,7 +5326,7 @@ async fn probe_agent(
         );
     }
     let tgt = format!("{}@{}", user, host);
-    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; ACT=$(openclaw status --json 2>/dev/null || ~/.npm-global/bin/openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
+    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); GWPID=$(pgrep -f 'openclaw.*gateway' 2>/dev/null | head -1 || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; echo "GWPID:$GWPID"; ACT=$(openclaw status --json 2>/dev/null || ~/.npm-global/bin/openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new("ssh")
@@ -6643,6 +6769,11 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         ),
         Span::raw("  —  "),
         Span::styled(a.status.to_string(), Style::default().fg(st_color)),
+        if a.gateway_status == GatewayStatus::Offline {
+            Span::styled("   GATEWAY OFFLINE", Style::default().fg(Color::Black).bg(Color::Red).bold())
+        } else {
+            Span::raw("")
+        },
         Span::raw("    "),
         Span::styled(
             match app.focus {
@@ -9134,6 +9265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                         *lat,
                     );
+                    let gw_pid = a.gateway_pid;
                     tokio::spawn(async move {
                         let _ = db::update_agent_status_full(
                             &p,
@@ -9377,6 +9509,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         disk_pct: None,
                                         gateway_port: 18789,
                                         gateway_token: None,
+                                        gateway_pid: None,
+                                        gateway_status: GatewayStatus::Unknown,
                                         uptime_seconds: 0,
                                         activity: "new".into(),
                                         context_pct: None,
@@ -11233,14 +11367,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         step.detail = step.detail.replace(" [reload-workspace]", "");
                     }
                     let is_done = step.label == "DONE";
+                    if step.label == "Gateway PID" && app.selected < app.agents.len() {
+                        let pid = step.detail.strip_prefix("pid ").and_then(|v| v.trim().parse::<i32>().ok());
+                        app.agents[app.selected].gateway_pid = pid;
+                        app.agents[app.selected].gateway_status = if pid.unwrap_or(0) > 0 { GatewayStatus::Online } else { GatewayStatus::Offline };
+                    }
                     app.diag_steps.push(step);
                     if is_done {
                         // Mark task as no longer running (overlay stays open for user to read)
                         app.diag_task_running = false;
+                        if app.diag_title.as_deref().map(|t| t.starts_with("🌐 Gateway")).unwrap_or(false) {
+                            refresh_after_done = true;
+                        }
                     }
                     if reload_workspace {
                         should_reload_workspace = true;
                     }
+                }
+                if refresh_after_done {
+                    app.start_refresh();
                 }
             }
             if should_reload_workspace {
