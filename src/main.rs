@@ -588,7 +588,7 @@ impl App {
             else { format!(" │ 🟡 {} alerts", self.alerts.len()) }
         } else { String::new() };
         self.status_message = format!(
-            "v1.1 │ {}/{} online{}{}{} │ sort:{} │ chat({}) │ {}/{} │ /=cmd ?=help",
+            "v1.2 │ {}/{} online{}{}{} │ sort:{} │ chat({}) │ {}/{} │ /=cmd ?=help",
             on, total, refresh, sel_info, alert_info, self.sort_mode.label(), chat_count,
             self.theme_name.label(), self.bg_density.label()
         );
