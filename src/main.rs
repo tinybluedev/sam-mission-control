@@ -667,12 +667,7 @@ impl App {
         let spinner_chars = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
         // Always advance spinner for a live "app is alive" indicator
         self.spinner_frame = (self.spinner_frame + 1) % spinner_chars.len();
-        let alive_indicator = spinner_chars[self.spinner_frame];
-        let refresh = if self.refreshing {
-            format!(" {} ", alive_indicator)
-        } else {
-            format!(" {} ", alive_indicator)
-        };
+        let refresh = format!(" {} ", spinner_chars[self.spinner_frame]);
         let chat_count = self.chat_history.len();
         let sel_info = if !self.multi_selected.is_empty() {
             format!(" │ 🔲 {}", self.multi_selected.len())
