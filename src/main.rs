@@ -14,7 +14,7 @@ mod shell;
 use clap::Parser;
 use dotenvy;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, MouseEventKind, MouseButton},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, MouseButton},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -2728,8 +2728,15 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(file_panel, split[0]);
 
-    // Right: file content viewer
-    let content_text = if let Some(ref content) = app.ws_content {
+    // Right: file content viewer / editor
+    let content_text = if app.ws_editing {
+        app.ws_edit_buffer.lines().enumerate().map(|(i, line)| {
+            Line::from(vec![
+                Span::styled(format!("{:>4} │ ", i + 1), Style::default().fg(t.text_dim)),
+                Span::styled(line.to_string(), Style::default().fg(t.text)),
+            ])
+        }).collect::<Vec<_>>()
+    } else if let Some(ref content) = app.ws_content {
         let lines: Vec<Line> = content.lines().enumerate().map(|(i, line)| {
             Line::from(vec![
                 Span::styled(format!("{:>4} │ ", i + 1), Style::default().fg(t.text_dim)),
@@ -2746,7 +2753,14 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
         ]
     };
 
-    let file_title = if app.ws_selected < app.ws_files.len() {
+    let file_title = if app.ws_editing {
+        let name = if app.ws_selected < app.ws_files.len() {
+            format!(" ✏ EDITING: {} ", app.ws_files[app.ws_selected].name)
+        } else {
+            " ✏ EDITING ".to_string()
+        };
+        name
+    } else if app.ws_selected < app.ws_files.len() {
         format!(" {} {} ", app.ws_files[app.ws_selected].icon, app.ws_files[app.ws_selected].name)
     } else {
         " File Viewer ".to_string()
@@ -2755,9 +2769,9 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
     let viewer = Paragraph::new(content_text)
         .scroll((app.ws_content_scroll, 0))
         .block(Block::default()
-            .title(Span::styled(file_title, Style::default().fg(t.accent).bold()))
+            .title(Span::styled(file_title, Style::default().fg(if app.ws_editing { t.status_busy } else { t.accent }).bold()))
             .borders(Borders::ALL).border_type(t.border_type)
-            .border_style(Style::default().fg(t.border))
+            .border_style(Style::default().fg(if app.ws_editing { t.status_busy } else { t.border }))
             .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(viewer, split[1]);
 }
@@ -3185,6 +3199,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         },
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
+            Focus::Workspace if app.ws_editing => vec![("^S","save"),("Esc","cancel edit")],
             Focus::Workspace => vec![("⏎","view"),("e","edit"),("r","reload"),("Esc","info"),("1-5","tabs")],
             Focus::Services => vec![("␣","toggle"),("r","reload"),("Esc","info"),("1-5","tabs")],
             _ => vec![("⏎","detail"),("d","check"),("D","fix"),("w","files"),("t","tasks"),("5","svc"),("Tab","chat"),("Esc","back")],
@@ -3568,8 +3583,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Screen::Help => { app.screen = Screen::Dashboard; }
                         Screen::AgentDetail if app.config_text.is_some() => match key.code {
                             KeyCode::Esc => { app.config_text = None; }
-                            KeyCode::PageUp | KeyCode::Up => { app.config_scroll = app.config_scroll.saturating_add(3); }
-                            KeyCode::PageDown | KeyCode::Down => { app.config_scroll = app.config_scroll.saturating_sub(3); }
+                            KeyCode::PageUp | KeyCode::Up => { app.config_scroll = app.config_scroll.saturating_sub(3); }
+                            KeyCode::PageDown | KeyCode::Down => { app.config_scroll = app.config_scroll.saturating_add(3); }
                             _ => { app.config_text = None; }
                         },
                         Screen::AgentDetail => match app.focus {
@@ -3584,7 +3599,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                 }
-                                KeyCode::Char('5') => { app.focus = Focus::Services; app.start_services_load(); }
                                 KeyCode::Char('5') => {} // already here
                                 KeyCode::Up => { if app.svc_selected > 0 { app.svc_selected -= 1; app.svc_detail_scroll = 0; } }
                                 KeyCode::Down => { if app.svc_selected < app.svc_list.len().saturating_sub(1) { app.svc_selected += 1; app.svc_detail_scroll = 0; } }
@@ -3595,7 +3609,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('q') => app.should_quit = true,
                                 _ => {}
                             },
-                            Focus::Workspace => match key.code {
+                            Focus::Workspace => if app.ws_editing {
+                                match key.code {
+                                    KeyCode::Esc => { app.ws_editing = false; }
+                                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => app.start_file_save(),
+                                    KeyCode::Enter => { app.ws_edit_buffer.push('\n'); }
+                                    KeyCode::Backspace => { app.ws_edit_buffer.pop(); }
+                                    KeyCode::Char(c) => { app.ws_edit_buffer.push(c); }
+                                    _ => {}
+                                }
+                            } else { match key.code {
                                 KeyCode::Esc => app.focus = Focus::Fleet,
                                 KeyCode::Tab => app.focus = Focus::Fleet,
                                 KeyCode::Char('1') => app.focus = Focus::Fleet,
@@ -3623,7 +3646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::PageDown => app.ws_content_scroll = app.ws_content_scroll.saturating_sub(5),
                                 KeyCode::Char('q') => app.should_quit = true,
                                 _ => {}
-                            },
+                            }}
                             Focus::AgentChat => if app.ac_visible {
                                 match key.code {
                                     KeyCode::Up => { if app.ac_selected > 0 { app.ac_selected -= 1; } else { app.ac_selected = app.ac_matches.len().saturating_sub(1); } }
@@ -3659,19 +3682,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Tab => app.focus = Focus::AgentChat,
                                 KeyCode::Char('1') => app.focus = Focus::Fleet,
                                 KeyCode::Char('2') => app.focus = Focus::AgentChat,
-                                KeyCode::Char('3') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
-                                KeyCode::Char('w') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
-                                KeyCode::Char('d') => app.start_diagnostics(false),
-                                KeyCode::Char('D') => app.start_diagnostics(true),
+                                KeyCode::Char('3') | KeyCode::Char('w') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
                                 KeyCode::Char('4') | KeyCode::Char('t') => {
                                     app.task_filter_agent = Some(app.agents[app.selected].db_name.clone());
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                 }
-                                KeyCode::Char('q') => app.should_quit = true,
-                                KeyCode::Char('r') => app.start_refresh(),
+                                KeyCode::Char('5') => { app.focus = Focus::Services; app.start_services_load(); }
                                 KeyCode::Char('d') => app.start_diagnostics(false),
                                 KeyCode::Char('D') => app.start_diagnostics(true),
+                                KeyCode::Char('q') => app.should_quit = true,
+                                KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('e') => {
                                     // Fetch remote config (non-blocking)
