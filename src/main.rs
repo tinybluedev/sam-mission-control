@@ -16,6 +16,7 @@ use ratatui::{
     widgets::*,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::stdout;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -155,6 +156,8 @@ struct App {
     detail_info_area: Rect,
     detail_chat_area: Rect,
     fleet_row_start_y: u16,  // Y offset where first agent row starts
+    // Multi-select
+    multi_selected: std::collections::HashSet<usize>,
     // Theme
     theme_name: ThemeName,
     bg_density: BgDensity,
@@ -220,6 +223,7 @@ impl App {
             wizard: wizard::AgentWizard::new(),
             tasks: vec![], task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
+            multi_selected: HashSet::new(),
             spinner_frame: 0, sort_mode: SortMode::Name,
             fleet_area: Rect::default(), chat_area: Rect::default(),
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
@@ -378,9 +382,12 @@ impl App {
             format!(" {} ", spinner_chars[self.spinner_frame])
         } else { String::new() };
         let chat_count = self.chat_history.len();
+        let sel_info = if !self.multi_selected.is_empty() {
+            format!(" │ 🔲 {}", self.multi_selected.len())
+        } else { String::new() };
         self.status_message = format!(
-            "v1.0 │ {}/{} online{} │ sort:{} │ chat({}) │ {}/{} │ /=cmd ?=help",
-            on, total, refresh, self.sort_mode.label(), chat_count,
+            "v1.0 │ {}/{} online{}{} │ sort:{} │ chat({}) │ {}/{} │ /=cmd ?=help",
+            on, total, refresh, sel_info, self.sort_mode.label(), chat_count,
             self.theme_name.label(), self.bg_density.label()
         );
     }
@@ -605,7 +612,8 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             AgentStatus::Online => t.status_online, AgentStatus::Busy => t.status_busy,
             AgentStatus::Offline => t.status_offline, _ => t.text_dim,
         };
-        let cursor = if sel { "▶" } else { " " };
+        let is_multi = app.multi_selected.contains(&i);
+        let cursor = if sel && is_multi { "▶✓" } else if sel { "▶ " } else if is_multi { " ✓" } else { "  " };
         let lat_str = match a.latency_ms {
             Some(ms) => format!("{}ms", ms),
             None => "—".into(),
@@ -904,7 +912,8 @@ fn render_task_board(frame: &mut Frame, app: &App) {
     let rows: Vec<Row> = app.tasks.iter().enumerate().map(|(i, task)| {
         let sel = i == app.task_selected;
         let bg = if sel { t.selected_bg } else { app.bg_density.bg() };
-        let cursor = if sel { "▶" } else { " " };
+        let is_multi = app.multi_selected.contains(&i);
+        let cursor = if sel && is_multi { "▶✓" } else if sel { "▶ " } else if is_multi { " ✓" } else { "  " };
 
         let st_color = match task.status.as_str() {
             "queued" => t.pending,
@@ -1048,6 +1057,9 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("  s", "Sort: name → status → location → version"),
         ("  t", "Task board"),
         ("  v", "VPN mesh status"),
+        ("  Space", "Toggle agent selection"),
+        ("  A (Shift)", "Select all agents"),
+        ("  N (Shift)", "Clear selection"),
         ("  a", "New agent wizard"),
         ("  /", "Fleet command (runs on all agents)"),
         ("  o", "OpenClaw version audit"),
@@ -1490,12 +1502,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // Trigger immediate agent chat load
                                     app.last_chat_poll = Instant::now() - Duration::from_secs(10);
                                 }
+                                KeyCode::Char(' ') => {
+                                    if app.multi_selected.contains(&app.selected) {
+                                        app.multi_selected.remove(&app.selected);
+                                    } else {
+                                        app.multi_selected.insert(app.selected);
+                                    }
+                                    app.next();
+                                }
                                 KeyCode::Char('?') => app.screen = Screen::Help,
                                 KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('c') => app.cycle_theme(),
                                 KeyCode::Char('s') => app.cycle_sort(),
                                 KeyCode::Char('a') => { app.wizard.open(); }
+                                KeyCode::Char('A') => {
+                                    // Select all
+                                    for i in 0..app.agents.len() { app.multi_selected.insert(i); }
+                                    app.status_message = format!("Selected all {} agents", app.agents.len());
+                                }
+                                KeyCode::Char('N') => {
+                                    app.multi_selected.clear();
+                                    app.status_message = "Selection cleared".into();
+                                }
                                 KeyCode::Char('h') => {
                                     // Fleet health summary
                                     let total = app.agents.len();
@@ -1540,7 +1569,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('u') => {
                                     // Bulk update OC on all agents
                                     app.status_message = "🔄 Updating OpenClaw fleet-wide...".into();
-                                    for (_i, agent) in app.agents.iter().enumerate() {
+                                    let targets: Vec<&Agent> = if app.multi_selected.is_empty() {
+                                        app.agents.iter().collect()
+                                    } else {
+                                        app.multi_selected.iter().filter_map(|&i| app.agents.get(i)).collect()
+                                    };
+                                    for agent in targets {
                                         if agent.host == "localhost" || agent.host == app.self_ip { continue; }
                                         let host = agent.host.clone();
                                         let user = agent.ssh_user.clone();
@@ -1595,11 +1629,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         app.focus = Focus::Fleet;
                                         app.status_message = format!("⚡ Running '{}' on all agents...", &cmd);
 
-                                        // Fan out to all online agents
-                                        let agents: Vec<(String, String, String, bool)> = app.agents.iter()
-                                            .filter(|a| a.status == AgentStatus::Online)
-                                            .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac")))
-                                            .collect();
+                                        // Fan out to selected agents (or all online if none selected)
+                                        let agents: Vec<(String, String, String, bool)> = if app.multi_selected.is_empty() {
+                                            app.agents.iter()
+                                                .filter(|a| a.status == AgentStatus::Online)
+                                                .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac")))
+                                                .collect()
+                                        } else {
+                                            app.multi_selected.iter()
+                                                .filter_map(|&i| app.agents.get(i))
+                                                .filter(|a| a.status == AgentStatus::Online)
+                                                .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac")))
+                                                .collect()
+                                        };
 
                                         if let Some(pool) = &app.db_pool {
                                             let user = app.user();
