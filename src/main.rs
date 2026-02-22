@@ -105,6 +105,13 @@ impl AlertSeverity {
     }
 }
 
+/// Events sent from background tasks to the main event loop.
+#[derive(Debug)]
+enum AppEvent {
+    /// A fleet-health alert: (agent db_name, human-readable reason).
+    AgentAlert(String, String),
+}
+
 #[derive(Clone, Debug)]
 struct ChatLine {
     sender: String,
@@ -354,6 +361,9 @@ struct App {
     ac_matches: Vec<String>,
     ac_selected: usize,
     ac_start_pos: usize,  // cursor position of the '@'
+    // Health watch (proactive fleet monitoring)
+    health_alert_rx: Option<mpsc::UnboundedReceiver<AppEvent>>,
+    unread_alerts: usize,
 }
 
 impl App {
@@ -437,6 +447,7 @@ impl App {
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
+            health_alert_rx: None, unread_alerts: 0,
         }
     }
 
@@ -2021,8 +2032,14 @@ SAMEOF", path, path, escaped_content);
 
     fn check_alerts(&mut self) {
         let now = now_str();
+        let cpu_threshold = std::env::var("ALERT_CPU_THRESHOLD")
+            .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(90.0);
+        let ram_threshold = std::env::var("ALERT_RAM_THRESHOLD")
+            .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(90.0);
+        let alert_offline = std::env::var("ALERT_OFFLINE")
+            .map(|v| v != "false" && v != "0").unwrap_or(true);
         for a in &self.agents {
-            if a.status == AgentStatus::Offline && !a.last_seen.is_empty() {
+            if alert_offline && a.status == AgentStatus::Offline && !a.last_seen.is_empty() {
                 // Only alert if we haven't recently alerted for this agent
                 let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("offline"));
                 if !already {
@@ -2032,6 +2049,21 @@ SAMEOF", path, path, escaped_content);
                         severity: AlertSeverity::Critical,
                     });
                     self.alert_flash = Some(Instant::now());
+                    self.unread_alerts += 1;
+                }
+            }
+            if let Some(cpu) = a.cpu_pct {
+                if cpu > cpu_threshold {
+                    let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("CPU"));
+                    if !already {
+                        self.alerts.push(Alert {
+                            time: now.clone(), created_at: Instant::now(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
+                            message: format!("{} CPU at {:.0}%", a.name, cpu),
+                            severity: AlertSeverity::Warning,
+                        });
+                        self.alert_flash = Some(Instant::now());
+                        self.unread_alerts += 1;
+                    }
                 }
             }
             if let Some(disk) = a.disk_pct {
@@ -2044,11 +2076,12 @@ SAMEOF", path, path, escaped_content);
                             severity: AlertSeverity::Warning,
                         });
                         self.alert_flash = Some(Instant::now());
+                        self.unread_alerts += 1;
                     }
                 }
             }
             if let Some(ram) = a.ram_pct {
-                if ram > 90.0 {
+                if ram > ram_threshold {
                     let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("RAM"));
                     if !already {
                         self.alerts.push(Alert {
@@ -2057,6 +2090,7 @@ SAMEOF", path, path, escaped_content);
                             severity: AlertSeverity::Warning,
                         });
                         self.alert_flash = Some(Instant::now());
+                        self.unread_alerts += 1;
                     }
                 }
             }
@@ -2086,6 +2120,81 @@ SAMEOF", path, path, escaped_content);
             on, total, refresh, sel_info, alert_info, self.sort_mode.label(), chat_count,
             self.theme_name.label(), self.bg_density.label()
         );
+    }
+
+    /// Spawn an independent background task that probes fleet health every 60s
+    /// and sends `AppEvent::AgentAlert` events via channel regardless of TUI activity.
+    fn start_health_watch(&mut self) {
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        self.health_alert_rx = Some(rx);
+
+        let agents: Vec<(String, String, String)> = self.agents.iter()
+            .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone()))
+            .collect();
+        let self_ip = self.self_ip.clone();
+        let cpu_threshold = std::env::var("ALERT_CPU_THRESHOLD")
+            .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(90.0);
+        let ram_threshold = std::env::var("ALERT_RAM_THRESHOLD")
+            .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(90.0);
+        let alert_offline = std::env::var("ALERT_OFFLINE")
+            .map(|v| v != "false" && v != "0").unwrap_or(true);
+
+        tokio::spawn(async move {
+            let mut prev_statuses: std::collections::HashMap<String, AgentStatus> =
+                std::collections::HashMap::new();
+            // Track per-agent alerts that have already been sent to avoid redundant events.
+            let mut alerted_cpu: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut alerted_ram: std::collections::HashSet<String> = std::collections::HashSet::new();
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                // Probe all agents concurrently so that a slow agent does not delay others.
+                let probe_tx = tx.clone();
+                let (result_tx, mut result_rx) = mpsc::unbounded_channel::<(String, AgentStatus, Option<f32>, Option<f32>)>();
+                for (db_name, host, user) in &agents {
+                    let rtx = result_tx.clone();
+                    let (n, h, u, sip) = (db_name.clone(), host.clone(), user.clone(), self_ip.clone());
+                    tokio::spawn(async move {
+                        let (status, _, _, _, _, cpu, ram, _, _, _) =
+                            probe_agent(&h, &u, &sip, false).await;
+                        let _ = rtx.send((n, status, cpu, ram));
+                    });
+                }
+                drop(result_tx); // close the sender side so the channel drains
+                while let Some((db_name, status, cpu, ram)) = result_rx.recv().await {
+                    // Detect Online/Busy → Offline transition
+                    if alert_offline {
+                        let was_up = prev_statuses.get(db_name.as_str())
+                            .map(|s| matches!(s, AgentStatus::Online | AgentStatus::Busy))
+                            .unwrap_or(false);
+                        if was_up && matches!(status, AgentStatus::Offline) {
+                            let _ = probe_tx.send(AppEvent::AgentAlert(
+                                db_name.clone(), "went offline".into()));
+                        }
+                    }
+                    if let Some(p) = cpu {
+                        if p > cpu_threshold {
+                            if alerted_cpu.insert(db_name.clone()) {
+                                let _ = probe_tx.send(AppEvent::AgentAlert(
+                                    db_name.clone(), format!("CPU at {:.0}%", p)));
+                            }
+                        } else {
+                            alerted_cpu.remove(&db_name);
+                        }
+                    }
+                    if let Some(p) = ram {
+                        if p > ram_threshold {
+                            if alerted_ram.insert(db_name.clone()) {
+                                let _ = probe_tx.send(AppEvent::AgentAlert(
+                                    db_name.clone(), format!("RAM at {:.0}%", p)));
+                            }
+                        } else {
+                            alerted_ram.remove(&db_name);
+                        }
+                    }
+                    prev_statuses.insert(db_name, status);
+                }
+            }
+        });
     }
 }
 
@@ -2656,7 +2765,9 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         Span::styled(if live { "● live" } else { "○ stale" }, Style::default().fg(if live { t.status_online } else { t.status_offline })),
         Span::raw("    "),
         Span::styled(if app.refreshing { "⟳ refreshing" } else { "" }, Style::default().fg(t.accent)),
-        if app.alert_flash.map(|f| f.elapsed() < Duration::from_secs(5)).unwrap_or(false) {
+        if app.unread_alerts > 0 {
+            Span::styled(format!("  ⚠ {}", app.unread_alerts), Style::default().fg(t.status_offline).bold())
+        } else if app.alert_flash.map(|f| f.elapsed() < Duration::from_secs(5)).unwrap_or(false) {
             Span::styled("  ⚠️ NEW ALERT", Style::default().fg(t.status_offline).bold())
         } else { Span::raw("") },
         Span::raw("    "),
@@ -4121,8 +4232,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(fleet_config).await;
     app.update_status_bar();
+    app.start_health_watch();
 
     loop {
+        // Drain health watch events (background proactive monitoring)
+        {
+            let mut events = vec![];
+            if let Some(ref mut rx) = app.health_alert_rx {
+                while let Ok(ev) = rx.try_recv() { events.push(ev); }
+            }
+            for AppEvent::AgentAlert(db_name, reason) in events {
+                let (name, emoji) = app.agents.iter()
+                    .find(|a| a.db_name == db_name)
+                    .map(|a| (a.name.clone(), a.emoji.clone()))
+                    .unwrap_or_else(|| (db_name.clone(), "🤖".into()));
+                let severity = if reason.contains("offline") {
+                    AlertSeverity::Critical
+                } else {
+                    AlertSeverity::Warning
+                };
+                let already = app.alerts.iter()
+                    .any(|al| al.agent == db_name && al.message.contains(reason.as_str()));
+                if !already {
+                    if severity == AlertSeverity::Critical {
+                        // Terminal bell to alert operator even when TUI is idle
+                        use std::io::Write;
+                        print!("\x07");
+                        let _ = std::io::stdout().flush();
+                    }
+                    app.alerts.push(Alert {
+                        time: now_str(), created_at: Instant::now(),
+                        agent: db_name, emoji,
+                        message: format!("{} {}", name, reason),
+                        severity,
+                    });
+                    app.alert_flash = Some(Instant::now());
+                    app.unread_alerts += 1;
+                    app.update_status_bar();
+                }
+            }
+        }
+
         // Drain background probe results (non-blocking)
         let updates = app.drain_refresh_results();
         if !updates.is_empty() {
@@ -4947,6 +5097,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('w') => {
                                     app.screen = Screen::Alerts;
                                     app.alerts_scroll = 0;
+                                    app.unread_alerts = 0;
                                 }
                                 KeyCode::Char('v') => {
                                     app.screen = Screen::VpnStatus;
