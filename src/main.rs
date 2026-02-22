@@ -3872,7 +3872,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Dashboard => match app.focus {
             Focus::Chat => vec![("Tab","fleet"),("⏎","send"),("@","target"),("Esc","back")],
             Focus::Command => vec![("⏎","run"),("Esc","cancel")],
-            _ => vec![("⏎","open"),("d","check"),("D","fix"),("t","tasks"),("f","filter"),("s","sort"),("r","refresh"),("?","help"),("q","quit")],
+            _ => vec![("⏎","open"),("d","check"),("D","fix"),("U","update"),("u","update all"),("t","tasks"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
         },
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
