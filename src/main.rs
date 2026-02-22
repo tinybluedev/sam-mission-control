@@ -267,6 +267,7 @@ struct App {
     agent_chat_scroll: u16,
     refresh_rx: Option<mpsc::UnboundedReceiver<ProbeResult>>,
     refreshing: bool,
+    refresh_cycle: u32,
     self_ip: String,
     // Fleet command
     command_input: String,
@@ -336,6 +337,8 @@ struct App {
     // Background chat poll
     chat_poll_rx: Option<mpsc::UnboundedReceiver<ChatPollResult>>,
     chat_polling: bool,
+    // Wizard SSH test (background)
+    wizard_ssh_rx: Option<mpsc::UnboundedReceiver<String>>,
     // Autocomplete
     ac_visible: bool,
     ac_matches: Vec<String>,
@@ -403,7 +406,7 @@ impl App {
             db_pool: Some(pool),
             chat_input: String::new(), chat_history, chat_scroll: 0,
             agent_chat_input: String::new(), agent_chat_history: vec![], agent_chat_scroll: 0,
-            refresh_rx: None, refreshing: false, self_ip,
+            refresh_rx: None, refreshing: false, refresh_cycle: 0, self_ip,
             command_input: String::new(),
             wizard: wizard::AgentWizard::new(),
             tasks: vec![], task_filter_agent: None, task_selected: 0, task_input: String::new(), task_input_active: false,
@@ -421,7 +424,8 @@ impl App {
             diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
-            ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
+            ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
+            ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
         }
     }
 
@@ -734,8 +738,9 @@ impl App {
             kind: "direct".into(),
         });
 
-        // Store in DB
+        // Store in DB (fire-and-forget, get ID via channel)
         let msg_id = if let Some(pool) = &self.db_pool {
+            // Quick inline await is fine — single INSERT is <1ms on LAN MySQL
             db::send_chat(pool, &self.user(), Some(&target), &message).await.unwrap_or(0)
         } else { 0 };
 
@@ -1433,6 +1438,7 @@ SAMEOF", path, path, escaped_content);
     fn start_refresh(&mut self) {
         if self.refreshing { return; }
         self.refreshing = true;
+        self.refresh_cycle += 1;
         self.last_refresh = Instant::now();
         let (tx, rx) = mpsc::unbounded_channel();
         self.refresh_rx = Some(rx);
@@ -1440,8 +1446,9 @@ SAMEOF", path, path, escaped_content);
         for (i, a) in self.agents.iter().enumerate() {
             let (host, user, sip) = (a.host.clone(), a.ssh_user.clone(), self.self_ip.clone());
             let tx = tx.clone();
+            let full = self.refresh_cycle % 5 == 0; // full probe every 5th cycle
             tokio::spawn(async move {
-                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx) = probe_agent(&host, &user, &sip).await;
+                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx) = probe_agent(&host, &user, &sip, full).await;
                 let _ = tx.send(ProbeResult { index: i, status, os, kernel: kern, oc_version: oc, latency_ms: lat, cpu_pct: cpu, ram_pct: ram, disk_pct: disk, activity: act, context_pct: ctx });
             });
         }
@@ -1561,8 +1568,21 @@ SAMEOF", path, path, escaped_content);
 
 // ---- SSH Probe ----
 
-async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, String, String, String, Option<u32>, Option<f32>, Option<f32>, Option<f32>, String, Option<f32>) {
+async fn probe_agent(host: &str, user: &str, self_ip: &str, full: bool) -> (AgentStatus, String, String, String, Option<u32>, Option<f32>, Option<f32>, Option<f32>, String, Option<f32>) {
     let start = Instant::now();
+    // Fast probe: just SSH echo (connectivity + latency only)
+    if !full && host != "localhost" && host != self_ip {
+        let tgt = format!("{}@{}", user, host);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            Command::new("ssh").args(["-o","ConnectTimeout=1","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"echo","ok"]).output()
+        ).await;
+        let ms = start.elapsed().as_millis() as u32;
+        return match result {
+            Ok(Ok(o)) if o.status.success() => (AgentStatus::Online, String::new(), String::new(), String::new(), Some(ms), None, None, None, String::new(), None),
+            _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None),
+        };
+    }
     if host == "localhost" || host == self_ip {
         let os = Command::new("bash").args(["-c", ". /etc/os-release 2>/dev/null && echo \"$NAME $VERSION_ID\" || echo unknown"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         let kern = Command::new("uname").arg("-r").output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
@@ -3526,22 +3546,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let user = app.wizard.ssh_user.clone();
                                     app.wizard.testing_ssh = true;
                                     app.wizard.ssh_result = Some("Testing...".into());
-                                    let result = tokio::process::Command::new("ssh")
-                                        .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                            &format!("{}@{}", user, host), "hostname && openclaw --version 2>/dev/null || echo 'OC not found'"])
-                                        .output().await;
-                                    app.wizard.testing_ssh = false;
-                                    match result {
-                                        Ok(o) if o.status.success() => {
-                                            app.wizard.ssh_result = Some(format!("✅ {}", String::from_utf8_lossy(&o.stdout).trim()));
-                                        }
-                                        Ok(o) => {
-                                            app.wizard.ssh_result = Some(format!("❌ {}", String::from_utf8_lossy(&o.stderr).trim().chars().take(60).collect::<String>()));
-                                        }
-                                        Err(e) => {
-                                            app.wizard.ssh_result = Some(format!("❌ {}", e));
-                                        }
-                                    }
+                                    let (tx, rx) = mpsc::unbounded_channel();
+                                    app.wizard_ssh_rx = Some(rx);
+                                    tokio::spawn(async move {
+                                        let result = tokio::process::Command::new("ssh")
+                                            .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                &format!("{}@{}", user, host), "hostname && openclaw --version 2>/dev/null || echo 'OC not found'"])
+                                            .output().await;
+                                        let msg = match result {
+                                            Ok(o) if o.status.success() => format!("✅ {}", String::from_utf8_lossy(&o.stdout).trim()),
+                                            Ok(o) => format!("❌ {}", String::from_utf8_lossy(&o.stderr).trim().chars().take(60).collect::<String>()),
+                                            Err(e) => format!("❌ {}", e),
+                                        };
+                                        let _ = tx.send(msg);
+                                    });
                                 } else {
                                     // Tab = skip/advance
                                     app.wizard.advance();
@@ -3770,8 +3788,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             app.task_input.clear();
                                             app.task_input_active = false;
                                             if let Some(pool) = &app.db_pool {
-                                                let agent = app.task_filter_agent.as_deref(); let _ = db::create_task(pool, &desc, 5, &app.user(), agent).await;
-if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
+                                                let pool = pool.clone();
+                                                let agent = app.task_filter_agent.clone();
+                                                let user = app.user();
+                                                tokio::spawn(async move {
+                                                    let _ = db::create_task(&pool, &desc, 5, &user, agent.as_deref()).await;
+                                                });
+                                                // Trigger re-poll on next tick
+                                                app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                             }
                                             app.toast("✓ Task created");
                                         }
@@ -3804,8 +3828,15 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                         if let Some(task) = app.tasks.get(app.task_selected) {
                                             let tid = task.id;
                                             if let Some(pool) = &app.db_pool {
-                                                let _ = db::update_task_status(pool, tid, "completed").await;
-                                                if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
+                                                let pool = pool.clone();
+                                                tokio::spawn(async move {
+                                                    let _ = db::update_task_status(&pool, tid, "completed").await;
+                                                });
+                                                // Mark completed locally (optimistic)
+                                                if let Some(t) = app.tasks.get_mut(app.task_selected) {
+                                                    t.status = "completed".into();
+                                                }
+                                                app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                             }
                                         }
                                     }
@@ -4152,6 +4183,15 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                         // Keep overlay open for user to see results
                     }
                 }
+            }
+        }
+
+        // Receive wizard SSH test result (non-blocking)
+        if let Some(ref mut rx) = app.wizard_ssh_rx {
+            if let Ok(result) = rx.try_recv() {
+                app.wizard.testing_ssh = false;
+                app.wizard.ssh_result = Some(result);
+                app.wizard_ssh_rx = None;
             }
         }
 
