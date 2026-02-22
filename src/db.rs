@@ -56,18 +56,18 @@ pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error>
     let agents = rows.into_iter().map(|r| {
         use mysql_async::prelude::FromValue;
         DbAgent {
-            agent_name: r.get(0).unwrap_or_default(),
+            agent_name: r.get::<Option<String>, _>(0).flatten().unwrap_or_default(),
             hostname: r.get(1),
             tailscale_ip: r.get(2),
-            status: r.get::<String, _>(3).unwrap_or_else(|| "unknown".into()),
+            status: r.get::<Option<String>, _>(3).flatten().unwrap_or_else(|| "unknown".into()),
             oc_version: r.get(4),
             os_info: r.get(5),
             kernel: r.get(6),
             capabilities: r.get(7),
-            token_burn_today: r.get(8).unwrap_or(0),
-            uptime_seconds: r.get(9).unwrap_or(0),
+            token_burn_today: r.get::<Option<i32>, _>(8).flatten().unwrap_or(0),
+            uptime_seconds: r.get::<Option<i64>, _>(9).flatten().unwrap_or(0),
             current_task_id: r.get(10),
-            gateway_port: r.get(11).unwrap_or(18789),
+            gateway_port: r.get::<Option<i32>, _>(11).flatten().unwrap_or(18789),
             gateway_token: r.get(12),
         }
     }).collect();
