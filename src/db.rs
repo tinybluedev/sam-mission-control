@@ -54,21 +54,20 @@ pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error>
         "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token FROM mc_fleet_status ORDER BY agent_name",
     ).await?;
     let agents = rows.into_iter().map(|r| {
-        use mysql_async::prelude::FromValue;
         DbAgent {
             agent_name: r.get::<Option<String>, _>(0).flatten().unwrap_or_default(),
-            hostname: r.get(1),
-            tailscale_ip: r.get(2),
+            hostname: r.get::<Option<String>, _>(1).flatten(),
+            tailscale_ip: r.get::<Option<String>, _>(2).flatten(),
             status: r.get::<Option<String>, _>(3).flatten().unwrap_or_else(|| "unknown".into()),
-            oc_version: r.get(4),
-            os_info: r.get(5),
-            kernel: r.get(6),
-            capabilities: r.get(7),
+            oc_version: r.get::<Option<String>, _>(4).flatten(),
+            os_info: r.get::<Option<String>, _>(5).flatten(),
+            kernel: r.get::<Option<String>, _>(6).flatten(),
+            capabilities: r.get::<Option<String>, _>(7).flatten(),
             token_burn_today: r.get::<Option<i32>, _>(8).flatten().unwrap_or(0),
             uptime_seconds: r.get::<Option<i64>, _>(9).flatten().unwrap_or(0),
-            current_task_id: r.get(10),
+            current_task_id: r.get::<Option<i32>, _>(10).flatten(),
             gateway_port: r.get::<Option<i32>, _>(11).flatten().unwrap_or(18789),
-            gateway_token: r.get(12),
+            gateway_token: r.get::<Option<String>, _>(12).flatten(),
         }
     }).collect();
     Ok(agents)
