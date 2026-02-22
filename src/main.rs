@@ -79,7 +79,7 @@ struct ChatLine {
 }
 
 #[derive(PartialEq, Clone)]
-enum Focus { Fleet, Chat, AgentChat }
+enum Focus { Fleet, Chat, AgentChat, Command }
 
 #[derive(PartialEq)]
 enum Screen { Dashboard, AgentDetail, TaskBoard, VpnStatus, Help }
@@ -132,6 +132,8 @@ struct App {
     refresh_rx: Option<mpsc::UnboundedReceiver<ProbeResult>>,
     refreshing: bool,
     self_ip: String,
+    // Fleet command
+    command_input: String,
     // Wizard
     wizard: wizard::AgentWizard,
     // Task board
@@ -209,6 +211,7 @@ impl App {
             chat_input: String::new(), chat_history, chat_scroll: 0,
             agent_chat_input: String::new(), agent_chat_history: vec![], agent_chat_scroll: 0,
             refresh_rx: None, refreshing: false, self_ip,
+            command_input: String::new(),
             wizard: wizard::AgentWizard::new(),
             tasks: vec![], task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
@@ -646,19 +649,23 @@ fn render_chat_panel(frame: &mut Frame, app: &App, area: Rect, active: bool, age
 
     let prompt = if agent_mode {
         format!(" @{} › ", app.agents[app.selected].db_name)
+    } else if app.focus == Focus::Command {
+        " ⚡ fleet command (runs on all agents) ⏎ ".to_string()
     } else if active {
         " broadcast to all ⏎ ".to_string()
     } else {
         " Tab to chat ".to_string()
     };
 
+    let display_text = if !agent_mode && app.focus == Focus::Command { &app.command_input } else { input_text };
+    let is_active = active || (!agent_mode && app.focus == Focus::Command);
     let input = Paragraph::new(Line::from(vec![
         Span::styled(" › ", Style::default().fg(t.accent)),
-        Span::styled(input_text.as_str(), Style::default().fg(t.text)),
-        if active { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
+        Span::styled(display_text, Style::default().fg(t.text)),
+        if is_active { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
     ])).block(Block::default().title(prompt)
         .borders(Borders::ALL).border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if active { t.border_active } else { t.border }))
+        .border_style(Style::default().fg(if is_active { t.border_active } else { t.border }))
         .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(input, cl[1]);
 }
@@ -1386,6 +1393,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('c') => app.cycle_theme(),
                                 KeyCode::Char('s') => app.cycle_sort(),
                                 KeyCode::Char('a') => { app.wizard.open(); }
+                                KeyCode::Char('/') => {
+                                    app.focus = Focus::Command;
+                                    app.command_input.clear();
+                                }
                                 KeyCode::Char('o') => {
                                     // OpenClaw fleet operations menu
                                     app.status_message = "⏳ Running OC audit...".into();
@@ -1449,6 +1460,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                 }
+                                _ => {}
+                            },
+                            Focus::Command => match key.code {
+                                KeyCode::Esc => { app.focus = Focus::Fleet; app.command_input.clear(); }
+                                KeyCode::Enter => {
+                                    if !app.command_input.trim().is_empty() {
+                                        let cmd = app.command_input.clone();
+                                        app.command_input.clear();
+                                        app.focus = Focus::Fleet;
+                                        app.status_message = format!("⚡ Running '{}' on all agents...", &cmd);
+
+                                        // Fan out to all online agents
+                                        let agents: Vec<(String, String, String, bool)> = app.agents.iter()
+                                            .filter(|a| a.status == AgentStatus::Online)
+                                            .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac")))
+                                            .collect();
+
+                                        if let Some(pool) = &app.db_pool {
+                                            let user = app.user();
+                                            for (name, host, ssh_user, is_mac) in agents {
+                                                let pool = pool.clone();
+                                                let cmd = cmd.clone();
+                                                let user = user.clone();
+                                                let self_ip = app.self_ip.clone();
+                                                tokio::spawn(async move {
+                                                    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                                    let full_cmd = format!("{}{}", pfx, cmd);
+
+                                                    let output = if host == "localhost" || host == self_ip {
+                                                        tokio::process::Command::new("bash").args(["-c", &cmd])
+                                                            .output().await.ok()
+                                                    } else {
+                                                        tokio::time::timeout(
+                                                            std::time::Duration::from_secs(10),
+                                                            tokio::process::Command::new("ssh")
+                                                                .args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                                    &format!("{}@{}", ssh_user, host), &full_cmd])
+                                                                .output()
+                                                        ).await.ok().and_then(|r| r.ok())
+                                                    };
+
+                                                    let response = match output {
+                                                        Some(o) => {
+                                                            let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                                            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                                                            if out.is_empty() && err.is_empty() { "(no output)".into() }
+                                                            else if out.is_empty() { err.chars().take(500).collect::<String>() }
+                                                            else { out.chars().take(500).collect::<String>() }
+                                                        }
+                                                        None => "Timeout/error".into(),
+                                                    };
+
+                                                    // Write result to mc_chat
+                                                    let _ = crate::db::send_direct(&pool, &user, &name, &format!("/{}", cmd)).await;
+                                                    // Update the last message with the response
+                                                    if let Ok(mut conn) = pool.get_conn().await {
+                                                        use mysql_async::prelude::*;
+                                                        let _ = conn.exec_drop(
+                                                            "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                                                            (&response, &user, &name),
+                                                        ).await;
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Backspace => { app.command_input.pop(); }
+                                KeyCode::Char(ch) => app.command_input.push(ch),
                                 _ => {}
                             },
                             Focus::Chat => match key.code {
