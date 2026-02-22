@@ -5,6 +5,7 @@
 //! `matrix`, `sunset`, `arctic`.
 
 use ratatui::prelude::*;
+use ratatui::widgets::BorderType;
 
 // ---- Background Density ----
 
@@ -65,6 +66,8 @@ pub enum ThemeName {
     Matrix,     // Green on black
     Sunset,     // Warm orange/red/purple
     Arctic,     // Cool blue/white/silver
+    Ocean,      // Blue/teal/white
+    Ember,      // Orange/red/dark
 }
 
 impl ThemeName {
@@ -77,7 +80,9 @@ impl ThemeName {
             Self::Cyber2077 => Self::Matrix,
             Self::Matrix => Self::Sunset,
             Self::Sunset => Self::Arctic,
-            Self::Arctic => Self::Standard,
+            Self::Arctic => Self::Ocean,
+            Self::Ocean => Self::Ember,
+            Self::Ember => Self::Standard,
         }
     }
 
@@ -91,6 +96,8 @@ impl ThemeName {
             Self::Matrix => "matrix",
             Self::Sunset => "sunset",
             Self::Arctic => "arctic",
+            Self::Ocean => "ocean",
+            Self::Ember => "ember",
         }
     }
 }
@@ -119,6 +126,7 @@ pub struct Theme {
     pub version: Color,
     pub pending: Color,        // Awaiting response
     pub header_title: Color,
+    pub border_type: BorderType, // Border style for this theme
 }
 
 impl Theme {
@@ -133,6 +141,8 @@ impl Theme {
             ThemeName::Matrix => Self::matrix(light),
             ThemeName::Sunset => Self::sunset(light),
             ThemeName::Arctic => Self::arctic(light),
+            ThemeName::Ocean => Self::ocean(light),
+            ThemeName::Ember => Self::ember(light),
         }
     }
 
@@ -159,6 +169,7 @@ impl Theme {
             version: Color::Rgb(120, 200, 220),
             pending: Color::Rgb(100, 100, 120),
             header_title: Color::Rgb(80, 200, 255),
+            border_type: BorderType::Rounded,
         }
     }
 
@@ -185,6 +196,7 @@ impl Theme {
             version: Color::Rgb(0, 100, 160),
             pending: Color::Rgb(140, 140, 160),
             header_title: Color::Rgb(0, 120, 180),
+            border_type: BorderType::Rounded,
         }
     }
 
@@ -211,6 +223,7 @@ impl Theme {
             version: Color::Rgb(180, 180, 180),
             pending: Color::Rgb(80, 80, 80),
             header_title: Color::White,
+            border_type: BorderType::Plain,
         }
     }
 
@@ -237,6 +250,7 @@ impl Theme {
             version: Color::Rgb(60, 60, 60),
             pending: Color::Rgb(140, 140, 140),
             header_title: Color::Black,
+            border_type: BorderType::Plain,
         }
     }
 
@@ -264,6 +278,7 @@ impl Theme {
                 version: Color::Rgb(140, 70, 0),
                 pending: Color::Rgb(160, 140, 110),
                 header_title: Color::Rgb(160, 80, 0),
+                border_type: BorderType::Plain,
             }
         } else {
             Self {
@@ -288,6 +303,7 @@ impl Theme {
                 version: Color::Rgb(220, 140, 40),
                 pending: Color::Rgb(120, 90, 50),
                 header_title: Color::Rgb(255, 170, 50),
+                border_type: BorderType::Plain,
             }
         }
     }
@@ -316,6 +332,7 @@ impl Theme {
                 version: Color::Rgb(0, 160, 200),
                 pending: Color::Rgb(140, 120, 160),
                 header_title: Color::Rgb(200, 0, 120),
+                border_type: BorderType::Thick,
             }
         } else {
             Self {
@@ -340,6 +357,7 @@ impl Theme {
                 version: Color::Rgb(0, 255, 255),
                 pending: Color::Rgb(100, 80, 120),
                 header_title: Color::Rgb(255, 0, 150),
+                border_type: BorderType::Thick,
             }
         }
     }
@@ -368,6 +386,7 @@ impl Theme {
                 version: Color::Rgb(0, 100, 0),
                 pending: Color::Rgb(80, 140, 80),
                 header_title: Color::Rgb(0, 120, 0),
+                border_type: BorderType::Plain,
             }
         } else {
             Self {
@@ -392,6 +411,7 @@ impl Theme {
                 version: Color::Rgb(0, 200, 0),
                 pending: Color::Rgb(0, 80, 0),
                 header_title: Color::Rgb(0, 255, 0),
+                border_type: BorderType::Plain,
             }
         }
     }
@@ -420,6 +440,7 @@ impl Theme {
                 version: Color::Rgb(180, 80, 120),
                 pending: Color::Rgb(160, 130, 120),
                 header_title: Color::Rgb(200, 60, 40),
+                border_type: BorderType::Rounded,
             }
         } else {
             Self {
@@ -444,6 +465,7 @@ impl Theme {
                 version: Color::Rgb(255, 80, 160),
                 pending: Color::Rgb(120, 80, 60),
                 header_title: Color::Rgb(255, 100, 50),
+                border_type: BorderType::Rounded,
             }
         }
     }
@@ -472,6 +494,7 @@ impl Theme {
                 version: Color::Rgb(60, 120, 180),
                 pending: Color::Rgb(120, 140, 160),
                 header_title: Color::Rgb(0, 80, 160),
+                border_type: BorderType::Rounded,
             }
         } else {
             Self {
@@ -496,6 +519,115 @@ impl Theme {
                 version: Color::Rgb(180, 210, 255),
                 pending: Color::Rgb(80, 100, 130),
                 header_title: Color::Rgb(120, 180, 255),
+                border_type: BorderType::Rounded,
+            }
+        }
+    }
+
+    fn ocean(light: bool) -> Self {
+        if light {
+            Self {
+                accent: Color::Rgb(0, 130, 160),
+                accent2: Color::Rgb(0, 170, 190),
+                text: Color::Rgb(10, 40, 60),
+                text_dim: Color::Rgb(80, 130, 150),
+                text_bold: Color::Rgb(0, 100, 130),
+                border: Color::Rgb(160, 210, 220),
+                border_active: Color::Rgb(0, 130, 160),
+                selected_bg: Color::Rgb(200, 235, 240),
+                sender_self: Color::Rgb(0, 130, 160),
+                sender_other: Color::Rgb(0, 160, 140),
+                response: Color::Rgb(0, 140, 120),
+                status_online: Color::Rgb(0, 160, 100),
+                status_busy: Color::Rgb(180, 150, 0),
+                status_offline: Color::Rgb(160, 40, 40),
+                loc_home: Color::Rgb(0, 140, 100),
+                loc_sm: Color::Rgb(160, 130, 0),
+                loc_vps: Color::Rgb(80, 60, 160),
+                loc_mobile: Color::Rgb(0, 120, 180),
+                version: Color::Rgb(0, 160, 180),
+                pending: Color::Rgb(100, 150, 160),
+                header_title: Color::Rgb(0, 130, 160),
+                border_type: BorderType::Rounded,
+            }
+        } else {
+            Self {
+                accent: Color::Rgb(0, 200, 230),
+                accent2: Color::Rgb(0, 230, 200),
+                text: Color::Rgb(200, 235, 240),
+                text_dim: Color::Rgb(60, 110, 130),
+                text_bold: Color::White,
+                border: Color::Rgb(20, 60, 80),
+                border_active: Color::Rgb(0, 200, 230),
+                selected_bg: Color::Rgb(10, 40, 60),
+                sender_self: Color::Rgb(0, 230, 200),
+                sender_other: Color::Rgb(0, 200, 230),
+                response: Color::Rgb(0, 180, 210),
+                status_online: Color::Rgb(0, 230, 160),
+                status_busy: Color::Rgb(220, 200, 60),
+                status_offline: Color::Rgb(200, 70, 70),
+                loc_home: Color::Rgb(0, 220, 160),
+                loc_sm: Color::Rgb(200, 190, 60),
+                loc_vps: Color::Rgb(140, 100, 230),
+                loc_mobile: Color::Rgb(60, 180, 240),
+                version: Color::Rgb(0, 210, 230),
+                pending: Color::Rgb(60, 110, 130),
+                header_title: Color::Rgb(0, 200, 230),
+                border_type: BorderType::Rounded,
+            }
+        }
+    }
+
+    fn ember(light: bool) -> Self {
+        if light {
+            Self {
+                accent: Color::Rgb(200, 80, 20),
+                accent2: Color::Rgb(220, 120, 0),
+                text: Color::Rgb(60, 25, 10),
+                text_dim: Color::Rgb(160, 110, 80),
+                text_bold: Color::Rgb(180, 60, 0),
+                border: Color::Rgb(210, 175, 155),
+                border_active: Color::Rgb(200, 80, 20),
+                selected_bg: Color::Rgb(245, 220, 200),
+                sender_self: Color::Rgb(200, 80, 20),
+                sender_other: Color::Rgb(180, 100, 0),
+                response: Color::Rgb(160, 80, 0),
+                status_online: Color::Rgb(100, 150, 0),
+                status_busy: Color::Rgb(220, 140, 0),
+                status_offline: Color::Rgb(180, 20, 0),
+                loc_home: Color::Rgb(100, 140, 0),
+                loc_sm: Color::Rgb(200, 130, 0),
+                loc_vps: Color::Rgb(160, 40, 100),
+                loc_mobile: Color::Rgb(0, 110, 170),
+                version: Color::Rgb(200, 100, 0),
+                pending: Color::Rgb(170, 130, 100),
+                header_title: Color::Rgb(200, 80, 20),
+                border_type: BorderType::Double,
+            }
+        } else {
+            Self {
+                accent: Color::Rgb(255, 120, 40),
+                accent2: Color::Rgb(255, 80, 30),
+                text: Color::Rgb(240, 200, 170),
+                text_dim: Color::Rgb(110, 65, 35),
+                text_bold: Color::Rgb(255, 180, 80),
+                border: Color::Rgb(80, 35, 15),
+                border_active: Color::Rgb(255, 120, 40),
+                selected_bg: Color::Rgb(55, 25, 10),
+                sender_self: Color::Rgb(255, 200, 80),
+                sender_other: Color::Rgb(255, 100, 50),
+                response: Color::Rgb(220, 80, 30),
+                status_online: Color::Rgb(200, 220, 60),
+                status_busy: Color::Rgb(255, 160, 20),
+                status_offline: Color::Rgb(160, 30, 10),
+                loc_home: Color::Rgb(200, 210, 60),
+                loc_sm: Color::Rgb(255, 150, 20),
+                loc_vps: Color::Rgb(210, 70, 160),
+                loc_mobile: Color::Rgb(80, 160, 240),
+                version: Color::Rgb(255, 140, 40),
+                pending: Color::Rgb(110, 65, 35),
+                header_title: Color::Rgb(255, 120, 40),
+                border_type: BorderType::Double,
             }
         }
     }
