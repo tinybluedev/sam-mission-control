@@ -7,7 +7,7 @@ mod theme;
 use clap::Parser;
 use dotenvy;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, MouseEvent, MouseEventKind, MouseButton},
+    event::{self, Event, KeyCode, KeyEventKind, MouseEventKind, MouseButton},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -1222,10 +1222,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let _ = pool.get_conn().await.map(|mut conn| {
                                             let name = w.agent_name.clone();
                                             let host = w.host.clone();
-                                            let loc = w.location_str().to_string();
-                                            let ssh = w.ssh_user.clone();
-                                            let emoji = w.emoji.clone();
-                                            let display = w.display_name.clone();
+                                            let _loc = w.location_str().to_string();
+                                            let _ssh = w.ssh_user.clone();
+                                            let _emoji = w.emoji.clone();
+                                            let _display = w.display_name.clone();
                                             tokio::spawn(async move {
                                                 use mysql_async::prelude::*;
                                                 let _ = conn.exec_drop(
@@ -1405,7 +1405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('u') => {
                                     // Bulk update OC on all agents
                                     app.status_message = "🔄 Updating OpenClaw fleet-wide...".into();
-                                    for (i, agent) in app.agents.iter().enumerate() {
+                                    for (_i, agent) in app.agents.iter().enumerate() {
                                         if agent.host == "localhost" || agent.host == app.self_ip { continue; }
                                         let host = agent.host.clone();
                                         let user = agent.ssh_user.clone();
