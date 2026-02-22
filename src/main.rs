@@ -1122,6 +1122,7 @@ impl App {
         let host = agent.host.clone();
         let user = agent.ssh_user.clone();
         let name = agent.db_name.clone();
+        let location = agent.location.clone();
         let gw_port = agent.gateway_port;
         self.diag_active = true;
         self.diag_auto_fix = fix;
@@ -1338,10 +1339,90 @@ impl App {
                                     false
                                 }
                             } else {
-                                let _ = tx.send(DiagStep { label: "  → LAN discovery".into(), status: DiagStatus::Fail, detail: "could not find LAN IP (no mDNS, ARP, or /etc/hosts entry)".into() });
-                                let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
-                                    detail: "Tailscale down, no LAN path — add LAN IP to /etc/hosts or wake machine manually".into() });
-                                false
+                                let _ = tx.send(DiagStep { label: "  → LAN discovery".into(), status: DiagStatus::Fail, detail: "no LAN IP found via mDNS/ARP/hosts".into() });
+
+                                // Try SSH config aliases (e.g. ~/.ssh/config Host entries with different hostnames/ports)
+                                let _ = tx.send(DiagStep { label: "  → SSH config".into(), status: DiagStatus::Running, detail: "checking ~/.ssh/config aliases...".into() });
+                                let ssh_config_check = Command::new("bash").args(["-c",
+                                    &format!("grep -i -A5 'Host {}' ~/.ssh/config 2>/dev/null | grep -i HostName | awk '{{print $2}}' | head -1", name)
+                                ]).output().await;
+                                let config_host = ssh_config_check.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+
+                                if !config_host.is_empty() {
+                                    let _ = tx.send(DiagStep { label: "  → SSH config".into(), status: DiagStatus::Pass, detail: format!("found alias: {}", config_host) });
+                                    // Try SSH via the config alias
+                                    let _ = tx.send(DiagStep { label: "  → SSH via alias".into(), status: DiagStatus::Running, detail: format!("ssh {}...", name) });
+                                    let alias_ssh = tokio::time::timeout(Duration::from_secs(10),
+                                        Command::new("ssh").args(["-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                            &name, "echo ok"]).output()
+                                    ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+
+                                    if alias_ssh {
+                                        let _ = tx.send(DiagStep { label: "  → SSH via alias".into(), status: DiagStatus::Pass, detail: "connected!".into() });
+                                        // Restart Tailscale via alias
+                                        let _ = tx.send(DiagStep { label: "  → Restart Tailscale".into(), status: DiagStatus::Running, detail: "bringing Tailscale back up...".into() });
+                                        let ts_cmd = "sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || sudo systemctl restart tailscaled && sleep 2 && sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || echo FAIL";
+                                        let ts_result = tokio::time::timeout(Duration::from_secs(30),
+                                            Command::new("ssh").args(["-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                                &name, ts_cmd]).output()
+                                        ).await.ok().and_then(|r| r.ok());
+                                        let ts_ok = ts_result.as_ref().map(|o| !String::from_utf8_lossy(&o.stdout).contains("FAIL")).unwrap_or(false);
+
+                                        if ts_ok {
+                                            let _ = tx.send(DiagStep { label: "  → Restart Tailscale".into(), status: DiagStatus::Fixed, detail: "Tailscale restarted!".into() });
+                                            tokio::time::sleep(Duration::from_secs(5)).await;
+                                            let _ = tx.send(DiagStep { label: "  → Verify".into(), status: DiagStatus::Running, detail: format!("re-testing {}...", host) });
+                                            let verify = tokio::time::timeout(Duration::from_secs(6),
+                                                Command::new("ssh").args(["-o","ConnectTimeout=3","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                                    &format!("{}@{}", user, host), "echo ok"]).output()
+                                            ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+                                            if verify {
+                                                let _ = tx.send(DiagStep { label: "  → Verify".into(), status: DiagStatus::Pass, detail: "Tailscale SSH restored!".into() });
+                                                let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fixed,
+                                                    detail: format!("fixed via SSH config alias ({})", config_host) });
+                                                true
+                                            } else {
+                                                let _ = tx.send(DiagStep { label: "  → Verify".into(), status: DiagStatus::Fail, detail: "Tailscale still not routing".into() });
+                                                let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                                    detail: format!("Tailscale restarted but mesh route failed — try: ssh {} then 'sudo tailscale up'", name) });
+                                                false
+                                            }
+                                        } else {
+                                            let _ = tx.send(DiagStep { label: "  → Restart Tailscale".into(), status: DiagStatus::Fail, detail: "restart command failed".into() });
+                                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                                detail: format!("reachable via 'ssh {}' but Tailscale restart failed — needs manual intervention", name) });
+                                            false
+                                        }
+                                    } else {
+                                        let _ = tx.send(DiagStep { label: "  → SSH via alias".into(), status: DiagStatus::Fail, detail: format!("{} also unreachable", config_host) });
+                                        let loc = location.to_lowercase();
+                                        let hint = if loc.contains("vps") {
+                                            "VPS unreachable — check hosting provider console (GoDaddy/DO/Vultr)"
+                                        } else if loc.contains("mobile") {
+                                            "mobile device — may be off-network or powered down"
+                                        } else if loc.contains("sm") || loc.contains("strange") {
+                                            "Strange Music network — Tailscale may be intentionally down (Bob policy)"
+                                        } else {
+                                            "machine appears fully offline — check physical power"
+                                        };
+                                        let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail, detail: hint.into() });
+                                        false
+                                    }
+                                } else {
+                                    let _ = tx.send(DiagStep { label: "  → SSH config".into(), status: DiagStatus::Skipped, detail: "no SSH config alias found".into() });
+                                    let loc = location.to_lowercase();
+                                    let hint = if loc.contains("vps") {
+                                        "VPS unreachable on all paths — check hosting provider console"
+                                    } else if loc.contains("mobile") {
+                                        "mobile device unreachable — may be off-network"
+                                    } else if loc.contains("sm") || loc.contains("strange") {
+                                        "SM machine — Tailscale may be down per policy (Bob)"
+                                    } else {
+                                        "add LAN IP to /etc/hosts, or check physical power"
+                                    };
+                                    let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail, detail: hint.into() });
+                                    false
+                                }
                             };
                             lan_fixed
                         }
