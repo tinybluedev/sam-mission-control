@@ -83,9 +83,13 @@ sam
 | `s` | Sort agents |
 | `f` | Filter/search |
 | `c` | Cycle color theme |
-| `r` | Refresh all agents (SSH) |
-| `a` | New agent wizard |
-| `g` | Restart gateway (selected) |
+| `R` | Refresh all agents (SSH) |
+| `Space` | Toggle select current agent |
+| `a` / `A` | Select all / clear selection |
+| `g` | Select all in current group filter |
+| `Esc` | Clear selection |
+| `r` | Restart gateway (selected) |
+| `P` | Config push (selected) |
 | `?` | Help |
 | `q` | Quit |
 
