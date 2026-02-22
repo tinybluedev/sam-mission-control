@@ -116,6 +116,20 @@ struct ChatLine {
     kind: String,
 }
 
+#[derive(Clone, Debug)]
+struct BroadcastReplyRow {
+    agent: String,
+    status: String,
+    response: String,
+}
+
+#[derive(Clone, Debug)]
+struct BroadcastAggMsg {
+    agent: String,
+    status: String,
+    response: Option<String>,
+}
+
 #[derive(PartialEq, Clone)]
 enum Focus { Fleet, Chat, AgentChat, Command, Workspace, Services }
 
@@ -397,6 +411,12 @@ struct App {
     // Operation state persistence
     interrupted_ops: Vec<db::Operation>,
     diag_task_running: bool,
+    // Broadcast aggregation overlay
+    broadcast_active: bool,
+    broadcast_title: Option<String>,
+    broadcast_rows: Vec<BroadcastReplyRow>,
+    broadcast_rx: Option<mpsc::UnboundedReceiver<BroadcastAggMsg>>,
+    broadcast_scroll: u16,
 }
 
 /// Returns true for npm output lines worth showing in the overlay.
@@ -509,6 +529,7 @@ impl App {
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
             interrupted_ops, diag_task_running: false,
+            broadcast_active: false, broadcast_title: None, broadcast_rows: vec![], broadcast_rx: None, broadcast_scroll: 0,
         }
     }
 
@@ -690,6 +711,21 @@ impl App {
         &self.agent_chat_history
     }
 
+    fn apply_broadcast_msg(&mut self, msg: BroadcastAggMsg) {
+        if let Some(row) = self.broadcast_rows.iter_mut().find(|r| r.agent == msg.agent) {
+            row.status = msg.status;
+            if let Some(resp) = msg.response {
+                row.response = resp;
+            }
+            return;
+        }
+        self.broadcast_rows.push(BroadcastReplyRow {
+            agent: msg.agent,
+            status: msg.status,
+            response: msg.response.unwrap_or_default(),
+        });
+    }
+
     async fn send_message(&mut self) {
         if self.chat_input.trim().is_empty() { return; }
         let message = validate::sanitize_chat_message(&self.chat_input);
@@ -729,25 +765,52 @@ impl App {
 
         if let Some(pool) = &self.db_pool {
             let ids = db::send_broadcast(pool, &self.user(), &message, &agent_names).await.unwrap_or_default();
+            let mut id_by_agent = std::collections::HashMap::new();
+            for (name, id) in agent_names.iter().zip(ids.iter().copied()) {
+                id_by_agent.insert(name.clone(), id);
+            }
             let sys_prompt = self.build_system_prompt(None);
+            let use_overlay = agent_names.len() > 1;
+            let (broadcast_tx, broadcast_rx) = if use_overlay {
+                let (tx, rx) = mpsc::unbounded_channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            if use_overlay {
+                self.broadcast_active = true;
+                self.broadcast_title = Some(format!(" Broadcast Aggregation — {} agents ", agent_names.len()));
+                self.broadcast_rows = agent_names.iter().map(|name| BroadcastReplyRow {
+                    agent: name.clone(),
+                    status: "pending".into(),
+                    response: String::new(),
+                }).collect();
+                self.broadcast_scroll = 0;
+                self.broadcast_rx = broadcast_rx;
+            }
             // Fire streaming AI requests to targeted agents (or all if broadcast)
-            for (i, agent) in self.agents.iter().enumerate() {
+            for agent in &self.agents {
                 if targeted && !agent_names.contains(&agent.db_name) { continue; }
                 if let Some(tok) = &agent.gateway_token {
                     let url = format!("http://{}:{}/v1/chat/completions", agent.host, agent.gateway_port);
                     let tok = tok.clone();
                     let msg = message.clone();
                     let pool = pool.clone();
-                    let msg_id = ids.get(i).copied().unwrap_or(0);
+                    let msg_id = id_by_agent.get(&agent.db_name).copied().unwrap_or(0);
                     let bcast_host = agent.host.clone();
                     let bcast_user = agent.ssh_user.clone();
+                    let bcast_agent = agent.db_name.clone();
                     let bcast_port = agent.gateway_port;
                     let sys_prompt = sys_prompt.clone();
+                    let bcast_tx = broadcast_tx.clone();
                     tokio::spawn(async move {
                         let client = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(120))
                             .build().unwrap_or_default();
                         let _ = db::update_chat_status(&pool, msg_id, "connecting").await;
+                        if let Some(tx) = &bcast_tx {
+                            let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "connecting".into(), response: None });
+                        }
                         let body = serde_json::json!({
                             "model": "openclaw:main",
                             "stream": true,
@@ -768,6 +831,9 @@ impl App {
                                     .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                                 if ct.contains("text/event-stream") || ct.contains("text/plain") {
                                     let _ = db::update_chat_status(&pool, msg_id, "thinking").await;
+                                    if let Some(tx) = &bcast_tx {
+                                        let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "thinking".into(), response: None });
+                                    }
                                     use futures_util::StreamExt;
                                     let mut stream = resp.bytes_stream();
                                     let mut full = String::new();
@@ -787,20 +853,38 @@ impl App {
                                         }
                                         if got && last_write.elapsed() > std::time::Duration::from_millis(300) {
                                             let _ = db::update_chat_partial(&pool, msg_id, &full).await;
+                                            if let Some(tx) = &bcast_tx {
+                                                let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "streaming".into(), response: Some(full.clone()) });
+                                            }
                                             last_write = std::time::Instant::now();
                                         }
                                     }
                                     if full.is_empty() { full = "(empty response)".into(); }
                                     let _ = db::respond_to_chat(&pool, msg_id, &full).await;
+                                    if let Some(tx) = &bcast_tx {
+                                        let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "responded".into(), response: Some(full) });
+                                    }
                                 } else {
                                     let _ = db::update_chat_status(&pool, msg_id, "thinking").await;
+                                    if let Some(tx) = &bcast_tx {
+                                        let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "thinking".into(), response: None });
+                                    }
                                     match resp.json::<serde_json::Value>().await {
                                         Ok(j) => {
                                             let r = j["choices"][0]["message"]["content"]
                                                 .as_str().unwrap_or("(no content)").to_string();
                                             let _ = db::respond_to_chat(&pool, msg_id, &r).await;
+                                            if let Some(tx) = &bcast_tx {
+                                                let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "responded".into(), response: Some(r) });
+                                            }
                                         }
-                                        Err(e) => { let _ = db::respond_to_chat(&pool, msg_id, &format!("Parse error: {}", e)).await; }
+                                        Err(e) => {
+                                            let err = format!("Parse error: {}", e);
+                                            let _ = db::respond_to_chat(&pool, msg_id, &err).await;
+                                            if let Some(tx) = &bcast_tx {
+                                                let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "failed".into(), response: Some(err) });
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -834,6 +918,10 @@ impl App {
                                     _ => "⚠ unreachable".into(),
                                 };
                                 let _ = db::respond_to_chat(&pool, msg_id, &response).await;
+                                if let Some(tx) = &bcast_tx {
+                                    let status = if response.contains("unreachable") { "failed" } else { "responded" };
+                                    let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: status.into(), response: Some(response) });
+                                }
                             }
                         }
                     });
@@ -3734,6 +3822,68 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
     frame.render_widget(diag, popup);
 }
 
+fn broadcast_done_count(rows: &[BroadcastReplyRow]) -> usize {
+    rows.iter().filter(|r| matches!(r.status.as_str(), "responded" | "failed")).count()
+}
+
+fn broadcast_max_scroll(rows_len: usize, visible_rows: usize) -> u16 {
+    rows_len.saturating_sub(visible_rows.max(1)).min(u16::MAX as usize) as u16
+}
+
+fn render_broadcast_aggregation(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = frame.area();
+    let w = ((area.width as f32 * 0.88) as u16).max(72).min(area.width.saturating_sub(2));
+    let h = ((area.height as f32 * 0.72) as u16).max(12).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+
+    let done = broadcast_done_count(&app.broadcast_rows);
+    let total = app.broadcast_rows.len();
+    let visible_rows = h.saturating_sub(5) as usize;
+    let max_scroll = broadcast_max_scroll(app.broadcast_rows.len(), visible_rows);
+    let start = app.broadcast_scroll.min(max_scroll) as usize;
+
+    let rows: Vec<Row> = app.broadcast_rows.iter().skip(start).take(visible_rows).map(|r| {
+        let status_color = match r.status.as_str() {
+            "responded" => t.status_online,
+            "failed" => t.status_offline,
+            "streaming" | "thinking" | "connecting" => t.pending,
+            _ => t.text_dim,
+        };
+        let response = if r.response.is_empty() {
+            "…".to_string()
+        } else if r.response.contains('\n') {
+            r.response.replace('\n', " ")
+        } else {
+            r.response.clone()
+        };
+        Row::new(vec![
+            Cell::from(r.agent.clone()),
+            Cell::from(Span::styled(r.status.clone(), Style::default().fg(status_color))),
+            Cell::from(response),
+        ])
+    }).collect();
+
+    let title = app.broadcast_title.clone().unwrap_or_else(|| " Broadcast Aggregation ".to_string());
+    let table = Table::new(rows, [Constraint::Length(18), Constraint::Length(12), Constraint::Min(24)])
+        .header(Row::new(vec![
+            Cell::from(Span::styled("Agent", Style::default().fg(t.header_title).bold())),
+            Cell::from(Span::styled("Status", Style::default().fg(t.header_title).bold())),
+            Cell::from(Span::styled("Reply", Style::default().fg(t.header_title).bold())),
+        ]))
+        .block(Block::default()
+            .title(Span::styled(format!("{}  {}/{} done ", title, done, total), Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(t.accent))
+            .style(Style::default().bg(app.bg_density.bg())))
+        .column_spacing(1);
+    frame.render_widget(table, popup);
+}
+
 fn render_services(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let split = Layout::default().direction(Direction::Horizontal)
@@ -4809,6 +4959,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else if app.diag_active {
                 render_diagnostics(f, &app);
             }
+            if app.broadcast_active {
+                render_broadcast_aggregation(f, &app);
+            }
 
             // Config viewer overlay
             if let Some(config) = &app.config_text {
@@ -5007,6 +5160,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => {}
                         }
                     } else {
+                    // Broadcast aggregation overlay intercepts keys when active
+                    if app.broadcast_active {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.broadcast_active = false;
+                            }
+                            KeyCode::PageUp => {
+                                app.broadcast_scroll = app.broadcast_scroll.saturating_sub(5);
+                            }
+                            KeyCode::PageDown => {
+                                let max_scroll = broadcast_max_scroll(app.broadcast_rows.len(), 1);
+                                app.broadcast_scroll = app.broadcast_scroll.saturating_add(5);
+                                app.broadcast_scroll = app.broadcast_scroll.min(max_scroll);
+                            }
+                            KeyCode::Up => {
+                                app.broadcast_scroll = app.broadcast_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                let max_scroll = broadcast_max_scroll(app.broadcast_rows.len(), 1);
+                                app.broadcast_scroll = app.broadcast_scroll.saturating_add(1);
+                                app.broadcast_scroll = app.broadcast_scroll.min(max_scroll);
+                            }
+                            _ => {}
+                        }
+                    } else
                     // Fleet diagnostic overlay intercepts all keys when active
                     if app.fleet_diag_active {
                         match key.code {
@@ -6009,6 +6187,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.ws_content_scroll = 0;
             }
         }
+        let mut broadcast_msgs = Vec::new();
+        if let Some(ref mut rx) = app.broadcast_rx {
+            while let Ok(msg) = rx.try_recv() {
+                broadcast_msgs.push(msg);
+            }
+        }
+        for msg in broadcast_msgs {
+            app.apply_broadcast_msg(msg);
+        }
 
         // Receive background chat poll results (non-blocking)
         let mut poll_results: Vec<ChatPollResult> = Vec::new();
@@ -6126,10 +6313,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::INPUT_POLL_MS;
+    use super::{BroadcastReplyRow, INPUT_POLL_MS, broadcast_done_count};
 
     #[test]
     fn input_poll_interval_is_low_for_responsive_ui() {
         assert!(INPUT_POLL_MS <= 10);
+    }
+
+    #[test]
+    fn broadcast_done_count_only_counts_terminal_statuses() {
+        let rows = vec![
+            BroadcastReplyRow { agent: "a".into(), status: "pending".into(), response: String::new() },
+            BroadcastReplyRow { agent: "b".into(), status: "streaming".into(), response: String::new() },
+            BroadcastReplyRow { agent: "c".into(), status: "responded".into(), response: "ok".into() },
+            BroadcastReplyRow { agent: "d".into(), status: "failed".into(), response: "err".into() },
+        ];
+        assert_eq!(broadcast_done_count(&rows), 2);
     }
 }
