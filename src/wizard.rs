@@ -1,3 +1,9 @@
+//! Interactive TUI wizard for adding new agents to the fleet.
+//!
+//! The wizard guides the operator through entering an agent name, display name,
+//! emoji, host (Tailscale IP), SSH username, and location. On completion it calls
+//! `sam onboard` to provision the agent over SSH.
+
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use crate::theme::Theme;

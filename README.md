@@ -1,8 +1,25 @@
 # S.A.M Mission Control
 
+[![CI](https://github.com/tinybluedev/sam-mission-control/actions/workflows/ci.yml/badge.svg)](https://github.com/tinybluedev/sam-mission-control/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/tinybluedev/sam-mission-control)](https://github.com/tinybluedev/sam-mission-control/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+
 A terminal-based fleet orchestration tool for managing distributed AI agents over SSH and Tailscale mesh networks. Built in Rust with [Ratatui](https://ratatui.rs).
 
 ![Dashboard](docs/screenshots/dashboard.png)
+
+## Why S.A.M?
+
+Modern AI deployments spread agents across many machines — home labs, VPS nodes, edge devices. Keeping track of which agents are alive, what tasks they're running, and sending them instructions without exposing ports is painful.
+
+S.A.M (Systems Administration & Management) solves this by providing a **zero-exposure TUI** that tunnels everything through SSH and Tailscale. No open ports, no API keys flying over the internet, no separate web dashboard to secure. It talks to your agents the same way you would manually — over SSH — while keeping a persistent state in a shared MySQL database.
+
+Use S.A.M when you:
+- Run a self-hosted fleet of [OpenClaw](https://github.com/openclaw/openclaw) AI agents
+- Need real-time health monitoring without a cloud service
+- Want to chat with individual agents or broadcast tasks from a single terminal
+- Value minimal attack surface and air-gap-compatible design
 
 ## Features
 
@@ -104,22 +121,94 @@ SAM_SELF_IP=10.0.0.1
 
 ## Architecture
 
+```mermaid
+graph TD
+    subgraph Master["Master Node"]
+        TUI["sam TUI / CLI"]
+        DB[(MySQL Database)]
+    end
+
+    subgraph Fleet["Agent Fleet (Tailscale mesh)"]
+        A1["Agent 1\n(OpenClaw)"]
+        A2["Agent 2\n(OpenClaw)"]
+        AN["Agent N\n(OpenClaw)"]
+    end
+
+    TUI -- "SSH (health probe / chat fallback)" --> A1
+    TUI -- "SSH (health probe / chat fallback)" --> A2
+    TUI -- "SSH (health probe / chat fallback)" --> AN
+    TUI -- "SQL (fleet state, chat, tasks)" --> DB
+    A1 -- "HTTP /v1/chat/completions" --> TUI
+    A2 -- "HTTP /v1/chat/completions" --> TUI
 ```
-┌─────────────┐     SSH      ┌──────────┐
-│  sam (TUI)  │─────────────▶│ Agent 1  │
-│  on master  │     SSH      ├──────────┤
-│  node       │─────────────▶│ Agent 2  │
-│             │     SSH      ├──────────┤
-│             │─────────────▶│ Agent N  │
-└──────┬──────┘              └──────────┘
-       │
-       ▼
-┌─────────────┐
-│   MySQL DB  │
-│ (fleet state│
-│  chat, tasks│
-└─────────────┘
-```
+
+For a deeper dive, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Configuration Reference
+
+### `~/.config/sam/config.toml`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `database.host` | `127.0.0.1` | MySQL host |
+| `database.port` | `3306` | MySQL port |
+| `database.user` | `root` | MySQL user |
+| `database.password` | _(empty)_ | MySQL password |
+| `database.database` | `sam_fleet` | Database name |
+| `tui.theme` | `standard` | Color theme: `standard`, `noir`, `paper`, `1977`, `2077`, `matrix`, `sunset`, `arctic` |
+| `tui.background` | `dark` | Background style: `dark` or `light` |
+| `tui.refresh_interval` | `30` | Fleet refresh interval in seconds |
+| `tui.chat_poll_interval` | `3` | Chat poll interval in seconds |
+| `identity.user` | `operator` | Operator display name in chat |
+
+Environment variables are also supported via a `.env` file:
+
+| Variable | Description |
+|----------|-------------|
+| `SAM_DB_URL` | Full MySQL URL (overrides all `database.*` keys) |
+| `SAM_DB_HOST` | MySQL host |
+| `SAM_DB_PORT` | MySQL port |
+| `SAM_DB_USER` | MySQL user |
+| `SAM_DB_PASS` | MySQL password |
+| `SAM_DB_NAME` | Database name |
+| `SAM_SELF_IP` | IP of the master node |
+| `SAM_FLEET_CONFIG` | Path to `fleet.toml` |
+
+### `fleet.toml`
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `agent[].name` | ✅ | Agent identifier (lowercase, used in DB) |
+| `agent[].display` | ❌ | Human-friendly display name |
+| `agent[].emoji` | ❌ | Emoji prefix shown in TUI |
+| `agent[].location` | ❌ | Physical/logical location label |
+| `agent[].ssh_user` | ❌ | SSH username (default: `root`) |
+
+## Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, coding style, and the PR process.
+
+Quick summary:
+1. Fork the repo and create a feature branch
+2. `cargo build && cargo test` must pass
+3. Open a pull request against `main`
+
+## Troubleshooting
+
+**`sam` hangs on startup**
+Check your MySQL connection. Run `sam doctor` — it will report which agents and DB connections are failing.
+
+**Agent shows `offline` but is reachable by SSH**
+The SSH health probe uses `BatchMode=yes` and a 5-second timeout. Ensure key-based auth is configured and the agent's SSH port is accessible over Tailscale.
+
+**`sam init` fails with "permission denied"**
+The installer tries to write to `/usr/local/bin`. Run with `sudo` or set `INSTALL_DIR` to a writable path.
+
+**Chat messages stay `pending`**
+The OpenClaw HTTP API on the agent may be unavailable. S.A.M will fall back to SSH delivery, but the agent must be online. Check `sam doctor --agent <name>`.
+
+**Mermaid diagram not rendering**
+GitHub renders Mermaid natively in markdown. If you see raw code, ensure you are viewing the file on github.com (not a local preview that lacks Mermaid support).
 
 ## License
 
