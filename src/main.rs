@@ -1507,6 +1507,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let msg = message.join(" ");
             return cli::send_chat(&agent, &msg).await.map_err(|e| e.into());
         }
+        Some(cli::Commands::Onboard { host, user, name }) => {
+            return cli::run_onboard(&host, &user, name.as_deref()).await.map_err(|e| e.into());
+        }
         Some(cli::Commands::Version) => {
             println!("sam v{}", env!("CARGO_PKG_VERSION"));
             return Ok(());
