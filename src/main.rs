@@ -4646,6 +4646,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     app.status_message = "🔄 OC update dispatched to all agents (background)".into();
                                 }
+                                KeyCode::Char('U') => {
+                                    // Update OC on single highlighted agent with feedback
+                                    if let Some(agent) = app.agents.get(app.selected) {
+                                        let host = agent.host.clone();
+                                        let user = agent.ssh_user.clone();
+                                        let name = agent.name.clone();
+                                        let db_name = agent.db_name.clone();
+                                        let is_mac = agent.os.to_lowercase().contains("mac");
+                                        let self_ip = app.self_ip.clone();
+                                        app.toast(&format!("🔄 Updating OpenClaw on {}...", name));
+                                        if let Some(pool) = &app.db_pool {
+                                            let pool = pool.clone();
+                                            let sender = app.user();
+                                            tokio::spawn(async move {
+                                                let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                                let cmd = format!("{}echo '=== Before ===' && openclaw --version 2>/dev/null && echo '=== Updating ===' && sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '=== After ===' && openclaw --version 2>/dev/null && echo '=== Restarting Gateway ===' && openclaw gateway restart 2>&1 | tail -1 || echo 'gateway restart skipped'", pfx);
+                                                let output = if host == "localhost" || host == self_ip {
+                                                    tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                                                } else {
+                                                    tokio::time::timeout(
+                                                        std::time::Duration::from_secs(120),
+                                                        tokio::process::Command::new("ssh")
+                                                            .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                                &format!("{}@{}", user, host), &cmd])
+                                                            .output()
+                                                    ).await.ok().and_then(|r| r.ok())
+                                                };
+                                                let response = output.map(|o| {
+                                                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                                    if s.is_empty() { "(no output)".into() } else { s.chars().take(1500).collect::<String>() }
+                                                }).unwrap_or_else(|| "Timeout — update may still be running".into());
+                                                let _ = crate::db::send_direct(&pool, &sender, &db_name, "🔄 openclaw update").await;
+                                                if let Ok(mut conn) = pool.get_conn().await {
+                                                    use mysql_async::prelude::*;
+                                                    let _ = conn.exec_drop(
+                                                        "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                                                        (&response, &sender, &db_name),
+                                                    ).await;
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
                                 KeyCode::Char('G') => {
                                     // Gateway status on selected agent
                                     if let Some(agent) = app.agents.get(app.selected) {
