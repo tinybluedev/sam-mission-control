@@ -136,6 +136,15 @@ pub enum Commands {
     },
     /// Print version info
     Version,
+    /// Show operation history log
+    Log {
+        /// Filter by agent name
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Number of most recent entries to show
+        #[arg(long, default_value = "20")]
+        tail: u32,
+    },
 }
 
 /// Persistent config file (~/.config/sam/config.toml)
@@ -842,7 +851,20 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
             result          TEXT
         )
     ").await?;
-    println!("✅ mc_fleet_status, mc_chat, mc_task_routing");
+    conn.query_drop(r"
+        CREATE TABLE IF NOT EXISTS mc_operations (
+            id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+            agent_name   VARCHAR(64) NOT NULL,
+            op_type      VARCHAR(32) NOT NULL,
+            status       VARCHAR(16) DEFAULT 'running',
+            detail       TEXT,
+            created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+            completed_at DATETIME,
+            INDEX idx_agent (agent_name),
+            INDEX idx_created (created_at)
+        )
+    ").await?;
+    println!("✅ mc_fleet_status, mc_chat, mc_task_routing, mc_operations");
 
     // Step 3: Generate config
     print!("  [3/4] Generating config... ");
@@ -1079,5 +1101,47 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
     }
     println!();
 
+    Ok(())
+}
+
+/// Print operation history log (non-TUI)
+pub async fn run_log(agent: Option<&str>, tail: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = crate::db::get_pool();
+    let ops = crate::db::get_operations(&pool, agent, tail).await?;
+
+    print_banner();
+    println!();
+    print_divider();
+    println!("   {:<18} {:<14} {:<10} {:<10} {}",
+        c_bold("Time"), c_bold("Agent"), c_bold("Type"), c_bold("Status"), c_bold("Detail"));
+    print_divider();
+
+    if ops.is_empty() {
+        println!("   {}", c_dim("No operations found."));
+    } else {
+        for op in &ops {
+            let status_str = match op.status.as_str() {
+                "pass" => c_bold_green("pass"),
+                "fail" => c_bold_red("fail"),
+                "fixed" => c_bold_green("fixed"),
+                "running" => c_yellow("running"),
+                s => c_dim(s),
+            };
+            let detail = op.detail.as_deref().unwrap_or("—");
+            let detail_short: String = detail.lines().next().unwrap_or("—").chars().take(50).collect();
+            println!("   {:<16} {:<22} {:<18} {}  {}",
+                c_dim(&op.created_at),
+                c_cyan(&op.agent_name),
+                c_magenta(&op.op_type),
+                status_str,
+                c_dim(&detail_short),
+            );
+        }
+    }
+
+    print_divider();
+    println!("   {} operations shown\n", ops.len());
+
+    pool.disconnect().await?;
     Ok(())
 }
