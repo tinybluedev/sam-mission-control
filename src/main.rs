@@ -1707,6 +1707,8 @@ const LINES_PER_MSG_EST: usize = 3;
 /// Spinner frame duration in milliseconds.  Dividing subsecond millis by this value gives
 /// a 0–9 index that advances ~10 times per second.
 const SPINNER_FRAME_MS: u64 = 100;
+/// Input poll interval in milliseconds. Lower values improve key/menu responsiveness.
+const INPUT_POLL_MS: u64 = 10;
 
 fn fmt_hhmm(t: &str) -> String {
     t.chars().take(5).collect()
@@ -3381,7 +3383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } // close else for show_splash
         })?;
 
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(Duration::from_millis(INPUT_POLL_MS))? {
             let ev = event::read()?;
 
             // Splash dismiss
@@ -4275,4 +4277,14 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
     stdout().execute(crossterm::event::DisableMouseCapture)?;
     stdout().execute(LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::INPUT_POLL_MS;
+
+    #[test]
+    fn input_poll_interval_is_low_for_responsive_ui() {
+        assert!(INPUT_POLL_MS <= 10);
+    }
 }
