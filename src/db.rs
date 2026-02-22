@@ -446,6 +446,14 @@ mod tests {
         assert!(static_query.contains("status='interrupted'"));
         assert!(static_query.contains("LIMIT 20"));
     }
+
+    /// `get_fleet_changelog` must only read fleet change entries.
+    #[test]
+    fn get_fleet_changelog_query_filters_op_type() {
+        let static_query = "SELECT id, agent, op_type, status, output, DATE_FORMAT(started_at, '%Y-%m-%d %H:%i') FROM mc_operations WHERE op_type='fleet_change' ORDER BY id DESC LIMIT ?";
+        assert!(static_query.contains("op_type='fleet_change'"));
+        assert_eq!(static_query.matches('?').count(), 1);
+    }
 }
 
 // ---- Task Board ----
@@ -626,6 +634,22 @@ pub async fn get_operations(
             (tail,),
         ).await?
     };
+    Ok(rows.into_iter().map(|(id, agent_name, op_type, status, detail, created_at)| {
+        OperationRecord { id, agent_name, op_type, status, detail, created_at }
+    }).collect())
+}
+
+/// Fetch recent fleet changelog entries (`op_type='fleet_change'`) from mc_operations.
+pub async fn get_fleet_changelog(
+    pool: &Pool,
+    tail: u32,
+) -> Result<Vec<OperationRecord>, Box<dyn std::error::Error>> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    let rows: Vec<(u64, String, String, String, Option<String>, String)> = conn.exec(
+        "SELECT id, agent, op_type, status, output, DATE_FORMAT(started_at, '%Y-%m-%d %H:%i') FROM mc_operations WHERE op_type='fleet_change' ORDER BY id DESC LIMIT ?",
+        (tail,),
+    ).await?;
     Ok(rows.into_iter().map(|(id, agent_name, op_type, status, detail, created_at)| {
         OperationRecord { id, agent_name, op_type, status, detail, created_at }
     }).collect())

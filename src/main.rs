@@ -344,6 +344,12 @@ struct App {
     fleet_diag_done: bool,
     fleet_diag_results: Vec<FleetDiagResult>,
     fleet_diag_rx: Option<mpsc::UnboundedReceiver<FleetDiagMsg>>,
+    // Fleet changelog overlay
+    fleet_changelog_active: bool,
+    fleet_changelog_loading: bool,
+    fleet_changelog_scroll: u16,
+    fleet_changelog_rows: Vec<db::OperationRecord>,
+    fleet_changelog_rx: Option<mpsc::UnboundedReceiver<Vec<db::OperationRecord>>>,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -502,6 +508,7 @@ impl App {
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
             diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None, diag_overlay_scroll: 0,
             fleet_diag_active: false, fleet_diag_fix: false, fleet_diag_selected: 0, fleet_diag_done: false, fleet_diag_results: vec![], fleet_diag_rx: None,
+            fleet_changelog_active: false, fleet_changelog_loading: false, fleet_changelog_scroll: 0, fleet_changelog_rows: vec![], fleet_changelog_rx: None,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: vec![], ws_cursor: (0, 0), ws_undo_stack: vec![], ws_discard_confirm: false,
@@ -2400,11 +2407,33 @@ print('ok')
         }
     }
 
-    fn drain_refresh_results(&mut self) -> Vec<(usize, AgentStatus, String, String, String, Option<u32>)> {
+    fn start_fleet_changelog_load(&mut self) {
+        self.fleet_changelog_active = true;
+        self.fleet_changelog_loading = true;
+        self.fleet_changelog_scroll = 0;
+        self.fleet_changelog_rows.clear();
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.fleet_changelog_rx = Some(rx);
+        if let Some(pool) = &self.db_pool {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let rows = db::get_fleet_changelog(&pool, 120).await.unwrap_or_default();
+                let _ = tx.send(rows);
+            });
+        } else {
+            let _ = tx.send(vec![]);
+        }
+    }
+
+    fn drain_refresh_results(&mut self) -> Vec<(usize, AgentStatus, String, String, String, Option<u32>, Option<String>)> {
         let mut updates = vec![];
         if let Some(rx) = &mut self.refresh_rx {
             while let Ok(r) = rx.try_recv() {
                 if r.index < self.agents.len() {
+                    let prev_status = self.agents[r.index].status.clone();
+                    let prev_os = self.agents[r.index].os.clone();
+                    let prev_kernel = self.agents[r.index].kernel.clone();
+                    let prev_oc = self.agents[r.index].oc_version.clone();
                     self.agents[r.index].status = r.status.clone();
                     if !r.os.is_empty() { self.agents[r.index].os = r.os.clone(); }
                     if !r.kernel.is_empty() { self.agents[r.index].kernel = r.kernel.clone(); }
@@ -2415,7 +2444,21 @@ print('ok')
                     self.agents[r.index].disk_pct = r.disk_pct;
                     self.agents[r.index].last_seen = now_str();
                     self.agents[r.index].last_probe_at = Some(Instant::now());
-                    updates.push((r.index, r.status, r.os, r.kernel, r.oc_version, r.latency_ms));
+                    let mut changes = Vec::new();
+                    if prev_status != r.status {
+                        changes.push(format!("status: {} → {}", prev_status.to_db_str(), r.status.to_db_str()));
+                    }
+                    if !r.os.is_empty() && prev_os != r.os {
+                        changes.push(format!("os: {} → {}", prev_os, r.os));
+                    }
+                    if !r.kernel.is_empty() && prev_kernel != r.kernel {
+                        changes.push(format!("kernel: {} → {}", prev_kernel, r.kernel));
+                    }
+                    if !r.oc_version.is_empty() && prev_oc != r.oc_version {
+                        changes.push(format!("openclaw: {} → {}", prev_oc, r.oc_version));
+                    }
+                    let change_detail = if changes.is_empty() { None } else { Some(changes.join(" | ")) };
+                    updates.push((r.index, r.status, r.os, r.kernel, r.oc_version, r.latency_ms, change_detail));
                 }
             }
         }
@@ -3596,6 +3639,54 @@ fn render_fleet_diagnostics(frame: &mut Frame, app: &App) {
     frame.render_widget(diag, popup);
 }
 
+fn render_fleet_changelog(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let w = (area.width as f32 * 0.80) as u16;
+    let h = (area.height as f32 * 0.75) as u16;
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w.max(40), h.max(12));
+    let t = &app.theme;
+    frame.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = vec![];
+    if app.fleet_changelog_loading {
+        lines.push(Line::from(Span::styled(
+            "⏳ Loading fleet changelog…",
+            Style::default().fg(t.status_busy).bold(),
+        )));
+    } else if app.fleet_changelog_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No fleet changes recorded yet.",
+            Style::default().fg(t.text_dim),
+        )));
+    } else {
+        for op in &app.fleet_changelog_rows {
+            let detail = op.detail.as_deref().unwrap_or("—");
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", op.created_at), Style::default().fg(t.text_dim)),
+                Span::styled(format!("{:<16}", op.agent_name), Style::default().fg(t.accent).bold()),
+                Span::styled(detail.to_string(), Style::default().fg(t.text)),
+            ]));
+        }
+    }
+
+    let body = Paragraph::new(lines)
+        .scroll((app.fleet_changelog_scroll, 0))
+        .wrap(Wrap { trim: false })
+        .block(Block::default()
+            .title(Span::styled(
+                " Fleet Changelog — Esc=close  ↑↓/PgUp/PgDn=scroll ",
+                Style::default().fg(t.accent).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(t.border_type)
+            .border_style(Style::default().fg(t.accent))
+            .style(Style::default().bg(app.bg_density.bg()))
+            .padding(Padding::new(1, 1, 1, 0)));
+    frame.render_widget(body, popup);
+}
+
 fn render_diagnostics(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let area = frame.area();
@@ -4535,6 +4626,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("  G (Shift)", "Investigate gateway (selected)", act_style),
         ("  o", "OpenClaw version audit", act_style),
         ("  u", "Bulk update OpenClaw", act_style),
+        ("  L (Shift)", "Fleet changelog", act_style),
         ("", "", dim_style),
         // --- Agent Detail ---
         ("AGENT DETAIL", "", dim_style),
@@ -4627,7 +4719,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Dashboard => match app.focus {
             Focus::Chat => vec![("Tab","fleet"),("⏎","send"),("@","target"),("Esc","back")],
             Focus::Command => vec![("⏎","run"),("Esc","cancel")],
-            _ => vec![("⏎","open"),("d","check"),("D","fix"),("U","update"),("u","update all"),("g","group"),("t","tasks"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
+            _ => vec![("⏎","open"),("d","check"),("D","fix"),("L","changes"),("U","update"),("u","update all"),("g","group"),("t","tasks"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
         },
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
@@ -4770,7 +4862,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !updates.is_empty() {
             // Write to DB in background
             if let Some(pool) = &app.db_pool {
-                for (idx, _status, _os, _kern, _oc, lat) in &updates {
+                for (idx, _status, _os, _kern, _oc, lat, change_detail) in &updates {
                     let a = &app.agents[*idx];
                     let p = pool.clone();
                     let (name, st, os, kern, oc, latency) = (
@@ -4784,6 +4876,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = db::update_agent_status_full(&p, &name, &st,
                             os.as_deref(), kern.as_deref(), oc.as_deref(), latency).await;
                     });
+                    if let Some(detail) = change_detail.clone() {
+                        let p = pool.clone();
+                        let agent_name = a.db_name.clone();
+                        tokio::spawn(async move {
+                            if let Ok(op_id) = db::create_operation(&p, &agent_name, "fleet_change").await {
+                                let _ = db::complete_operation(&p, op_id, "pass", Some(&detail)).await;
+                            }
+                        });
+                    }
                 }
             }
             app.check_alerts();
@@ -4806,6 +4907,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Diagnostic overlay (renders on top of everything)
             if app.fleet_diag_active {
                 render_fleet_diagnostics(f, &app);
+            } else if app.fleet_changelog_active {
+                render_fleet_changelog(f, &app);
             } else if app.diag_active {
                 render_diagnostics(f, &app);
             }
@@ -5037,6 +5140,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.selected = idx;
                                     app.start_diagnostics(fix);
                                 }
+                            }
+                            _ => {}
+                        }
+                    } else
+                    if app.fleet_changelog_active {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.fleet_changelog_active = false;
+                                app.fleet_changelog_loading = false;
+                                app.fleet_changelog_rx = None;
+                            }
+                            KeyCode::PageUp => {
+                                app.fleet_changelog_scroll = app.fleet_changelog_scroll.saturating_sub(10);
+                            }
+                            KeyCode::PageDown => {
+                                app.fleet_changelog_scroll = app.fleet_changelog_scroll.saturating_add(10);
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.fleet_changelog_scroll = app.fleet_changelog_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.fleet_changelog_scroll = app.fleet_changelog_scroll.saturating_add(1);
                             }
                             _ => {}
                         }
@@ -5547,6 +5672,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('q') => app.should_quit = true,
                                 KeyCode::Char('d') => app.start_fleet_diagnostics(false),
                                 KeyCode::Char('D') => app.start_fleet_diagnostics(true),
+                                KeyCode::Char('L') => app.start_fleet_changelog_load(),
                                 KeyCode::Tab => app.focus = Focus::Chat,
                                 KeyCode::Up | KeyCode::Char('k') => app.previous(),
                                 KeyCode::Down | KeyCode::Char('j') => app.next(),
@@ -5961,6 +6087,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             app.fleet_diag_done = true;
                         }
                     }
+                }
+            }
+        }
+
+        if app.fleet_changelog_active {
+            if let Some(ref mut rx) = app.fleet_changelog_rx {
+                if let Ok(rows) = rx.try_recv() {
+                    app.fleet_changelog_rows = rows;
+                    app.fleet_changelog_loading = false;
                 }
             }
         }
