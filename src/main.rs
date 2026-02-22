@@ -1342,6 +1342,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('c') => app.cycle_theme(),
+                                KeyCode::Char('l') => {
+                                    // Fetch gateway logs for this agent
+                                    if let Some(agent) = app.agents.get(app.selected) {
+                                        let host = agent.host.clone();
+                                        let user = agent.ssh_user.clone();
+                                        let name = agent.db_name.clone();
+                                        let self_ip = app.self_ip.clone();
+                                        if let Some(pool) = &app.db_pool {
+                                            let pool = pool.clone();
+                                            let sender = app.user();
+                                            tokio::spawn(async move {
+                                                let cmd = "journalctl -u openclaw-gateway --no-pager -n 15 --output=short-iso 2>/dev/null || openclaw gateway status 2>/dev/null || echo 'no logs available'";
+                                                let output = if host == "localhost" || host == self_ip {
+                                                    tokio::process::Command::new("bash").args(["-c", cmd]).output().await.ok()
+                                                } else {
+                                                    let is_mac = host.contains("10.64.0.1") && !host.ends_with(".1");
+                                                    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                                    tokio::time::timeout(
+                                                        std::time::Duration::from_secs(8),
+                                                        tokio::process::Command::new("ssh")
+                                                            .args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                                &format!("{}@{}", user, host), &format!("{}{}", pfx, cmd)])
+                                                            .output()
+                                                    ).await.ok().and_then(|r| r.ok())
+                                                };
+                                                let response = output.map(|o| {
+                                                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                                    if s.is_empty() { "(no output)".into() } else { s.chars().take(1000).collect::<String>() }
+                                                }).unwrap_or_else(|| "Timeout".into());
+                                                let _ = crate::db::send_direct(&pool, &sender, &name, "📋 gateway logs").await;
+                                                if let Ok(mut conn) = pool.get_conn().await {
+                                                    use mysql_async::prelude::*;
+                                                    let _ = conn.exec_drop(
+                                                        "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                                                        (&response, &sender, &name),
+                                                    ).await;
+                                                }
+                                            });
+                                        }
+                                        let agent_name = app.agents.get(app.selected).map(|a| a.name.clone()).unwrap_or_default();
+                                        app.status_message = format!("📋 Fetching gateway logs from {}...", agent_name);
+                                    }
+                                }
                                 _ => {}
                             },
                         },
@@ -1413,6 +1456,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('c') => app.cycle_theme(),
                                 KeyCode::Char('s') => app.cycle_sort(),
                                 KeyCode::Char('a') => { app.wizard.open(); }
+                                KeyCode::Char('h') => {
+                                    // Fleet health summary
+                                    let total = app.agents.len();
+                                    let online = app.agents.iter().filter(|a| a.status == AgentStatus::Online).count();
+                                    let offline: Vec<String> = app.agents.iter()
+                                        .filter(|a| a.status == AgentStatus::Offline)
+                                        .map(|a| a.name.clone()).collect();
+                                    let unknown: Vec<String> = app.agents.iter()
+                                        .filter(|a| a.status == AgentStatus::Unknown)
+                                        .map(|a| a.name.clone()).collect();
+                                    let outdated: Vec<String> = app.agents.iter()
+                                        .filter(|a| !a.oc_version.is_empty() && a.oc_version != "2026.2.21-2" && a.oc_version != "?")
+                                        .map(|a| format!("{}({})", a.name, a.oc_version)).collect();
+
+                                    let mut msg = format!("🏥 {}/{} online", online, total);
+                                    if !offline.is_empty() { msg += &format!(" │ ❌ offline: {}", offline.join(", ")); }
+                                    if !unknown.is_empty() { msg += &format!(" │ ❓ unknown: {}", unknown.join(", ")); }
+                                    if !outdated.is_empty() { msg += &format!(" │ ⚠️  old OC: {}", outdated.join(", ")); }
+                                    if offline.is_empty() && unknown.is_empty() && outdated.is_empty() { msg += " │ ✅ All healthy"; }
+                                    app.status_message = msg;
+                                }
                                 KeyCode::Char('/') => {
                                     app.focus = Focus::Command;
                                     app.command_input.clear();
