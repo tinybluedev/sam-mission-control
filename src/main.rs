@@ -2180,6 +2180,24 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         if svc.name == "model" || svc.name == "gateway" { return; } // Can't toggle these
         let new_state = !svc.enabled;
         let name = svc.name.clone();
+        let mut proposed = self.svc_config.clone().unwrap_or_else(|| serde_json::json!({}));
+        if let Some(root) = proposed.as_object_mut() {
+            let plugins = root.entry("plugins").or_insert_with(|| serde_json::json!({}));
+            if let Some(plugins_obj) = plugins.as_object_mut() {
+                let entries = plugins_obj.entry("entries").or_insert_with(|| serde_json::json!({}));
+                if let Some(entries_obj) = entries.as_object_mut() {
+                    let plugin = entries_obj.entry(name.clone()).or_insert_with(|| serde_json::json!({}));
+                    if let Some(plugin_obj) = plugin.as_object_mut() {
+                        plugin_obj.insert("enabled".into(), serde_json::Value::Bool(new_state));
+                    }
+                }
+            }
+        }
+        let validation_errors = validate::validate_openclaw_config(&proposed);
+        if !validation_errors.is_empty() {
+            self.toast(&format!("❌ Config validation failed: {}", validation_errors[0]));
+            return;
+        }
         let agent = &self.agents[self.selected];
         let host = agent.host.clone();
         let user = agent.ssh_user.clone();
@@ -4728,6 +4746,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(cli::Commands::Log { agent, tail }) => {
             return cli::run_log(agent.as_deref(), tail).await.map_err(|e| e.into());
+        }
+        Some(cli::Commands::Validate { agent }) => {
+            return cli::run_validate(agent.as_deref()).await.map_err(|e| e.into());
         }
         Some(cli::Commands::Version) => {
             println!("sam v{}", env!("CARGO_PKG_VERSION"));

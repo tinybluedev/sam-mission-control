@@ -12,6 +12,7 @@
 //! - [`Commands::Setup`] — regenerate `config.toml`
 //! - [`Commands::Onboard`] — provision a new agent over SSH
 //! - [`Commands::Deploy`] — push a file to an agent's workspace
+//! - [`Commands::Validate`] — validate remote openclaw.json schema
 //! - [`Commands::Version`] — print the binary version
 
 use clap::{Parser, Subcommand};
@@ -144,6 +145,11 @@ pub enum Commands {
         /// Number of most recent entries to show
         #[arg(long, default_value = "20")]
         tail: u32,
+    },
+    /// Validate remote openclaw.json schema
+    Validate {
+        /// Optional single agent name (default: validate all agents)
+        agent: Option<String>,
     },
 }
 
@@ -1143,5 +1149,72 @@ pub async fn run_log(agent: Option<&str>, tail: u32) -> Result<(), Box<dyn std::
     println!("   {} operations shown\n", ops.len());
 
     pool.disconnect().await?;
+    Ok(())
+}
+
+/// Validate openclaw.json on one agent or the full fleet.
+pub async fn run_validate(agent: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::process::Command;
+
+    let pool = crate::db::get_pool();
+    let fleet = crate::db::load_fleet(&pool).await?;
+    let targets: Vec<&crate::db::DbAgent> = if let Some(name) = agent {
+        fleet.iter().filter(|a| a.agent_name == name).collect()
+    } else {
+        fleet.iter().collect()
+    };
+
+    if targets.is_empty() {
+        return Err("No matching agents found".into());
+    }
+
+    println!("\n🔎 Validating openclaw.json schema\n");
+    let mut invalid_agents = 0usize;
+    for target in targets {
+        let name = &target.agent_name;
+        let ip = target.tailscale_ip.as_deref().unwrap_or("?");
+        print!("  {} ({}) ... ", name, ip);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Command::new("ssh").args([
+                "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                &format!("admin@{}", ip), "cat ~/.openclaw/openclaw.json 2>/dev/null || echo null",
+            ]).output()
+        ).await;
+
+        let text = match out {
+            Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => {
+                println!("❌ unreachable");
+                invalid_agents += 1;
+                continue;
+            }
+        };
+
+        let parsed = match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("❌ invalid JSON ({})", e);
+                invalid_agents += 1;
+                continue;
+            }
+        };
+
+        let errors = validate::validate_openclaw_config(&parsed);
+        if errors.is_empty() {
+            println!("✅ valid");
+        } else {
+            invalid_agents += 1;
+            println!("❌ {} issue(s)", errors.len());
+            for err in errors {
+                println!("     - {}", err);
+            }
+        }
+    }
+
+    pool.disconnect().await?;
+    if invalid_agents > 0 {
+        return Err(format!("Validation failed for {} agent(s)", invalid_agents).into());
+    }
     Ok(())
 }

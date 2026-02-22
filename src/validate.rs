@@ -140,6 +140,74 @@ pub fn validate_deploy_filename(value: &str) -> Result<(), String> {
     validate_shell_arg(value)
 }
 
+/// Validate openclaw.json schema requirements used by SAM write operations.
+///
+/// Returns a list of human-readable validation errors. Empty list means valid.
+pub fn validate_openclaw_config(config: &serde_json::Value) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let defaults = config
+        .get("agents")
+        .and_then(|a| a.get("defaults"));
+
+    let model_value = defaults.and_then(|d| d.get("model"));
+    let model = model_value
+        .and_then(|m| m.as_str())
+        .or_else(|| model_value.and_then(|m| m.get("primary")).and_then(|p| p.as_str()));
+    match model {
+        Some(m) if m.contains('/') && !m.starts_with('/') && !m.ends_with('/') => {}
+        Some(_) => errors.push("agents.defaults.model must match provider/model-name".into()),
+        None => errors.push("Missing required field: agents.defaults.model".into()),
+    }
+
+    match defaults
+        .and_then(|d| d.get("contextTokens"))
+        .and_then(|c| c.as_i64())
+    {
+        Some(v) if (1000..=2_000_000).contains(&v) => {}
+        Some(_) => errors.push("agents.defaults.contextTokens must be an integer between 1000 and 2000000".into()),
+        None => errors.push("Missing required field: agents.defaults.contextTokens".into()),
+    }
+
+    if let Some(entries) = config.get("plugins").and_then(|p| p.get("entries")) {
+        if !entries.is_array() {
+            errors.push("plugins.entries must be an array when present".into());
+        }
+    }
+
+    fn walk_tokens(path: &str, value: &serde_json::Value, errors: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let next = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
+                    if k == "requireMention" && !v.is_boolean() {
+                        errors.push(format!("{} must be a boolean", next));
+                    }
+                    let key_lower = k.to_ascii_lowercase();
+                    let is_token_field = key_lower == "token"
+                        || key_lower.ends_with("token")
+                        || key_lower.ends_with("_token");
+                    if is_token_field
+                        && !matches!(v, serde_json::Value::String(s) if !s.trim().is_empty())
+                    {
+                        errors.push(format!("{} must be a non-empty string", next));
+                    }
+                    walk_tokens(&next, v, errors);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    walk_tokens(&format!("{}[{}]", path, i), item, errors);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk_tokens("", config, &mut errors);
+    errors
+}
+
 // ---- Unit tests ----
 
 #[cfg(test)]
@@ -349,5 +417,30 @@ mod tests {
         assert!(validate_deploy_filename("a\\b.txt").is_err());
         assert!(validate_deploy_filename(".").is_err());
         assert!(validate_deploy_filename("..").is_err());
+    }
+
+    #[test]
+    fn openclaw_config_valid_minimum_schema() {
+        let cfg = serde_json::json!({
+            "agents": { "defaults": { "model": "openai/gpt-4.1", "contextTokens": 200000 } },
+            "plugins": { "entries": [] },
+            "channels": { "discord": { "requireMention": true, "botToken": "abc" } }
+        });
+        assert!(validate_openclaw_config(&cfg).is_empty());
+    }
+
+    #[test]
+    fn openclaw_config_reports_schema_errors() {
+        let cfg = serde_json::json!({
+            "agents": { "defaults": { "model": "badmodel", "contextTokens": 10 } },
+            "plugins": { "entries": {} },
+            "channels": { "discord": { "requireMention": "yes", "botToken": "" } }
+        });
+        let errors = validate_openclaw_config(&cfg);
+        assert!(errors.iter().any(|e| e.contains("provider/model-name")));
+        assert!(errors.iter().any(|e| e.contains("contextTokens")));
+        assert!(errors.iter().any(|e| e.contains("plugins.entries")));
+        assert!(errors.iter().any(|e| e.contains("requireMention")));
+        assert!(errors.iter().any(|e| e.contains("botToken")));
     }
 }
