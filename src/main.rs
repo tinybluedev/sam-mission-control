@@ -3081,6 +3081,50 @@ fn render_alerts(frame: &mut Frame, app: &App) {
     frame.render_widget(footer, outer[2]);
 }
 
+fn render_spawn_manager(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let outer = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
+        .split(frame.area());
+
+    let bg_block = Block::default().style(Style::default().bg(app.bg_density.bg()));
+    frame.render_widget(bg_block, frame.area());
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("🤖 SPAWN MANAGER", Style::default().fg(t.header_title).bold()),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(header, outer[0]);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("  🚧 Coming Soon", Style::default().fg(t.accent).bold())),
+        Line::from(""),
+        Line::from(Span::styled("  Spawn Manager will allow you to:", Style::default().fg(t.text))),
+        Line::from(""),
+        Line::from(Span::styled("    • View spawned agent sessions and processes", Style::default().fg(t.text_dim))),
+        Line::from(Span::styled("    • Monitor agent name, spawn time, and status", Style::default().fg(t.text_dim))),
+        Line::from(Span::styled("    • Inspect active prompt / task per agent", Style::default().fg(t.text_dim))),
+        Line::from(Span::styled("    • Kill, respawn, or view output of agents", Style::default().fg(t.text_dim))),
+    ];
+
+    let body = Paragraph::new(lines)
+        .block(Block::default().title(Span::styled(" ◆── Spawn Manager ──◆ ", Style::default().fg(t.border_active).bold()))
+            .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(t.border_active))
+            .style(Style::default().bg(app.bg_density.bg()))
+            .padding(Padding::new(1, 1, 1, 0)));
+    frame.render_widget(body, outer[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Esc=back │ q=quit", Style::default().fg(t.text_dim)),
+    ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(footer, outer[2]);
+}
+
 fn render_help(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let sections = vec![
@@ -3173,6 +3217,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
         Screen::Help => "Help".to_string(),
+        Screen::SpawnManager => "Dashboard › Spawn Manager".to_string(),
         _ => "Dashboard".to_string(),
     };
 
@@ -3195,6 +3240,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             vec![("n","new"),("d","done"),("Esc","back")]
         },
         Screen::Help => vec![("Esc","back"),("q","quit")],
+        Screen::SpawnManager => vec![("Esc","back"),("q","quit")],
         _ => vec![("Esc","back")],
     };
 
@@ -3350,7 +3396,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Screen::VpnStatus => render_vpn_status(f, &app),
                 Screen::Alerts => render_alerts(f, &app),
                 Screen::Help => render_help(f, &app),
-                Screen::SpawnManager => render_help(f, &app),
+                Screen::SpawnManager => render_spawn_manager(f, &app),
             }
             // Diagnostic overlay (renders on top of everything)
             if app.diag_active {
