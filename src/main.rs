@@ -3,6 +3,7 @@ mod config;
 mod wizard;
 mod db;
 mod theme;
+mod validate;
 
 use clap::Parser;
 use dotenvy;
@@ -385,8 +386,9 @@ impl App {
 
     async fn send_message(&mut self) {
         if self.chat_input.trim().is_empty() { return; }
-        let message = self.chat_input.clone();
+        let message = validate::sanitize_chat_message(&self.chat_input);
         self.chat_input.clear();
+        if message.is_empty() { return; }
 
         // Dashboard chat = broadcast to all agents
         let agent_names: Vec<String> = self.agents.iter().map(|a| a.db_name.clone()).collect();
@@ -465,8 +467,9 @@ impl App {
 
     async fn send_agent_message(&mut self) {
         if self.agent_chat_input.trim().is_empty() { return; }
-        let message = self.agent_chat_input.clone();
+        let message = validate::sanitize_chat_message(&self.agent_chat_input);
         self.agent_chat_input.clear();
+        if message.is_empty() { return; }
         let agent = &self.agents[self.selected];
         let target = agent.db_name.clone();
         let host = agent.host.clone();

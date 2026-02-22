@@ -1,6 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use crate::theme::Theme;
+use crate::validate;
 
 #[derive(PartialEq, Clone)]
 pub enum WizardStep {
@@ -142,12 +143,22 @@ impl AgentWizard {
         // Validate current step
         match self.step {
             WizardStep::AgentName => {
-                let name = self.agent_name.trim().to_lowercase().replace(' ', "-");
-                if name.is_empty() { self.error = Some("Name required".into()); return false; }
-                self.agent_name = name;
+                match validate::normalize_agent_name(&self.agent_name) {
+                    Ok(name) => self.agent_name = name,
+                    Err(e) => { self.error = Some(e); return false; }
+                }
             }
             WizardStep::Host => {
-                if self.host.trim().is_empty() { self.error = Some("Host/IP required".into()); return false; }
+                if let Err(e) = validate::validate_ip_address(self.host.trim()) {
+                    self.error = Some(e);
+                    return false;
+                }
+            }
+            WizardStep::SshUser => {
+                if let Err(e) = validate::validate_ssh_username(self.ssh_user.trim()) {
+                    self.error = Some(e);
+                    return false;
+                }
             }
             WizardStep::Confirm => return true, // Signal: ready to create
             _ => {}
