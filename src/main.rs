@@ -116,7 +116,7 @@ struct ChatLine {
 }
 
 #[derive(PartialEq, Clone)]
-enum Focus { Fleet, Chat, AgentChat, Command, Workspace }
+enum Focus { Fleet, Chat, AgentChat, Command, Workspace, Services }
 
 #[derive(PartialEq)]
 enum Screen { Dashboard, AgentDetail, TaskBoard, SpawnManager, VpnStatus, Alerts, Help }
@@ -295,6 +295,13 @@ struct App {
     // Alerts
     alerts: Vec<Alert>,
     alert_flash: Option<Instant>,
+    // Services (OpenClaw plugin management)
+    svc_list: Vec<ServiceEntry>,
+    svc_selected: usize,
+    svc_config: Option<serde_json::Value>,  // Full openclaw.json
+    svc_loading: bool,
+    svc_load_rx: Option<mpsc::UnboundedReceiver<Option<serde_json::Value>>>,
+    svc_detail_scroll: u16,
     // Workspace (agent file management)
     ws_files: Vec<WorkspaceFile>,
     ws_selected: usize,
@@ -405,6 +412,7 @@ impl App {
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
+            svc_list: vec![], svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
         }
@@ -946,6 +954,184 @@ impl App {
         }
     }
 
+    /// Load OpenClaw config from agent via SSH (non-blocking)
+    fn start_services_load(&mut self) {
+        if self.selected >= self.agents.len() { return; }
+        if self.svc_loading { return; }
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        self.svc_loading = true;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.svc_load_rx = Some(rx);
+
+        tokio::spawn(async move {
+            let output = tokio::time::timeout(
+                Duration::from_secs(8),
+                Command::new("ssh").args([
+                    "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), "cat ~/.openclaw/openclaw.json 2>/dev/null || echo null",
+                ]).output()
+            ).await;
+            let config = match output {
+                Ok(Ok(o)) if o.status.success() => {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    serde_json::from_str::<serde_json::Value>(s.trim()).ok()
+                }
+                _ => None,
+            };
+            let _ = tx.send(config);
+        });
+    }
+
+    /// Parse services from loaded config
+    fn parse_services(&mut self) {
+        let mut services = Vec::new();
+        if let Some(ref config) = self.svc_config {
+            // Get enabled plugins
+            let plugins = config.get("plugins").and_then(|p| p.get("entries"))
+                .and_then(|e| e.as_object());
+            let channels = config.get("channels").and_then(|c| c.as_object());
+
+            // Collect all known services (from plugins + channels)
+            let mut seen = std::collections::HashSet::new();
+            if let Some(plugins) = plugins {
+                for (name, val) in plugins {
+                    seen.insert(name.clone());
+                    let enabled = val.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+                    let has_channel = channels.map(|c| c.contains_key(name)).unwrap_or(false);
+                    let summary = if has_channel {
+                        self.build_channel_summary(name, config)
+                    } else if enabled {
+                        "enabled, no channel config".into()
+                    } else {
+                        "disabled".into()
+                    };
+                    services.push(ServiceEntry {
+                        name: name.clone(), icon: svc_icon(name),
+                        enabled, has_channel_config: has_channel, summary,
+                    });
+                }
+            }
+            // Also show channels that exist but aren't in plugins
+            if let Some(channels) = channels {
+                for name in channels.keys() {
+                    if !seen.contains(name) {
+                        seen.insert(name.clone());
+                        let summary = self.build_channel_summary(name, config);
+                        services.push(ServiceEntry {
+                            name: name.clone(), icon: svc_icon(name),
+                            enabled: false, has_channel_config: true,
+                            summary: format!("no plugin entry — {}", summary),
+                        });
+                    }
+                }
+            }
+
+            // Add gateway info
+            if let Some(gw) = config.get("gateway") {
+                let mode = gw.get("mode").and_then(|m| m.as_str()).unwrap_or("?");
+                let has_token = gw.get("auth").and_then(|a| a.get("token")).is_some();
+                let bind = gw.get("bind").and_then(|b| b.as_str()).unwrap_or("localhost");
+                let chat = config.get("gateway").and_then(|g| g.get("chatCompletions"))
+                    .and_then(|c| c.get("enabled")).and_then(|e| e.as_bool()).unwrap_or(false);
+                services.insert(0, ServiceEntry {
+                    name: "gateway".into(), icon: "🌐",
+                    enabled: true, has_channel_config: false,
+                    summary: format!("mode:{} bind:{} chat:{} auth:{}", mode, bind, if chat {"on"} else {"off"}, if has_token {"token"} else {"none"}),
+                });
+            }
+
+            // Add model info
+            if let Some(agents) = config.get("agents").and_then(|a| a.get("defaults")) {
+                let model = agents.get("model").and_then(|m| m.get("primary"))
+                    .and_then(|p| p.as_str()).unwrap_or("?");
+                let ctx = agents.get("contextTokens").and_then(|c| c.as_u64()).unwrap_or(0);
+                services.insert(0, ServiceEntry {
+                    name: "model".into(), icon: "🧠",
+                    enabled: true, has_channel_config: false,
+                    summary: format!("{} ({}K ctx)", model.split('/').last().unwrap_or(model), ctx / 1000),
+                });
+            }
+        }
+        services.sort_by(|a, b| {
+            // Gateway and model first, then enabled, then disabled
+            let rank = |s: &ServiceEntry| -> u8 {
+                if s.name == "model" { 0 }
+                else if s.name == "gateway" { 1 }
+                else if s.enabled { 2 }
+                else { 3 }
+            };
+            rank(a).cmp(&rank(b))
+        });
+        self.svc_list = services;
+    }
+
+    fn build_channel_summary(&self, name: &str, config: &serde_json::Value) -> String {
+        let ch = config.get("channels").and_then(|c| c.get(name));
+        match ch {
+            Some(v) => {
+                let mut parts = Vec::new();
+                if let Some(dm) = v.get("dmPolicy").and_then(|d| d.as_str()) {
+                    parts.push(format!("dm:{}", dm));
+                }
+                if let Some(groups) = v.get("groups").and_then(|g| g.as_array()) {
+                    parts.push(format!("{} groups", groups.len()));
+                }
+                if v.get("botToken").is_some() { parts.push("token:✓".into()); }
+                if v.get("botId").is_some() { parts.push("botId:✓".into()); }
+                if let Some(ch_arr) = v.get("channels").and_then(|c| c.as_array()) {
+                    parts.push(format!("{} channels", ch_arr.len()));
+                }
+                if parts.is_empty() { "configured".into() } else { parts.join("  ") }
+            }
+            None => "no config".into(),
+        }
+    }
+
+    /// Toggle a service plugin enabled/disabled via SSH
+    fn toggle_service(&mut self) {
+        if self.svc_selected >= self.svc_list.len() { return; }
+        let svc = &self.svc_list[self.svc_selected];
+        if svc.name == "model" || svc.name == "gateway" { return; } // Can't toggle these
+        let new_state = !svc.enabled;
+        let name = svc.name.clone();
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+
+        let cmd = format!(
+            r#"python3 -c "
+import json
+with open('$HOME/.openclaw/openclaw.json'.replace('$HOME', __import__('os').path.expanduser('~'))) as f:
+    d = json.load(f)
+d.setdefault('plugins', {{}}).setdefault('entries', {{}}).setdefault('{}', {{}})['enabled'] = {}
+with open('$HOME/.openclaw/openclaw.json'.replace('$HOME', __import__('os').path.expanduser('~')), 'w') as f:
+    json.dump(d, f, indent=2)
+print('ok')
+""#, name, if new_state { "True" } else { "False" }
+        );
+
+        let toast_msg = format!("{} {} {}", svc.icon, name, if new_state { "enabled" } else { "disabled" });
+        self.toast(&toast_msg);
+
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(8),
+                Command::new("ssh").args([
+                    "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &cmd,
+                ]).output()
+            ).await;
+        });
+
+        // Optimistic update
+        if let Some(svc) = self.svc_list.get_mut(self.svc_selected) {
+            svc.enabled = new_state;
+        }
+    }
+
     /// Load workspace files for focused agent via SSH (non-blocking)
     fn start_workspace_load(&mut self) {
         if self.selected >= self.agents.len() { return; }
@@ -1298,6 +1484,28 @@ struct CronEntry {
     schedule: String,
     description: String,
     enabled: bool,
+}
+
+/// OpenClaw service/plugin entry
+#[derive(Clone, Debug)]
+struct ServiceEntry {
+    name: String,
+    icon: &'static str,
+    enabled: bool,
+    has_channel_config: bool,
+    summary: String,  // e.g. "2 groups, dmPolicy: pairing"
+}
+
+const SERVICE_ICONS: &[(&str, &str)] = &[
+    ("telegram", "📱"), ("discord", "🎮"), ("signal", "🔒"), ("whatsapp", "💬"),
+    ("slack", "💼"), ("irc", "📟"), ("matrix", "🔷"), ("imessage", "🍎"),
+    ("bluebubbles", "🫧"), ("msteams", "🏢"), ("nostr", "🟣"), ("twitch", "🎬"),
+    ("line", "🟢"), ("googlechat", "🟡"), ("mattermost", "🔵"), ("feishu", "🦅"),
+    ("zalo", "📲"), ("nextcloud-talk", "☁️"), ("tlon", "🌐"),
+];
+
+fn svc_icon(name: &str) -> &'static str {
+    SERVICE_ICONS.iter().find(|(n, _)| *n == name).map(|(_, i)| *i).unwrap_or("🔌")
 }
 
 const AGENT_FILES: &[(&str, &str, &str)] = &[
@@ -1978,9 +2186,10 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         Span::styled(a.status.to_string(), Style::default().fg(st_color)),
         Span::raw("    "),
         Span::styled(match app.focus {
-            Focus::AgentChat => "  1:Info  2:▌Chat▐  3:Files  4:Tasks ",
-            Focus::Workspace => "  1:Info  2:Chat  3:▌Files▐  4:Tasks ",
-            _ => "  1:▌Info▐  2:Chat  3:Files  4:Tasks ",
+            Focus::AgentChat => " 1:Info 2:▌Chat▐ 3:Files 4:Tasks 5:Svc",
+            Focus::Workspace => " 1:Info 2:Chat 3:▌Files▐ 4:Tasks 5:Svc",
+            Focus::Services => " 1:Info 2:Chat 3:Files 4:Tasks 5:▌Svc▐",
+            _ => " 1:▌Info▐ 2:Chat 3:Files 4:Tasks 5:Svc",
         }, Style::default().fg(t.accent).bold()),
     ]))
     .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
@@ -2046,6 +2255,8 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         .padding(Padding::new(1, 1, 1, 0)));
     if app.focus == Focus::Workspace {
         render_workspace(frame, app, body[0]);
+    } else if app.focus == Focus::Services {
+        render_services(frame, app, body[0]);
     } else {
         frame.render_widget(detail, body[0]);
     }
@@ -2059,6 +2270,128 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
 
     // Footer
     render_footer(frame, app, chunks[2]);
+}
+
+fn render_services(frame: &mut Frame, app: &App, area: Rect) {
+    let t = &app.theme;
+    let split = Layout::default().direction(Direction::Horizontal)
+        .constraints([Constraint::Length(30), Constraint::Min(40)])
+        .split(area);
+
+    // Left: service list
+    let mut items: Vec<Line> = Vec::new();
+    items.push(Line::from(Span::styled("  🔌 Services & Plugins", Style::default().fg(t.header_title).bold())));
+    items.push(Line::from(""));
+
+    if app.svc_loading {
+        items.push(Line::from(Span::styled("  Loading config...", Style::default().fg(t.pending))));
+    } else if app.svc_list.is_empty() {
+        items.push(Line::from(Span::styled("  No config loaded", Style::default().fg(t.text_dim))));
+    } else {
+        for (i, svc) in app.svc_list.iter().enumerate() {
+            let selected = i == app.svc_selected;
+            let prefix = if selected { " ▸ " } else { "   " };
+            let status_icon = if svc.name == "model" || svc.name == "gateway" {
+                "◆"
+            } else if svc.enabled { "●" } else { "○" };
+            let status_color = if svc.enabled { t.status_online } else { t.text_dim };
+            let name_style = if selected {
+                Style::default().fg(Color::Black).bg(t.accent).bold()
+            } else {
+                Style::default().fg(if svc.enabled { t.text } else { t.text_dim })
+            };
+            items.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(t.accent)),
+                Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
+                Span::styled(format!("{} ", svc.icon), Style::default()),
+                Span::styled(format!("{:<16}", svc.name), name_style),
+            ]));
+        }
+    }
+
+    items.push(Line::from(""));
+    items.push(Line::from(Span::styled("  ↑↓ select  Space toggle", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  Enter details  r reload", Style::default().fg(t.text_dim))));
+
+    let list = Paragraph::new(items)
+        .block(Block::default()
+            .title(Span::styled(" Services ", Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(t.border_type)
+            .border_style(Style::default().fg(t.border_active))
+            .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(list, split[0]);
+
+    // Right: service detail
+    let detail_lines = if app.svc_selected < app.svc_list.len() {
+        let svc = &app.svc_list[app.svc_selected];
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(format!("  {} ", svc.icon), Style::default()),
+                Span::styled(&svc.name, Style::default().fg(t.header_title).bold()),
+                Span::raw("  "),
+                Span::styled(
+                    if svc.enabled { "● enabled" } else { "○ disabled" },
+                    Style::default().fg(if svc.enabled { t.status_online } else { t.text_dim }),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Summary: ", Style::default().fg(t.text_bold).bold()),
+                Span::styled(&svc.summary, Style::default().fg(t.text)),
+            ]),
+            Line::from(""),
+        ];
+
+        // Show raw config section if available
+        if let Some(ref config) = app.svc_config {
+            let section = if svc.name == "gateway" {
+                config.get("gateway")
+            } else if svc.name == "model" {
+                config.get("agents")
+            } else {
+                // Show channel config if exists, otherwise plugin config
+                config.get("channels").and_then(|c| c.get(&svc.name))
+                    .or_else(|| config.get("plugins").and_then(|p| p.get("entries")).and_then(|e| e.get(&svc.name)))
+            };
+
+            if let Some(section) = section {
+                lines.push(Line::from(Span::styled("  Configuration:", Style::default().fg(t.text_bold).bold())));
+                lines.push(Line::from(""));
+                let pretty = serde_json::to_string_pretty(section).unwrap_or_default();
+                for line in pretty.lines() {
+                    // Syntax highlight JSON
+                    let styled = if line.contains(':') {
+                        let parts: Vec<&str> = line.splitn(2, ':').collect();
+                        Line::from(vec![
+                            Span::styled(format!("  {}", parts[0]), Style::default().fg(t.accent)),
+                            Span::styled(format!(":{}", parts.get(1).unwrap_or(&"")), Style::default().fg(t.text)),
+                        ])
+                    } else {
+                        Line::from(Span::styled(format!("  {}", line), Style::default().fg(t.text_dim)))
+                    };
+                    lines.push(styled);
+                }
+            }
+        }
+        lines
+    } else {
+        vec![Line::from(Span::styled("  Select a service", Style::default().fg(t.text_dim)))]
+    };
+
+    let detail_title = if app.svc_selected < app.svc_list.len() {
+        format!(" {} Detail ", app.svc_list[app.svc_selected].name)
+    } else {
+        " Detail ".to_string()
+    };
+
+    let detail = Paragraph::new(detail_lines)
+        .scroll((app.svc_detail_scroll, 0))
+        .block(Block::default()
+            .title(Span::styled(detail_title, Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(t.border_type)
+            .border_style(Style::default().fg(t.border))
+            .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(detail, split[1]);
 }
 
 fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
@@ -2594,12 +2927,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             _ => "Enter:open  t:tasks  f:filter  s:sort  r:refresh  /:cmd  ?:help  q:quit",
         },
         Screen::AgentDetail => match app.focus {
-            Focus::AgentChat => "Enter:send  @:tag  Tab:next  Esc:info  1-4:tabs",
-            Focus::Workspace => "Enter:view  e:edit  r:reload  Esc:info  1-4:tabs",
-            _ => "Tab:chat  w:files  t:tasks  g:gateway  e:config  Esc:back  1-4:tabs",
+            Focus::AgentChat => "Enter:send  @:tag  Tab:next  Esc:info  1-5:tabs",
+            Focus::Workspace => "Enter:view  e:edit  r:reload  Esc:info  1-5:tabs",
+            Focus::Services => "Space:toggle  r:reload  PgUp/Dn:scroll  Esc:info  1-5:tabs",
+            _ => "Tab:chat  w:files  t:tasks  5:services  Esc:back  1-5:tabs",
         },
         Screen::TaskBoard => if app.task_filter_agent.is_some() {
-            "n:new  d:done  c:clear filter  1-3:tabs  Esc:back to agent"
+            "n:new  d:done  c:clear  1-3/5:tabs  Esc:back"
         } else {
             "n:new  d:done  Esc:back"
         },
@@ -2958,6 +3292,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => { app.config_text = None; }
                         },
                         Screen::AgentDetail => match app.focus {
+                            Focus::Services => match key.code {
+                                KeyCode::Esc => app.focus = Focus::Fleet,
+                                KeyCode::Tab => app.focus = Focus::Fleet,
+                                KeyCode::Char('1') => app.focus = Focus::Fleet,
+                                KeyCode::Char('2') => app.focus = Focus::AgentChat,
+                                KeyCode::Char('3') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
+                                KeyCode::Char('4') | KeyCode::Char('t') => {
+                                    app.task_filter_agent = Some(app.agents[app.selected].db_name.clone());
+                                    app.screen = Screen::TaskBoard;
+                                    app.last_task_poll = Instant::now() - Duration::from_secs(10);
+                                }
+                                KeyCode::Char('5') => { app.focus = Focus::Services; app.start_services_load(); }
+                                KeyCode::Char('5') => {} // already here
+                                KeyCode::Up => { if app.svc_selected > 0 { app.svc_selected -= 1; app.svc_detail_scroll = 0; } }
+                                KeyCode::Down => { if app.svc_selected < app.svc_list.len().saturating_sub(1) { app.svc_selected += 1; app.svc_detail_scroll = 0; } }
+                                KeyCode::Char(' ') => app.toggle_service(),
+                                KeyCode::Char('r') => app.start_services_load(),
+                                KeyCode::PageUp => app.svc_detail_scroll = app.svc_detail_scroll.saturating_add(5),
+                                KeyCode::PageDown => app.svc_detail_scroll = app.svc_detail_scroll.saturating_sub(5),
+                                KeyCode::Char('q') => app.should_quit = true,
+                                _ => {}
+                            },
                             Focus::Workspace => match key.code {
                                 KeyCode::Esc => app.focus = Focus::Fleet,
                                 KeyCode::Tab => app.focus = Focus::Fleet,
@@ -2969,6 +3325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                 }
+                                KeyCode::Char('5') => { app.focus = Focus::Services; app.start_services_load(); }
                                 KeyCode::Up => { if app.ws_selected > 0 { app.ws_selected -= 1; } }
                                 KeyCode::Down => { if app.ws_selected < app.ws_files.len().saturating_sub(1) { app.ws_selected += 1; } }
                                 KeyCode::Enter => app.start_file_load(),
@@ -3007,6 +3364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         app.screen = Screen::TaskBoard;
                                         app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                     }
+                                    KeyCode::Char('5') if app.agent_chat_input.is_empty() => { app.focus = Focus::Services; app.start_services_load(); }
                                     KeyCode::Enter => app.send_agent_message().await,
                                     KeyCode::Backspace => { app.agent_chat_input.pop(); app.update_autocomplete(); }
                                     KeyCode::Char(c) => { app.agent_chat_input.push(c); app.update_autocomplete(); }
@@ -3151,6 +3509,7 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                     KeyCode::Char('2') if app.task_filter_agent.is_some() => { app.screen = Screen::AgentDetail; app.focus = Focus::AgentChat; }
                                     KeyCode::Char('3') if app.task_filter_agent.is_some() => { app.screen = Screen::AgentDetail; app.focus = Focus::Workspace; app.start_workspace_load(); }
                                     KeyCode::Char('4') => {} // already on tasks
+                                    KeyCode::Char('5') if app.task_filter_agent.is_some() => { app.screen = Screen::AgentDetail; app.focus = Focus::Services; app.start_services_load(); }
                                     KeyCode::Up | KeyCode::Char('k') => { if app.task_selected > 0 { app.task_selected -= 1; } }
                                     KeyCode::Down | KeyCode::Char('j') => { if app.task_selected < app.tasks.len().saturating_sub(1) { app.task_selected += 1; } }
                                     KeyCode::Char('n') => app.task_input_active = true,
@@ -3493,6 +3852,17 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                 }
             }
             app.last_task_poll = Instant::now();
+        }
+
+        // Receive services load results (non-blocking)
+        if let Some(ref mut rx) = app.svc_load_rx {
+            if let Ok(config) = rx.try_recv() {
+                app.svc_config = config;
+                app.parse_services();
+                app.svc_loading = false;
+                let count = app.svc_list.len();
+                app.toast(&format!("✓ Loaded {} services", count));
+            }
         }
 
         // Receive workspace load results (non-blocking)
