@@ -247,15 +247,17 @@ struct ProbeResult {
 }
 
 // ── UI Helpers ──────────────────────────────────────
-fn chrono_now() -> String {
+fn chrono_now_hms() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let secs = now % 86400;
+    // Keep fixed UTC-6 offset for consistency with the existing app clock display.
     let hours = ((secs / 3600) + 24 - 6) % 24; // UTC-6 for CST
     let mins = (secs % 3600) / 60;
-    format!("{:02}:{:02}", hours, mins)
+    let sec = secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, mins, sec)
 }
 
 fn os_emoji(os: &str) -> &'static str {
@@ -295,6 +297,12 @@ fn format_uptime(secs: i64) -> String {
     } else {
         format!("{}m", mins)
     }
+}
+
+fn format_app_uptime(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    if hours > 0 { format!("{}h {}m", hours, mins) } else { format!("{}m", mins) }
 }
 
 fn format_last_seen(dt: &str) -> String {
@@ -348,6 +356,19 @@ fn ping_color(latency: Option<u32>) -> ratatui::style::Color {
         Some(ms) if ms < 500 => ratatui::style::Color::Yellow,
         Some(_) => ratatui::style::Color::Red,
         None => ratatui::style::Color::DarkGray,
+    }
+}
+
+fn db_latency_color(latency: Option<u32>, online: bool, t: &Theme) -> Color {
+    if !online {
+        t.status_offline
+    } else {
+        match latency {
+            Some(ms) if ms < 10 => t.status_online,
+            Some(ms) if ms < 50 => t.status_busy,
+            Some(_) => t.status_offline,
+            None => t.text_dim,
+        }
     }
 }
 
@@ -486,6 +507,10 @@ struct App {
     // Operation state persistence
     interrupted_ops: Vec<db::Operation>,
     diag_task_running: bool,
+    tui_start: Instant,
+    db_latency_ms: Option<u32>,
+    db_online: bool,
+    db_latency_rx: Option<mpsc::UnboundedReceiver<Option<u32>>>,
 }
 
 /// Returns true for npm output lines worth showing in the overlay.
@@ -5107,6 +5132,7 @@ const LINES_PER_MSG_EST: usize = 3;
 const SPINNER_FRAME_MS: u64 = 100;
 /// Input poll interval in milliseconds. Lower values improve key/menu responsiveness.
 const INPUT_POLL_MS: u64 = 10;
+const STATUS_OP_PULSE_MS: u128 = 500;
 
 fn fmt_hhmm(t: &str) -> String {
     t.chars().take(5).collect()
@@ -5700,6 +5726,48 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         render_chat_panel(frame, app, body[1], app.focus == Focus::Chat, false);
     }
     render_footer(frame, app, outer[2]);
+    render_status_bar(frame, app, outer[3], online, total, health_color);
+}
+
+fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, online: usize, total: usize, health_color: Color) {
+    let t = &app.theme;
+    let elapsed = app.tui_start.elapsed();
+    let uptime = format_app_uptime(elapsed.as_secs());
+    let ops = app.active_ops_running();
+    let pulse = if (elapsed.as_millis() / STATUS_OP_PULSE_MS) % 2 == 0 { "◐" } else { "◓" };
+    let db_text = if app.db_online {
+        match app.db_latency_ms {
+            Some(ms) => format!("DB: {}ms", ms),
+            None => "DB: …".to_string(),
+        }
+    } else {
+        "DB: ✗ offline".to_string()
+    };
+    let db_span = Span::styled(
+        format!("[{}]", db_text),
+        Style::default().fg(db_latency_color(app.db_latency_ms, app.db_online, t)).bold(),
+    );
+    let ops_text = if ops > 0 {
+        format!("[ops: {} {}]", ops, pulse)
+    } else {
+        "[ops: 0 running]".to_string()
+    };
+    let status = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("[{}]", chrono_now_hms()), Style::default().fg(t.text_dim)),
+        Span::raw(" "),
+        Span::styled(format!("[sam uptime: {}]", uptime), Style::default().fg(t.text)),
+        Span::raw(" "),
+        db_span,
+        Span::raw(" "),
+        Span::styled(ops_text, Style::default().fg(if ops > 0 { t.accent } else { t.text_dim })),
+        Span::raw(" "),
+        Span::styled(format!("[↑ {}/{} online]", online, total), Style::default().fg(health_color).bold()),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(t.border_type)
+        .border_style(Style::default().fg(t.border))
+        .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(status, area);
 }
 
 fn mini_bar(pct: Option<f32>, width: usize) -> String {
@@ -8558,6 +8626,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(fleet_config).await;
     app.vim_mode = sam_config.tui.vim_mode;
     app.update_status_bar();
+    app.start_db_latency_probe();
 
     loop {
         // Drain background probe results (non-blocking)
@@ -10756,6 +10825,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(content) = rx.try_recv() {
                 app.ws_content = Some(content);
                 app.ws_content_scroll = 0;
+            }
+        }
+
+        if let Some(ref mut rx) = app.db_latency_rx {
+            while let Ok(latency) = rx.try_recv() {
+                if let Some(ms) = latency {
+                    app.db_latency_ms = Some(ms);
+                    app.db_online = true;
+                } else {
+                    app.db_latency_ms = None;
+                    app.db_online = false;
+                }
             }
         }
 
