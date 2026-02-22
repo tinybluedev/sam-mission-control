@@ -486,18 +486,42 @@ impl App {
         self.chat_input.clear();
         if message.is_empty() { return; }
 
-        // Dashboard chat = broadcast to all agents
-        let agent_names: Vec<String> = self.agents.iter().map(|a| a.db_name.clone()).collect();
+        // If message contains @mentions, only send to those agents. Otherwise broadcast to all.
+        let mentioned: Vec<String> = {
+            let mut m = Vec::new();
+            for word in message.split_whitespace() {
+                if let Some(name) = word.strip_prefix('@') {
+                    let name_lower = name.to_lowercase();
+                    if self.agents.iter().any(|a| a.db_name.to_lowercase() == name_lower) {
+                        m.push(name_lower);
+                    }
+                }
+            }
+            m
+        };
+        let targeted = !mentioned.is_empty();
+        let agent_names: Vec<String> = if targeted {
+            self.agents.iter()
+                .filter(|a| mentioned.contains(&a.db_name.to_lowercase()))
+                .map(|a| a.db_name.clone())
+                .collect()
+        } else {
+            self.agents.iter().map(|a| a.db_name.clone()).collect()
+        };
+        let display_target = if targeted {
+            Some(agent_names.iter().map(|n| format!("@{}", n)).collect::<Vec<_>>().join(" "))
+        } else { None };
         self.chat_history.push(ChatLine {
-            sender: self.user(), target: None, message: message.clone(),
+            sender: self.user(), target: display_target, message: message.clone(),
             response: None, time: now_str(), status: "pending".into(),
-            kind: "global".into(),
+            kind: if targeted { "direct".into() } else { "global".into() },
         });
 
         if let Some(pool) = &self.db_pool {
             let ids = db::send_broadcast(pool, &self.user(), &message, &agent_names).await.unwrap_or_default();
-            // Fire streaming AI requests to all agents with tokens
+            // Fire streaming AI requests to targeted agents (or all if broadcast)
             for (i, agent) in self.agents.iter().enumerate() {
+                if targeted && !agent_names.contains(&agent.db_name) { continue; }
                 if let Some(tok) = &agent.gateway_token {
                     let url = format!("http://{}:{}/v1/chat/completions", agent.host, agent.gateway_port);
                     let tok = tok.clone();
