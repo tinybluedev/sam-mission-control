@@ -2184,11 +2184,20 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         if let Some(root) = proposed.as_object_mut() {
             let plugins = root.entry("plugins").or_insert_with(|| serde_json::json!({}));
             if let Some(plugins_obj) = plugins.as_object_mut() {
-                let entries = plugins_obj.entry("entries").or_insert_with(|| serde_json::json!({}));
-                if let Some(entries_obj) = entries.as_object_mut() {
-                    let plugin = entries_obj.entry(name.clone()).or_insert_with(|| serde_json::json!({}));
-                    if let Some(plugin_obj) = plugin.as_object_mut() {
-                        plugin_obj.insert("enabled".into(), serde_json::Value::Bool(new_state));
+                let entries = plugins_obj.entry("entries").or_insert_with(|| serde_json::json!([]));
+                if let Some(entries_arr) = entries.as_array_mut() {
+                    let mut found = false;
+                    for item in entries_arr.iter_mut() {
+                        if item.get("name").and_then(|v| v.as_str()) == Some(name.as_str()) {
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("enabled".into(), serde_json::Value::Bool(new_state));
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        entries_arr.push(serde_json::json!({ "name": name.clone(), "enabled": new_state }));
                     }
                 }
             }
@@ -2206,12 +2215,24 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             r#"python3 -c "
 import json
 with open('$HOME/.openclaw/openclaw.json'.replace('$HOME', __import__('os').path.expanduser('~'))) as f:
-    d = json.load(f)
-d.setdefault('plugins', {{}}).setdefault('entries', {{}}).setdefault('{}', {{}})['enabled'] = {}
+d = json.load(f)
+plugins = d.setdefault('plugins', {{}})
+entries = plugins.setdefault('entries', [])
+if isinstance(entries, dict):
+    entries = [dict(v if isinstance(v, dict) else {{}}, name=k) for k, v in entries.items()]
+    plugins['entries'] = entries
+done = False
+for e in entries:
+    if isinstance(e, dict) and e.get('name') == '{}':
+        e['enabled'] = {}
+        done = True
+        break
+if not done:
+    entries.append({{'name': '{}', 'enabled': {}}})
 with open('$HOME/.openclaw/openclaw.json'.replace('$HOME', __import__('os').path.expanduser('~')), 'w') as f:
     json.dump(d, f, indent=2)
 print('ok')
-""#, name, if new_state { "True" } else { "False" }
+""#, name, if new_state { "True" } else { "False" }, name, if new_state { "True" } else { "False" }
         );
 
         let toast_msg = format!("{} {} {}", svc.icon, name, if new_state { "enabled" } else { "disabled" });

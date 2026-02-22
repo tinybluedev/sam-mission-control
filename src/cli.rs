@@ -1173,12 +1173,13 @@ pub async fn run_validate(agent: Option<&str>) -> Result<(), Box<dyn std::error:
     for target in targets {
         let name = &target.agent_name;
         let ip = target.tailscale_ip.as_deref().unwrap_or("?");
+        let user = target.ssh_user.as_deref().unwrap_or("admin");
         print!("  {} ({}) ... ", name, ip);
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             Command::new("ssh").args([
                 "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                &format!("admin@{}", ip), "cat ~/.openclaw/openclaw.json 2>/dev/null || echo null",
+                &format!("{}@{}", user, ip), "cat ~/.openclaw/openclaw.json 2>/dev/null || echo null",
             ]).output()
         ).await;
 

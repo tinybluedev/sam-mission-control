@@ -165,7 +165,7 @@ pub fn validate_openclaw_config(config: &serde_json::Value) -> Vec<String> {
         .and_then(|c| c.as_i64())
     {
         Some(v) if (1000..=2_000_000).contains(&v) => {}
-        Some(_) => errors.push("agents.defaults.contextTokens must be an integer between 1000 and 2000000".into()),
+        Some(_) => errors.push("agents.defaults.contextTokens must be an integer between 1000 and 2,000,000".into()),
         None => errors.push("Missing required field: agents.defaults.contextTokens".into()),
     }
 
