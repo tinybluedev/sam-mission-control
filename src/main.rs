@@ -463,6 +463,15 @@ struct App {
     svc_load_rx: Option<mpsc::UnboundedReceiver<Option<serde_json::Value>>>,
     config_load_rx: Option<mpsc::UnboundedReceiver<Option<String>>>,
     svc_detail_scroll: u16,
+    // Agent model management
+    agent_model: Option<String>,
+    agent_model_agent: Option<String>,
+    agent_model_loading: bool,
+    model_picker_active: bool,
+    model_picker_selected: usize,
+    model_options: Vec<String>,
+    model_load_rx: Option<mpsc::UnboundedReceiver<ModelLoadResult>>,
+    model_write_rx: Option<mpsc::UnboundedReceiver<ModelWriteResult>>,
     // Workspace (agent file management)
     ws_files: Vec<WorkspaceFile>,
     ws_selected: usize,
@@ -1843,6 +1852,145 @@ impl App {
                 _ => None,
             };
             let _ = tx.send(config);
+        });
+    }
+
+    fn start_model_load(&mut self) {
+        if self.selected >= self.agents.len() || self.agent_model_loading { return; }
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let db_name = agent.db_name.clone();
+        self.agent_model_loading = true;
+        self.agent_model_agent = Some(db_name.clone());
+        self.model_options = curated_model_list();
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.model_load_rx = Some(rx);
+        tokio::spawn(async move {
+            let cmd = r#"python3 - <<'PY'
+import json, os, subprocess
+p = os.path.expanduser('~/.openclaw/openclaw.json')
+model = None
+try:
+    with open(p) as f:
+        d = json.load(f)
+    model = (((d.get('agents') or {}).get('defaults') or {}).get('model'))
+except Exception:
+    pass
+models = []
+for c in ("openclaw models list", "~/.npm-global/bin/openclaw models list"):
+    try:
+        out = subprocess.check_output(c, shell=True, stderr=subprocess.DEVNULL, text=True, timeout=4)
+    except Exception:
+        continue
+    for line in out.splitlines():
+        t = line.strip().split()
+        if t and '/' in t[0]:
+            models.append(t[0])
+    if models:
+        break
+print(json.dumps({"model": model, "models": models}))
+PY"#;
+            let output = tokio::time::timeout(
+                Duration::from_secs(7),
+                Command::new("ssh").args([
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), cmd,
+                ]).output()
+            ).await;
+            let (model, models) = match output {
+                Ok(Ok(o)) if o.status.success() => {
+                    let parsed = serde_json::from_slice::<serde_json::Value>(&o.stdout).ok();
+                    let model = parsed.as_ref().and_then(|v| v.get("model")).and_then(|m| m.as_str()).map(|s| s.to_string());
+                    let models = parsed.as_ref().and_then(|v| v.get("models")).and_then(|m| m.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    (model, models)
+                }
+                _ => (None, vec![]),
+            };
+            let _ = tx.send(ModelLoadResult { agent_db_name: db_name, model, models });
+        });
+    }
+
+    fn open_model_picker(&mut self) {
+        if self.selected >= self.agents.len() { return; }
+        if self.agent_model_agent.as_deref() != Some(self.agents[self.selected].db_name.as_str()) {
+            self.start_model_load();
+        }
+        self.model_picker_active = true;
+        if let Some(current) = &self.agent_model {
+            if let Some(idx) = self.model_options.iter().position(|m| m == current) {
+                self.model_picker_selected = idx;
+            }
+        }
+    }
+
+    fn write_agent_model(&mut self, model: String, restart_gateway: bool) {
+        if self.selected >= self.agents.len() { return; }
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let db_name = agent.db_name.clone();
+        let name = agent.name.clone();
+        let os = agent.os.to_ascii_lowercase();
+        let is_mac = os.contains("mac") || os.contains("darwin");
+        self.model_picker_active = false;
+        self.diag_active = true;
+        self.diag_task_running = true;
+        self.diag_auto_fix = false;
+        self.diag_title = Some(format!("🧠 Model switch — {}", name));
+        self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
+        self.diag_steps = vec![DiagStep { label: "Updating OpenClaw model".into(), status: DiagStatus::Running, detail: model.clone() }];
+        let (diag_tx, diag_rx) = mpsc::unbounded_channel::<DiagStep>();
+        self.diag_rx = Some(diag_rx);
+        let (tx, rx) = mpsc::unbounded_channel::<ModelWriteResult>();
+        self.model_write_rx = Some(rx);
+        tokio::spawn(async move {
+            let escaped_model = shell::escape(&model);
+            let write_cmd = format!(r#"MODEL={} python3 - <<'PY'
+import json, os
+p = os.path.expanduser('~/.openclaw/openclaw.json')
+try:
+    with open(p) as f:
+        d = json.load(f)
+except Exception:
+    d = {{}}
+d.setdefault('agents', {{}}).setdefault('defaults', {{}})['model'] = os.environ.get('MODEL', '')
+with open(p, 'w') as f:
+    json.dump(d, f, indent=2)
+print('ok')
+PY"#, escaped_model);
+            let write_out = Command::new("ssh").args([
+                "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host), &write_cmd,
+            ]).output().await;
+            let wrote = write_out.map(|o| o.status.success()).unwrap_or(false);
+            if !wrote {
+                let _ = diag_tx.send(DiagStep { label: "Updating OpenClaw model".into(), status: DiagStatus::Fail, detail: "write failed".into() });
+                let _ = diag_tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Could not update model".into() });
+                return;
+            }
+            let _ = diag_tx.send(DiagStep { label: "Updating OpenClaw model".into(), status: DiagStatus::Pass, detail: model.clone() });
+            if restart_gateway {
+                let _ = diag_tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Running, detail: String::new() });
+                let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                let cmd = format!("{}openclaw gateway restart 2>&1 | tail -1 || ~/.npm-global/bin/openclaw gateway restart 2>&1 | tail -1 || systemctl --user restart openclaw-gateway 2>&1 | tail -1 || echo 'restart skipped - run manually'", pfx);
+                let restart_ok = Command::new("ssh").args([
+                    "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &cmd,
+                ]).output().await.map(|o| o.status.success()).unwrap_or(false);
+                let _ = diag_tx.send(DiagStep {
+                    label: "Restarting gateway".into(),
+                    status: if restart_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                    detail: if restart_ok { "gateway restart attempted".into() } else { "restart failed — run manually".into() },
+                });
+            } else {
+                let _ = diag_tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Skipped, detail: "skipped — restart required".into() });
+            }
+            let _ = diag_tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Model updated".into() });
+            let _ = tx.send(ModelWriteResult { agent_db_name: db_name, model, restarted: restart_gateway });
         });
     }
 
@@ -5265,6 +5413,18 @@ enum FleetDiagMsg {
     AllDone,
 }
 
+struct ModelLoadResult {
+    agent_db_name: String,
+    model: Option<String>,
+    models: Vec<String>,
+}
+
+struct ModelWriteResult {
+    agent_db_name: String,
+    model: String,
+    restarted: bool,
+}
+
 const SERVICE_ICONS: &[(&str, &str)] = &[
     ("telegram", "📱"),
     ("discord", "🎮"),
@@ -5307,6 +5467,31 @@ const AGENT_FILES: &[(&str, &str, &str)] = &[
     ("RECALL.md", "recall", "🔍"),
     ("CHECKPOINT.md", "checkpoint", "📌"),
 ];
+
+const CURATED_MODELS: &[&str] = &[
+    "anthropic/claude-opus-4-6",
+    "anthropic/claude-sonnet-4-6",
+    "anthropic/claude-haiku-4-5",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "google/gemini-2.0-flash",
+    "groq/llama-3.3-70b-versatile",
+];
+
+fn curated_model_list() -> Vec<String> {
+    CURATED_MODELS.iter().map(|m| (*m).to_string()).collect()
+}
+
+fn merge_model_list(extra: &[String]) -> Vec<String> {
+    let mut merged = curated_model_list();
+    let mut seen: HashSet<String> = merged.iter().cloned().collect();
+    for model in extra {
+        if model.contains('/') && seen.insert(model.clone()) {
+            merged.push(model.clone());
+        }
+    }
+    merged
+}
 
 /// Result of a background chat poll
 struct ChatPollResult {
@@ -6502,6 +6687,15 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     // OS-based ASCII art decoration
     let os_art = os_ascii_art(&a.os);
 
+    let model_value = if app.agent_model_agent.as_deref() == Some(a.db_name.as_str()) {
+        if app.agent_model_loading {
+            "loading…".to_string()
+        } else {
+            app.agent_model.clone().unwrap_or_else(|| "not set".into())
+        }
+    } else {
+        "loading…".to_string()
+    };
     let rows = vec![
         ("Host", a.host.clone(), t.text),
         (
@@ -6519,6 +6713,7 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         ("OS", a.os.clone(), t.text),
         ("Kernel", a.kernel.clone(), t.text),
         ("OC Version", a.oc_version.clone(), t.version),
+        ("Model", model_value, t.accent),
         ("SSH User", a.ssh_user.clone(), t.text),
         ("Capabilities", caps, t.text),
         (
@@ -6640,6 +6835,41 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
 
     // Footer
     render_footer(frame, app, chunks[2]);
+}
+
+fn render_model_picker(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = frame.area();
+    let h = (app.model_options.len() as u16 + 6).max(10).min(area.height.saturating_sub(4));
+    let w = area.width.min(72).saturating_sub(2).max(44);
+    let popup = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
+    frame.render_widget(Clear, popup);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled("  Select active model", Style::default().fg(t.header_title).bold())));
+    lines.push(Line::from(""));
+    for (i, model) in app.model_options.iter().enumerate() {
+        let sel = i == app.model_picker_selected;
+        let prefix = if sel { " ▶ " } else { "   " };
+        let style = if sel { Style::default().fg(t.text).bg(t.accent).bold() } else { Style::default().fg(t.text) };
+        lines.push(Line::from(Span::styled(format!("{}{}", prefix, model), style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Enter apply  R apply+restart  Esc close",
+        Style::default().fg(t.text_dim),
+    )));
+    let title = if let Some(model) = &app.agent_model {
+        format!(" Model Picker — current: {} ", model)
+    } else {
+        " Model Picker ".to_string()
+    };
+    let widget = Paragraph::new(lines).block(Block::default()
+        .title(Span::styled(title, Style::default().fg(t.accent).bold()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(t.accent))
+        .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(widget, popup);
 }
 
 fn render_fleet_diagnostics(frame: &mut Frame, app: &App) {
@@ -8503,6 +8733,7 @@ fn render_help(frame: &mut Frame, app: &App) {
             nav_style,
         ),
         ("  Tab", "Switch: Info ↔ Chat", nav_style),
+        ("  m", "Pick active model for this agent", act_style),
         ("  e", "View agent config (openclaw.json)", act_style),
         ("  d", "Run diagnostics", act_style),
         ("  D (Shift)", "Run diagnostics + auto-fix", act_style),
@@ -11086,6 +11317,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.config_text = result;
                 app.config_scroll = 0;
                 app.toast("📋 Config loaded — PageUp/Down to scroll, Esc to close");
+            }
+        }
+
+        if let Some(ref mut rx) = app.model_load_rx {
+            if let Ok(result) = rx.try_recv() {
+                if app.selected < app.agents.len() && app.agents[app.selected].db_name == result.agent_db_name {
+                    app.agent_model = result.model;
+                    app.model_options = merge_model_list(&result.models);
+                    if let Some(current) = &app.agent_model {
+                        if let Some(idx) = app.model_options.iter().position(|m| m == current) {
+                            app.model_picker_selected = idx;
+                        }
+                    }
+                }
+                app.agent_model_loading = false;
+                app.model_load_rx = None;
+            }
+        }
+
+        if let Some(ref mut rx) = app.model_write_rx {
+            if let Ok(result) = rx.try_recv() {
+                if app.selected < app.agents.len() && app.agents[app.selected].db_name == result.agent_db_name {
+                    app.agent_model = Some(result.model.clone());
+                    app.agent_model_agent = Some(result.agent_db_name.clone());
+                    if result.restarted {
+                        app.toast(&format!("Model changed → {} — gateway restarted", result.model));
+                    } else {
+                        app.toast(&format!("Model changed → {} — gateway restart required", result.model));
+                    }
+                }
+                app.model_write_rx = None;
             }
         }
 
