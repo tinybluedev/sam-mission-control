@@ -191,6 +191,9 @@ struct App {
     // Filter
     filter_active: bool,
     filter_text: String,
+    // Config viewer
+    config_text: Option<String>,
+    config_scroll: u16,
     // Multi-select
     multi_selected: std::collections::HashSet<usize>,
     // Theme
@@ -262,6 +265,7 @@ impl App {
             tasks: vec![], task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
             show_splash: true, splash_start: Instant::now(),
+            config_text: None, config_scroll: 0,
             filter_active: false, filter_text: String::new(),
             alerts: vec![], alert_flash: None,
             multi_selected: HashSet::new(),
@@ -1432,6 +1436,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("  q", "Quit"),
         ("", ""),
         ("AGENT DETAIL", ""),
+        ("  e", "View agent config (openclaw.json)"),
         ("  Tab", "Switch: Info ↔ Chat"),
         ("  Enter", "Send direct message"),
         ("  Esc", "Back to dashboard"),
@@ -1506,6 +1511,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cli::Commands::Chat { agent, message }) => {
             let msg = message.join(" ");
             return cli::send_chat(&agent, &msg).await.map_err(|e| e.into());
+        }
+        Some(cli::Commands::Deploy { target, file, source }) => {
+            return cli::run_deploy(&target, &file, source.as_deref()).await.map_err(|e| e.into());
         }
         Some(cli::Commands::Onboard { host, user, name }) => {
             return cli::run_onboard(&host, &user, name.as_deref()).await.map_err(|e| e.into());
@@ -1583,6 +1591,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Screen::Alerts => render_alerts(f, &app),
                 Screen::Help => render_help(f, &app),
             }
+            }
+            // Config viewer overlay
+            if let Some(config) = &app.config_text {
+                let t = &app.theme;
+                let area = f.area();
+                let w = (area.width as f32 * 0.7) as u16;
+                let h = (area.height as f32 * 0.8) as u16;
+                let x = (area.width - w) / 2;
+                let y = (area.height - h) / 2;
+                let rect = Rect::new(x, y, w, h);
+                let clear = Block::default().style(Style::default().bg(app.bg_density.bg()));
+                f.render_widget(clear, rect);
+                let lines: Vec<Line> = config.lines().map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(t.text)))).collect();
+                let p = Paragraph::new(lines).scroll((app.config_scroll, 0))
+                    .block(Block::default()
+                        .title(Span::styled(" openclaw.json — Esc to close ", Style::default().fg(t.accent).bold()))
+                        .borders(Borders::ALL).border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(t.accent))
+                        .style(Style::default().bg(app.bg_density.bg()))
+                        .padding(Padding::new(1, 1, 1, 0)));
+                f.render_widget(p, rect);
             }
             if app.wizard.active {
                 wizard::render_wizard(f, &app.wizard, &app.theme, app.bg_density.bg());
@@ -1756,6 +1785,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                     match app.screen {
                         Screen::Help => { app.screen = Screen::Dashboard; }
+                        Screen::AgentDetail if app.config_text.is_some() => match key.code {
+                            KeyCode::Esc => { app.config_text = None; }
+                            KeyCode::PageUp | KeyCode::Up => { app.config_scroll = app.config_scroll.saturating_add(3); }
+                            KeyCode::PageDown | KeyCode::Down => { app.config_scroll = app.config_scroll.saturating_sub(3); }
+                            _ => { app.config_text = None; }
+                        },
                         Screen::AgentDetail => match app.focus {
                             Focus::AgentChat => match key.code {
                                 KeyCode::Esc => app.focus = Focus::Fleet,
@@ -1773,6 +1808,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('q') => app.should_quit = true,
                                 KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
+                                KeyCode::Char('e') => {
+                                    // Fetch remote config
+                                    if let Some(agent) = app.agents.get(app.selected) {
+                                        let host = agent.host.clone();
+                                        let user = agent.ssh_user.clone();
+                                        let self_ip = app.self_ip.clone();
+                                        app.status_message = format!("📋 Fetching config from {}...", agent.name);
+                                        let is_mac = agent.os.to_lowercase().contains("mac");
+                                        let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                        let cmd = format!("{}cat ~/.openclaw/openclaw.json 2>/dev/null || echo '(no config found)'", pfx);
+                                        let output = if host == "localhost" || host == self_ip {
+                                            tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                                        } else {
+                                            tokio::time::timeout(
+                                                std::time::Duration::from_secs(8),
+                                                tokio::process::Command::new("ssh")
+                                                    .args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                        &format!("{}@{}", user, host), &cmd])
+                                                    .output()
+                                            ).await.ok().and_then(|r| r.ok())
+                                        };
+                                        app.config_text = output.map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+                                        app.config_scroll = 0;
+                                        app.status_message = "📋 Config loaded — PageUp/PageDown to scroll, Esc to close".into();
+                                    }
+                                }
                                 KeyCode::Char('c') => app.cycle_theme(),
                                 KeyCode::Char('l') => {
                                     // Fetch gateway logs for this agent
