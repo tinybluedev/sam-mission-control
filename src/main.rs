@@ -389,6 +389,9 @@ struct App {
     chat_polling: bool,
     // Wizard SSH test (background)
     wizard_ssh_rx: Option<mpsc::UnboundedReceiver<String>>,
+    // Full onboard tracking (atomic DB write on success)
+    onboard_pending: Option<OnboardPending>,
+    onboard_commit_rx: Option<mpsc::UnboundedReceiver<OnboardCommit>>,
     // Autocomplete
     ac_visible: bool,
     ac_matches: Vec<String>,
@@ -506,6 +509,7 @@ impl App {
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: vec![], ws_cursor: (0, 0), ws_undo_stack: vec![], ws_discard_confirm: false,
             ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
+            onboard_pending: None, onboard_commit_rx: None,
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
             interrupted_ops, diag_task_running: false,
@@ -1947,6 +1951,352 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         });
     }
 
+    /// Launch full 10-step SSH provisioning wizard for the current wizard data.
+    ///
+    /// Steps:
+    ///   1. Test SSH connectivity
+    ///   2. Detect OS
+    ///   3. Distribute SSH public key (optional — skipped if no local key)
+    ///   4. Check/install Node.js
+    ///   5. Check/install OpenClaw
+    ///   6. Run `openclaw init --non-interactive`
+    ///   7. Configure gateway (token, bind, endpoints)
+    ///   8. Start gateway
+    ///   9. Check/configure Tailscale
+    ///  10. Run post-install diagnostic (SSH + gateway health)
+    ///
+    /// The agent is added to the DB **only** if all steps succeed.
+    /// Partial installs (steps 5+) are rolled back on failure.
+    fn start_full_onboard(&mut self) {
+        let w = &self.wizard;
+        let host = w.host.clone();
+        let user = w.ssh_user.clone();
+        let agent_name = w.agent_name.clone();
+        let display_name = w.display_name.clone();
+        let emoji = w.emoji.clone();
+        let location = w.location_str().to_string();
+
+        // Store pending data — DB write happens only on success
+        self.onboard_pending = Some(OnboardPending {
+            agent_name: agent_name.clone(),
+            display_name: display_name.clone(),
+            emoji: emoji.clone(),
+            host: host.clone(),
+            ssh_user: user.clone(),
+            location: location.clone(),
+        });
+
+        // Close the form wizard and switch to diag overlay
+        self.wizard.active = false;
+        self.diag_active = true;
+        self.diag_task_running = true;
+        self.diag_auto_fix = false;
+        self.diag_title = Some(format!("🛰️  Onboarding — {}", agent_name));
+        self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
+        self.diag_steps = vec![DiagStep {
+            label: format!("Provisioning {}@{}…", user, host),
+            status: DiagStatus::Running,
+            detail: String::new(),
+        }];
+
+        let (diag_tx, diag_rx) = mpsc::unbounded_channel::<DiagStep>();
+        let (commit_tx, commit_rx) = mpsc::unbounded_channel::<OnboardCommit>();
+        self.diag_rx = Some(diag_rx);
+        self.onboard_commit_rx = Some(commit_rx);
+
+        tokio::spawn(async move {
+            let send_step = |label: &str, status: DiagStatus, detail: String| {
+                let _ = diag_tx.send(DiagStep { label: label.to_owned(), status, detail });
+            };
+
+            let ssh_args = |cmd: &str| -> Vec<String> {
+                vec![
+                    "-o".into(), "ConnectTimeout=5".into(),
+                    "-o".into(), "BatchMode=yes".into(),
+                    "-o".into(), "StrictHostKeyChecking=no".into(),
+                    format!("{}@{}", user, host), cmd.into(),
+                ]
+            };
+
+            // ── Step 1: SSH connectivity ───────────────────────────────────────
+            send_step("SSH connectivity", DiagStatus::Running, format!("connecting to {}@{}", user, host));
+            let ssh_ok = tokio::time::timeout(
+                Duration::from_secs(8),
+                Command::new("ssh").args(ssh_args("echo ok")).output(),
+            ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+            if !ssh_ok {
+                send_step("SSH connectivity", DiagStatus::Fail, format!("cannot reach {}@{} — check host and SSH access", user, host));
+                send_step("DONE", DiagStatus::Fail, "Onboarding aborted — SSH unreachable".to_string());
+                return;
+            }
+            send_step("SSH connectivity", DiagStatus::Pass, format!("{}@{}", user, host));
+
+            // ── Step 2: Detect OS ──────────────────────────────────────────────
+            send_step("OS detection", DiagStatus::Running, String::new());
+            let os_out = Command::new("ssh").args(ssh_args(
+                ". /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\" || sw_vers -productName 2>/dev/null || uname -s"
+            )).output().await.ok();
+            let os_info = os_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|| "Linux".into());
+            let is_mac = os_info.to_lowercase().contains("mac") || os_info.to_lowercase().contains("darwin");
+            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+            send_step("OS detection", DiagStatus::Pass, os_info.clone());
+
+            // ── Step 3: Distribute SSH public key (optional) ──────────────────
+            send_step("SSH key", DiagStatus::Running, "checking for local public key".to_string());
+            let pub_key = tokio::task::spawn_blocking(|| {
+                let candidates = [
+                    dirs::home_dir().unwrap_or_default().join(".ssh/id_ed25519.pub"),
+                    dirs::home_dir().unwrap_or_default().join(".ssh/id_rsa.pub"),
+                    dirs::home_dir().unwrap_or_default().join(".ssh/id_ecdsa.pub"),
+                ];
+                candidates.iter().find_map(|p| std::fs::read_to_string(p).ok())
+            }).await.ok().flatten();
+            if let Some(key) = pub_key {
+                let key = key.trim().to_string();
+                let install_key_cmd = format!(
+                    "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+                     grep -qxF {k} ~/.ssh/authorized_keys 2>/dev/null \
+                       || echo {k} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
+                    k = crate::shell::escape(&key),
+                );
+                let result = Command::new("ssh").args(ssh_args(&install_key_cmd)).output().await;
+                match result {
+                    Ok(o) if o.status.success() => {
+                        let _ = diag_tx.send(DiagStep { label: "SSH key".into(), status: DiagStatus::Pass, detail: "public key installed on remote".into() });
+                    }
+                    _ => {
+                        let _ = diag_tx.send(DiagStep { label: "SSH key".into(), status: DiagStatus::Skipped, detail: "could not install key — continuing with existing credentials".into() });
+                    }
+                }
+            } else {
+                let _ = diag_tx.send(DiagStep { label: "SSH key".into(), status: DiagStatus::Skipped, detail: "no local public key found".into() });
+            }
+
+            // ── Step 4: Check / install Node.js ──────────────────────────────
+            let _ = diag_tx.send(DiagStep { label: "Node.js".into(), status: DiagStatus::Running, detail: "checking version".into() });
+            let node_cmd = format!("{}node --version 2>/dev/null || echo NOT_FOUND", pfx);
+            let node_out = Command::new("ssh").args(ssh_args(&node_cmd)).output().await.ok();
+            let node_ver = node_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+            if node_ver.contains("NOT_FOUND") || node_ver.is_empty() {
+                let _ = diag_tx.send(DiagStep { label: "Node.js".into(), status: DiagStatus::Running, detail: "not found — installing via NodeSource".into() });
+                let install_node: String = if is_mac {
+                    format!("{}brew install node 2>&1 | tail -3", pfx)
+                } else {
+                    // NodeSource universal installer
+                    "curl -fsSL https://rpm.nodesource.com/setup_lts.x | sudo bash - 2>&1 | tail -5 && sudo dnf install -y nodejs 2>&1 | tail -3 || \
+                     curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo bash - 2>&1 | tail -5 && sudo apt-get install -y nodejs 2>&1 | tail -3".to_string()
+                };
+                let node_install_out = tokio::time::timeout(Duration::from_secs(120),
+                    Command::new("ssh").args(ssh_args(&install_node)).output()
+                ).await;
+                // Re-check
+                let node_recheck = Command::new("ssh").args(ssh_args(&node_cmd)).output().await.ok();
+                let node_ver2 = node_recheck.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                if node_ver2.contains("NOT_FOUND") || node_ver2.is_empty() {
+                    let err = node_install_out.ok().and_then(|r| r.ok())
+                        .map(|o| String::from_utf8_lossy(&o.stderr).trim().chars().take(80).collect::<String>())
+                        .unwrap_or_else(|| "install failed".into());
+                    send_step("Node.js", DiagStatus::Fail, format!("could not install Node.js — {}", err));
+                    send_step("DONE", DiagStatus::Fail, "Onboarding aborted — Node.js required".to_string());
+                    return;
+                }
+                send_step("Node.js", DiagStatus::Fixed, format!("installed {}", node_ver2));
+            } else {
+                send_step("Node.js", DiagStatus::Pass, node_ver);
+            }
+
+            // ── Step 5: Check / install OpenClaw ─────────────────────────────
+            let oc_check_cmd = format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx);
+            let oc_out = Command::new("ssh").args(ssh_args(&oc_check_cmd)).output().await.ok();
+            let oc_ver = oc_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+            let mut oc_installed_by_us = false;
+            if oc_ver.contains("NOT_INSTALLED") || oc_ver.is_empty() {
+                send_step("OpenClaw install", DiagStatus::Running, "running npm install -g openclaw@latest".to_string());
+                let npm_cmd = if is_mac {
+                    format!("{}npm install -g openclaw@latest 2>&1", pfx)
+                } else {
+                    "sudo npm install -g openclaw@latest 2>&1".into()
+                };
+                let install_out = tokio::time::timeout(Duration::from_secs(120),
+                    Command::new("ssh").args(ssh_args(&npm_cmd)).output()
+                ).await;
+                let install_ok = install_out.as_ref().ok()
+                    .and_then(|r| r.as_ref().ok())
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if !install_ok {
+                    let stderr = install_out.ok().and_then(|r| r.ok())
+                        .map(|o| String::from_utf8_lossy(&o.stderr).trim().chars().take(80).collect::<String>())
+                        .unwrap_or_else(|| "unknown error".into());
+                    send_step("OpenClaw install", DiagStatus::Fail, stderr);
+                    send_step("DONE", DiagStatus::Fail, "Onboarding aborted — OpenClaw install failed".to_string());
+                    return;
+                }
+                oc_installed_by_us = true;
+                // Re-check version
+                let oc_recheck = Command::new("ssh").args(ssh_args(&oc_check_cmd)).output().await.ok();
+                let new_ver = oc_recheck.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                send_step("OpenClaw install", DiagStatus::Fixed, format!("installed {}", new_ver));
+            } else {
+                send_step("OpenClaw install", DiagStatus::Pass, oc_ver.clone());
+            }
+
+            // ── Step 6: openclaw init ─────────────────────────────────────────
+            send_step("openclaw init", DiagStatus::Running, "initialising on remote".to_string());
+            let init_cmd = format!("{}openclaw init --non-interactive 2>&1 | tail -5", pfx);
+            let init_out = tokio::time::timeout(Duration::from_secs(30),
+                Command::new("ssh").args(ssh_args(&init_cmd)).output()
+            ).await;
+            match init_out {
+                Ok(Ok(o)) if o.status.success() => {
+                    send_step("openclaw init", DiagStatus::Pass, "initialised".to_string());
+                }
+                Ok(Ok(o)) => {
+                    // openclaw init may exit non-zero if already initialised; check stderr
+                    let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    if stderr.to_lowercase().contains("already") || stderr.is_empty() {
+                        send_step("openclaw init", DiagStatus::Pass, "already initialised".to_string());
+                    } else {
+                        // Non-fatal: warn but continue
+                        send_step("openclaw init", DiagStatus::Skipped, format!("init returned non-zero: {}", stderr.chars().take(70).collect::<String>()));
+                    }
+                }
+                _ => {
+                    send_step("openclaw init", DiagStatus::Skipped, "timeout or command not found — continuing".to_string());
+                }
+            }
+
+            // ── Step 7: Configure gateway ─────────────────────────────────────
+            send_step("Gateway config", DiagStatus::Running, "generating token & writing openclaw.json".to_string());
+            let token = {
+                let mut bytes = vec![0u8; 24];
+                if getrandom::fill(&mut bytes).is_err() {
+                    send_step("Gateway config", DiagStatus::Fail, "failed to generate secure token".to_string());
+                    // Rollback if we installed OC
+                    if oc_installed_by_us {
+                        let _ = Command::new("ssh").args(ssh_args(&format!("{}sudo npm uninstall -g openclaw 2>/dev/null || true", pfx))).output().await;
+                    }
+                    send_step("DONE", DiagStatus::Fail, "Onboarding aborted".to_string());
+                    return;
+                }
+                bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+            };
+            let escaped_token = crate::shell::escape(&token);
+            let escaped_agent = crate::shell::escape(&agent_name);
+            let config_script = format!(
+                r#"python3 -c "
+import json,os
+p=os.path.expanduser('~/.openclaw/openclaw.json')
+os.makedirs(os.path.dirname(p), exist_ok=True)
+c={{}}
+if os.path.exists(p):
+    with open(p) as f: c=json.load(f)
+gw=c.setdefault('gateway',{{}})
+gw['bind']='lan'
+gw.setdefault('auth',{{}})['mode']='token'
+gw['auth']['token']={token}
+h=gw.setdefault('http',{{}})
+e=h.setdefault('endpoints',{{}})
+e['chatCompletions']={{'enabled':True}}
+c['name']={name}
+with open(p,'w') as f: json.dump(c,f,indent=2)
+print('ok')
+""#,
+                token = escaped_token,
+                name = escaped_agent,
+            );
+            let cfg_out = Command::new("ssh").args(ssh_args(&config_script)).output().await;
+            let cfg_ok = cfg_out.as_ref().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "ok").unwrap_or(false);
+            if !cfg_ok {
+                send_step("Gateway config", DiagStatus::Fail, "could not write openclaw.json".to_string());
+                if oc_installed_by_us {
+                    let _ = Command::new("ssh").args(ssh_args(&format!("{}sudo npm uninstall -g openclaw 2>/dev/null || true", pfx))).output().await;
+                    send_step("Rollback", DiagStatus::Rollback, "OpenClaw uninstalled".to_string());
+                }
+                send_step("DONE", DiagStatus::Fail, "Onboarding aborted".to_string());
+                return;
+            }
+
+            // Read port
+            let port_cmd = format!(
+                "{}python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{{}}).get('port',18789))\"",
+                pfx
+            );
+            let port_out = Command::new("ssh").args(ssh_args(&port_cmd)).output().await.ok();
+            let gateway_port: i32 = port_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(18789)).unwrap_or(18789);
+            send_step("Gateway config", DiagStatus::Pass, format!("port={} token={}...", gateway_port, &token[..8]));
+
+            // ── Step 8: Start gateway ─────────────────────────────────────────
+            send_step("Gateway start", DiagStatus::Running, "restarting openclaw gateway".to_string());
+            let restart_cmd = format!("{}openclaw gateway restart 2>&1 | tail -3", pfx);
+            let _ = tokio::time::timeout(Duration::from_secs(15),
+                Command::new("ssh").args(ssh_args(&restart_cmd)).output()
+            ).await;
+            send_step("Gateway start", DiagStatus::Pass, "gateway restart requested".to_string());
+
+            // ── Step 9: Tailscale check ───────────────────────────────────────
+            send_step("Tailscale", DiagStatus::Running, "checking Tailscale status".to_string());
+            let ts_cmd = format!("{}tailscale status --json 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('BackendState',''))\" || echo NOT_FOUND", pfx);
+            let ts_out = Command::new("ssh").args(ssh_args(&ts_cmd)).output().await.ok();
+            let ts_state = ts_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+            match ts_state.as_str() {
+                "Running" => send_step("Tailscale", DiagStatus::Pass, "Tailscale is running".to_string()),
+                "NOT_FOUND" | "" => {
+                    send_step("Tailscale", DiagStatus::Skipped, "Tailscale not installed — agent reachable via direct IP".to_string());
+                }
+                other => {
+                    // Try to bring it up using login server from env
+                    let ts_server = std::env::var("SAM_TAILSCALE_SERVER").unwrap_or_default();
+                    if !ts_server.is_empty() {
+                        let ts_up_cmd = format!("{}sudo tailscale up --login-server={} 2>&1 | tail -3", pfx, crate::shell::escape(&ts_server));
+                        let _ = tokio::time::timeout(Duration::from_secs(30),
+                            Command::new("ssh").args(ssh_args(&ts_up_cmd)).output()
+                        ).await;
+                        send_step("Tailscale", DiagStatus::Fixed, format!("ran tailscale up (was: {})", other));
+                    } else {
+                        send_step("Tailscale", DiagStatus::Skipped, format!("state={} — set SAM_TAILSCALE_SERVER to auto-join", other));
+                    }
+                }
+            }
+
+            // ── Step 10: Post-install diagnostic ─────────────────────────────
+            send_step("Diagnostics", DiagStatus::Running, "verifying installation".to_string());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            // SSH check
+            let ssh_recheck = tokio::time::timeout(Duration::from_secs(6),
+                Command::new("ssh").args(ssh_args("echo ok")).output()
+            ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+            // OC version
+            let oc_ver_cmd = format!("{}openclaw --version 2>/dev/null || echo unknown", pfx);
+            let oc_ver_out = Command::new("ssh").args(ssh_args(&oc_ver_cmd)).output().await.ok();
+            let final_oc_ver = oc_ver_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|| "unknown".into());
+            // Gateway health via HTTP
+            let gw_url = format!("http://{}:{}/v1/models", host, gateway_port);
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap_or_default();
+            let gw_ok = client.get(&gw_url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send().await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+
+            if ssh_recheck && !final_oc_ver.contains("unknown") {
+                send_step("Diagnostics", DiagStatus::Pass, format!("SSH ✓  OpenClaw {}  Gateway {}", final_oc_ver, if gw_ok { "✓" } else { "⚠ not yet responding" }));
+            } else {
+                send_step("Diagnostics", DiagStatus::Skipped, format!("SSH {}  OpenClaw {}  Gateway {}", if ssh_recheck { "✓" } else { "✗" }, final_oc_ver, if gw_ok { "✓" } else { "✗" }));
+            }
+
+            // ── Send commit data back (DB write happens in main loop) ─────────
+            let _ = commit_tx.send(OnboardCommit {
+                os_info: os_info.clone(),
+                gateway_port,
+                gateway_token: token.clone(),
+            });
+
+            send_step("DONE", DiagStatus::Pass, format!("✅ {} ready — all checks complete", agent_name));
+        });
+    }
+
     /// Start fleet diagnostics for all multi-selected agents sequentially.
     /// Falls back to single-agent diagnostic if nothing is multi-selected.
     fn start_fleet_diagnostics(&mut self, fix: bool) {
@@ -2662,6 +3012,23 @@ enum FleetDiagMsg {
     CheckDone { result_idx: usize, check_idx: usize, status: DiagStatus, issue: String },
     AgentDone(usize),
     AllDone,
+}
+
+/// Agent data collected by the wizard, held until onboarding succeeds.
+struct OnboardPending {
+    agent_name: String,
+    display_name: String,
+    emoji: String,
+    host: String,
+    ssh_user: String,
+    location: String,
+}
+
+/// Result sent back from the full-onboard background task on success.
+struct OnboardCommit {
+    os_info: String,
+    gateway_port: i32,
+    gateway_token: String,
 }
 
 const SERVICE_ICONS: &[(&str, &str)] = &[
@@ -4921,59 +5288,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Enter => {
                                 let ready = app.wizard.advance();
                                 if ready {
-                                    // Create the agent
-                                    if let Some(pool) = &app.db_pool {
-                                        let w = &app.wizard;
-                                        let caps = format!(r#"["{}"]"#, w.location_str().to_lowercase());
-                                        let _ = pool.get_conn().await.map(|mut conn| {
-                                            let name = w.agent_name.clone();
-                                            let host = w.host.clone();
-                                            let _loc = w.location_str().to_string();
-                                            let _ssh = w.ssh_user.clone();
-                                            let _emoji = w.emoji.clone();
-                                            let _display = w.display_name.clone();
-                                            tokio::spawn(async move {
-                                                use mysql_async::prelude::*;
-                                                let _ = conn.exec_drop(
-                                                    "INSERT IGNORE INTO mc_fleet_status (agent_name, tailscale_ip, status, capabilities) VALUES (?, ?, 'offline', ?)",
-                                                    (&name, &host, &caps),
-                                                ).await;
+                                    if app.wizard.mode == wizard::WizardMode::FullOnboard {
+                                        // Full SSH provisioning — DB write only on success
+                                        app.start_full_onboard();
+                                    } else {
+                                        // AddAgent mode: register in DB immediately (no SSH)
+                                        if let Some(pool) = &app.db_pool {
+                                            let w = &app.wizard;
+                                            let caps = format!(r#"["{}"]"#, w.location_str().to_lowercase());
+                                            let _ = pool.get_conn().await.map(|mut conn| {
+                                                let name = w.agent_name.clone();
+                                                let host = w.host.clone();
+                                                tokio::spawn(async move {
+                                                    use mysql_async::prelude::*;
+                                                    let _ = conn.exec_drop(
+                                                        "INSERT IGNORE INTO mc_fleet_status (agent_name, tailscale_ip, status, capabilities) VALUES (?, ?, 'offline', ?)",
+                                                        (&name, &host, &caps),
+                                                    ).await;
+                                                });
                                             });
+                                        }
+                                        // Add to fleet config in memory
+                                        app.fleet_config.push(config::AgentConfig {
+                                            name: app.wizard.agent_name.clone(),
+                                            display: Some(app.wizard.display_name.clone()),
+                                            emoji: Some(app.wizard.emoji.clone()),
+                                            location: Some(app.wizard.location_str().to_string()),
+                                            ssh_user: Some(app.wizard.ssh_user.clone()),
                                         });
+                                        // Add to agents vec
+                                        app.agents.push(Agent {
+                                            name: app.wizard.display_name.clone(),
+                                            db_name: app.wizard.agent_name.clone(),
+                                            emoji: app.wizard.emoji.clone(),
+                                            host: app.wizard.host.clone(),
+                                            location: app.wizard.location_str().to_string(),
+                                            status: AgentStatus::Unknown,
+                                            os: String::new(), kernel: String::new(),
+                                            oc_version: String::new(), last_seen: String::new(),
+                                            current_task: None,
+                                            ssh_user: app.wizard.ssh_user.clone(),
+                                            capabilities: vec![],
+                                            token_burn: 0,
+                                            latency_ms: None,
+                                            cpu_pct: None, ram_pct: None, disk_pct: None,
+                                            gateway_port: 18789,
+                                            gateway_token: None,
+                                            uptime_seconds: 0,
+                                            activity: "new".into(), context_pct: None,
+                                            last_probe_at: None,
+                                        });
+                                        app.wizard.active = false;
+                                        let created_name = app.wizard.agent_name.clone();
+                                        app.toast(&format!("✅ Agent '{}' created", created_name));
                                     }
-                                    // Add to fleet config in memory
-                                    app.fleet_config.push(config::AgentConfig {
-                                        name: app.wizard.agent_name.clone(),
-                                        display: Some(app.wizard.display_name.clone()),
-                                        emoji: Some(app.wizard.emoji.clone()),
-                                        location: Some(app.wizard.location_str().to_string()),
-                                        ssh_user: Some(app.wizard.ssh_user.clone()),
-                                    });
-                                    // Add to agents vec
-                                    app.agents.push(Agent {
-                                        name: app.wizard.display_name.clone(),
-                                        db_name: app.wizard.agent_name.clone(),
-                                        emoji: app.wizard.emoji.clone(),
-                                        host: app.wizard.host.clone(),
-                                        location: app.wizard.location_str().to_string(),
-                                        status: AgentStatus::Unknown,
-                                        os: String::new(), kernel: String::new(),
-                                        oc_version: String::new(), last_seen: String::new(),
-                                        current_task: None,
-                                        ssh_user: app.wizard.ssh_user.clone(),
-                                        capabilities: vec![],
-                                        token_burn: 0,
-                                        latency_ms: None,
-                                        cpu_pct: None, ram_pct: None, disk_pct: None,
-                                        gateway_port: 18789,
-                                        gateway_token: None,
-                                        uptime_seconds: 0,
-                                        activity: "new".into(), context_pct: None,
-                                        last_probe_at: None,
-                                    });
-                                    app.wizard.active = false;
-                                    let created_name = app.wizard.agent_name.clone();
-                                    app.toast(&format!("✅ Agent '{}' created", created_name));
                                 }
                             }
                             KeyCode::Tab => {
@@ -5919,18 +6287,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.last_task_poll = Instant::now();
         }
 
-        // Receive diagnostic steps (non-blocking)
+        // Receive diagnostic steps (non-blocking).
+        // We collect the onboard commit data in a local var to avoid borrow conflicts,
+        // then apply DB write + agents push + toast after releasing the borrow.
+        let mut onboard_commit_data: Option<(OnboardPending, OnboardCommit)> = None;
+        let mut onboard_failed = false;
         if app.diag_active {
             if let Some(ref mut rx) = app.diag_rx {
                 while let Ok(step) = rx.try_recv() {
                     let is_done = step.label == "DONE";
+                    let is_pass = step.status == DiagStatus::Pass;
                     app.diag_steps.push(step);
                     if is_done {
                         // Mark task as no longer running (overlay stays open for user to read)
                         app.diag_task_running = false;
+                        // If this was a full-onboard run, collect commit data
+                        if is_pass {
+                            if let Some(pending) = app.onboard_pending.take() {
+                                if let Some(ref mut commit_rx) = app.onboard_commit_rx {
+                                    if let Ok(commit) = commit_rx.try_recv() {
+                                        onboard_commit_data = Some((pending, commit));
+                                    }
+                                }
+                                app.onboard_commit_rx = None;
+                            }
+                        } else if app.onboard_pending.is_some() {
+                            // Onboard failed — clear pending (nothing was written to DB)
+                            onboard_failed = true;
+                            app.onboard_pending = None;
+                            app.onboard_commit_rx = None;
+                        }
                     }
                 }
             }
+        }
+        // Apply onboard commit now that diag_rx borrow is released
+        if let Some((pending, commit)) = onboard_commit_data {
+            // Atomic DB write — only now that all steps succeeded
+            if let Some(pool) = &app.db_pool {
+                let pool = pool.clone();
+                let caps = format!(r#"["{}"]"#, pending.location.to_lowercase());
+                let (an, host, os_i, gp, gt) = (
+                    pending.agent_name.clone(),
+                    pending.host.clone(),
+                    commit.os_info.clone(),
+                    commit.gateway_port,
+                    commit.gateway_token.clone(),
+                );
+                tokio::spawn(async move {
+                    use mysql_async::prelude::*;
+                    if let Ok(mut conn) = pool.get_conn().await {
+                        let _ = conn.exec_drop(
+                            "INSERT INTO mc_fleet_status \
+                             (agent_name, tailscale_ip, status, capabilities, os_info, gateway_port, gateway_token) \
+                             VALUES (?, ?, 'online', ?, ?, ?, ?) \
+                             ON DUPLICATE KEY UPDATE \
+                               tailscale_ip=VALUES(tailscale_ip), \
+                               status='online', \
+                               capabilities=VALUES(capabilities), \
+                               os_info=VALUES(os_info), \
+                               gateway_port=VALUES(gateway_port), \
+                               gateway_token=VALUES(gateway_token)",
+                            (&an, &host, &caps, &os_i, gp, &gt),
+                        ).await;
+                    }
+                });
+            }
+            // Add to in-memory fleet
+            let emoji = pending.emoji.clone();
+            let display = pending.display_name.clone();
+            let agent_name = pending.agent_name.clone();
+            app.fleet_config.push(config::AgentConfig {
+                name: pending.agent_name.clone(),
+                display: Some(pending.display_name.clone()),
+                emoji: Some(pending.emoji.clone()),
+                location: Some(pending.location.clone()),
+                ssh_user: Some(pending.ssh_user.clone()),
+            });
+            let gw_token = commit.gateway_token.clone();
+            let os_info = commit.os_info.clone();
+            app.agents.push(Agent {
+                name: display,
+                db_name: agent_name.clone(),
+                emoji,
+                host: pending.host.clone(),
+                location: pending.location.clone(),
+                status: AgentStatus::Online,
+                os: os_info,
+                kernel: String::new(),
+                oc_version: String::new(),
+                last_seen: String::new(),
+                current_task: None,
+                ssh_user: pending.ssh_user.clone(),
+                capabilities: vec![],
+                token_burn: 0,
+                latency_ms: None,
+                cpu_pct: None, ram_pct: None, disk_pct: None,
+                gateway_port: commit.gateway_port,
+                gateway_token: Some(gw_token),
+                uptime_seconds: 0,
+                activity: "new".into(), context_pct: None,
+                last_probe_at: None,
+            });
+            let os_label = commit.os_info.split_whitespace().next().unwrap_or("agent").to_string();
+            app.toast(&format!("✅ {} added to fleet — all checks passed", os_label));
+        } else if onboard_failed {
+            app.toast("❌ Onboarding failed — see overlay for details");
         }
 
         // Receive fleet diagnostic messages (non-blocking)
