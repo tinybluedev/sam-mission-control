@@ -56,6 +56,8 @@ struct Agent {
     gateway_port: i32,
     gateway_token: Option<String>,
     uptime_seconds: i64,
+    activity: String,  // What the agent is currently doing
+    context_pct: Option<f32>,  // Context window usage %
     #[serde(skip)]
     last_probe_at: Option<std::time::Instant>,
 }
@@ -151,6 +153,8 @@ struct ProbeResult {
     cpu_pct: Option<f32>,
     ram_pct: Option<f32>,
     disk_pct: Option<f32>,
+    activity: String,
+    context_pct: Option<f32>,
 }
 
 
@@ -357,6 +361,7 @@ impl App {
                         gateway_port: da.gateway_port,
                         gateway_token: da.gateway_token.clone(),
                         uptime_seconds: da.uptime_seconds,
+                        activity: "idle".into(), context_pct: None,
                         last_probe_at: None,
                     });
                 }
@@ -1102,8 +1107,8 @@ SAMEOF", path, path, escaped_content);
             let (host, user, sip) = (a.host.clone(), a.ssh_user.clone(), self.self_ip.clone());
             let tx = tx.clone();
             tokio::spawn(async move {
-                let (status, os, kern, oc, lat, cpu, ram, disk) = probe_agent(&host, &user, &sip).await;
-                let _ = tx.send(ProbeResult { index: i, status, os, kernel: kern, oc_version: oc, latency_ms: lat, cpu_pct: cpu, ram_pct: ram, disk_pct: disk });
+                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx) = probe_agent(&host, &user, &sip).await;
+                let _ = tx.send(ProbeResult { index: i, status, os, kernel: kern, oc_version: oc, latency_ms: lat, cpu_pct: cpu, ram_pct: ram, disk_pct: disk, activity: act, context_pct: ctx });
             });
         }
     }
@@ -1222,7 +1227,7 @@ SAMEOF", path, path, escaped_content);
 
 // ---- SSH Probe ----
 
-async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, String, String, String, Option<u32>, Option<f32>, Option<f32>, Option<f32>) {
+async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, String, String, String, Option<u32>, Option<f32>, Option<f32>, Option<f32>, String, Option<f32>) {
     let start = Instant::now();
     if host == "localhost" || host == self_ip {
         let os = Command::new("bash").args(["-c", ". /etc/os-release 2>/dev/null && echo \"$NAME $VERSION_ID\" || echo unknown"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
@@ -1232,17 +1237,17 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, Str
         let ram = Command::new("bash").args(["-c", r#"free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}'"#]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok()).ok().flatten();
         let disk = Command::new("bash").args(["-c", r#"df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}'"#]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok()).ok().flatten();
         let ms = start.elapsed().as_millis() as u32;
-        return (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk);
+        return (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk, "local".into(), None);
     }
     let tgt = format!("{}@{}", user, host);
-    let script = r#"OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK""#;
+    let script = r#"OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; ACT=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
     let result = tokio::time::timeout(
         Duration::from_secs(8),
         Command::new("ssh").args(["-o","ConnectTimeout=4","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",&tgt,"bash","-c",script]).output()
     ).await;
     let result = match result {
         Ok(r) => r,
-        Err(_) => return (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None),
+        Err(_) => return (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None),
     };
     match result {
         Ok(o) if o.status.success() => {
@@ -1253,16 +1258,18 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, Str
                 else if let Some(v) = l.strip_prefix("KERN:") { kern = v.trim().into(); }
                 else if let Some(v) = l.strip_prefix("OC:") { oc = v.trim().into(); }
             }
-            let (mut cpu, mut ram, mut disk) = (None, None, None);
+            let (mut cpu, mut ram, mut disk, mut act, mut ctx) = (None, None, None, String::new(), None);
             for l in s.lines() {
                 if let Some(v) = l.strip_prefix("CPU:") { cpu = v.trim().parse::<f32>().ok(); }
                 else if let Some(v) = l.strip_prefix("RAM:") { ram = v.trim().parse::<f32>().ok(); }
                 else if let Some(v) = l.strip_prefix("DISK:") { disk = v.trim().parse::<f32>().ok(); }
+                else if let Some(v) = l.strip_prefix("ACT:") { act = v.trim().to_string(); }
+                else if let Some(v) = l.strip_prefix("CTX:") { ctx = v.trim().parse::<f32>().ok(); }
             }
             let ms = start.elapsed().as_millis() as u32;
-            (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk)
+            (AgentStatus::Online, os, kern, oc, Some(ms), cpu, ram, disk, act, ctx)
         }
-        _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None),
+        _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None, None, None, None, String::new(), None),
     }
 }
 
@@ -1772,11 +1779,11 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     let show_resources = area.width > 120;
     let show_ip = area.width > 85;
     // Last Seen is shown in the 101-120 col range; at >120 the CPU/RAM/Disk resource columns take precedence
-    let show_last_seen = area.width > 100 && !show_resources;
+    let show_activity = area.width > 100;
     let hcells_vec: Vec<&str> = if show_resources {
-        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "Uptime", "CPU", "RAM", "Disk", "Version"]
-    } else if show_last_seen {
-        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "Uptime", "Last", "Version"]
+        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "Activity", "Ctx%", "CPU", "RAM", "Disk", "Version"]
+    } else if show_activity {
+        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "Uptime", "Activity", "Version"]
     } else if show_ip && show_latency {
         vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "Uptime", "Version"]
     } else if show_latency {
@@ -1824,10 +1831,23 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             cells.push(Cell::from(lat_str).style(Style::default().fg(lat_color)));
             cells.push(Cell::from(format_uptime(a.uptime_seconds)).style(Style::default().fg(t.text_dim)));
         }
-        if show_last_seen {
-            cells.push(Cell::from(format_since(a.last_probe_at)).style(Style::default().fg(last_seen_color(a.last_probe_at, t))));
+        if show_activity && !show_resources {
+            let act_display = if a.activity.is_empty() || a.activity == "idle" { "idle".to_string() } else { a.activity.clone() };
+            let act_color = if act_display == "idle" { t.text_dim } else { t.accent };
+            cells.push(Cell::from(act_display).style(Style::default().fg(act_color)));
         }
         if show_resources {
+            let act_short = if a.activity.is_empty() || a.activity == "idle" { "·" } else { &a.activity };
+            let act_color = if act_short == "·" { t.text_dim } else { t.accent };
+            cells.push(Cell::from(act_short.chars().take(10).collect::<String>()).style(Style::default().fg(act_color)));
+            let ctx_str = a.context_pct.map(|p| format!("{:.0}%", p)).unwrap_or("—".into());
+            let ctx_color = match a.context_pct {
+                Some(p) if p > 80.0 => t.status_offline,
+                Some(p) if p > 50.0 => t.status_busy,
+                Some(_) => t.status_online,
+                None => t.text_dim,
+            };
+            cells.push(Cell::from(ctx_str).style(Style::default().fg(ctx_color)));
             cells.push(Cell::from(mini_bar(a.cpu_pct, 4)).style(Style::default().fg(mini_bar_color(a.cpu_pct, t, 70.0, 90.0))));
             cells.push(Cell::from(mini_bar(a.ram_pct, 4)).style(Style::default().fg(mini_bar_color(a.ram_pct, t, 70.0, 85.0))));
             cells.push(Cell::from(mini_bar(a.disk_pct, 4)).style(Style::default().fg(mini_bar_color(a.disk_pct, t, 80.0, 90.0))));
@@ -1839,9 +1859,9 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     app.fleet_row_start_y = area.y + 1; // +1 for border, +1 for header handled in click calc
 
     let widths = if show_resources {
-        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Length(8), Constraint::Length(8), Constraint::Length(8), Constraint::Min(10)]
-    } else if show_last_seen {
-        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Length(8), Constraint::Min(10)]
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(10), Constraint::Length(5), Constraint::Length(6), Constraint::Length(6), Constraint::Length(6), Constraint::Min(10)]
+    } else if show_activity {
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Length(12), Constraint::Min(10)]
     } else if show_ip && show_latency {
         vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Min(10)]
     } else if show_latency {
@@ -2578,7 +2598,11 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Focus::Workspace => "Enter:view  e:edit  r:reload  Esc:info  1-4:tabs",
             _ => "Tab:chat  w:files  t:tasks  g:gateway  e:config  Esc:back  1-4:tabs",
         },
-        Screen::TaskBoard => "n:new  d:done  c:clear filter  Esc:back",
+        Screen::TaskBoard => if app.task_filter_agent.is_some() {
+            "n:new  d:done  c:clear filter  1-3:tabs  Esc:back to agent"
+        } else {
+            "n:new  d:done  Esc:back"
+        },
         Screen::Help => "Esc:back  q:quit",
         _ => "Esc:back",
     };
@@ -2884,6 +2908,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         gateway_port: 18789,
                                         gateway_token: None,
                                         uptime_seconds: 0,
+                                        activity: "new".into(), context_pct: None,
                                         last_probe_at: None,
                                     });
                                     app.wizard.active = false;
@@ -3112,8 +3137,20 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                 }
                             } else {
                                 match key.code {
-                                    KeyCode::Esc => { app.screen = Screen::Dashboard; app.focus = Focus::Fleet; }
+                                    KeyCode::Esc => {
+                                        if app.task_filter_agent.is_some() {
+                                            app.screen = Screen::AgentDetail;
+                                            app.focus = Focus::Fleet;
+                                        } else {
+                                            app.screen = Screen::Dashboard;
+                                            app.focus = Focus::Fleet;
+                                        }
+                                    }
                                     KeyCode::Char('q') => app.should_quit = true,
+                                    KeyCode::Char('1') if app.task_filter_agent.is_some() => { app.screen = Screen::AgentDetail; app.focus = Focus::Fleet; }
+                                    KeyCode::Char('2') if app.task_filter_agent.is_some() => { app.screen = Screen::AgentDetail; app.focus = Focus::AgentChat; }
+                                    KeyCode::Char('3') if app.task_filter_agent.is_some() => { app.screen = Screen::AgentDetail; app.focus = Focus::Workspace; app.start_workspace_load(); }
+                                    KeyCode::Char('4') => {} // already on tasks
                                     KeyCode::Up | KeyCode::Char('k') => { if app.task_selected > 0 { app.task_selected -= 1; } }
                                     KeyCode::Down | KeyCode::Char('j') => { if app.task_selected < app.tasks.len().saturating_sub(1) { app.task_selected += 1; } }
                                     KeyCode::Char('n') => app.task_input_active = true,
@@ -3126,8 +3163,11 @@ if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                             }
                                         }
                                     }
-                                    KeyCode::Char('b') => app.cycle_bg(),
-                                    KeyCode::Char('c') => app.cycle_theme(),
+                                    KeyCode::Char('c') if app.task_filter_agent.is_some() => {
+                                        app.task_filter_agent = None;
+                                        app.last_task_poll = Instant::now() - Duration::from_secs(10);
+                                        app.toast("Filter cleared — showing all tasks");
+                                    }
                                     _ => {}
                                 }
                             }
