@@ -300,6 +300,7 @@ struct App {
     diag_steps: Vec<DiagStep>,
     diag_rx: Option<mpsc::UnboundedReceiver<DiagStep>>,
     diag_auto_fix: bool,
+    diag_start: Option<Instant>,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -418,7 +419,7 @@ impl App {
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
-            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false,
+            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
@@ -1107,6 +1108,7 @@ impl App {
         let gw_port = agent.gateway_port;
         self.diag_active = true;
         self.diag_auto_fix = fix;
+        self.diag_start = Some(Instant::now());
         self.diag_steps = vec![DiagStep { label: format!("Diagnosing {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2448,9 +2450,37 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
 fn render_diagnostics(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let area = frame.area();
-    // Center overlay
-    let w = 60.min(area.width.saturating_sub(4));
-    let h = (app.diag_steps.len() as u16 + 6).min(area.height.saturating_sub(4));
+
+    // Deduplicate — only show latest status per label (computed first for sizing)
+    let mut seen: std::collections::HashMap<String, DiagStep> = std::collections::HashMap::new();
+    for step in &app.diag_steps {
+        seen.insert(step.label.clone(), step.clone());
+    }
+    let mut ordered_labels: Vec<String> = Vec::new();
+    for step in &app.diag_steps {
+        if !ordered_labels.contains(&step.label) {
+            ordered_labels.push(step.label.clone());
+        }
+    }
+
+    // Count check steps (excludes header "Diagnosing…" and "DONE")
+    let total_steps = ordered_labels.iter().filter(|l| {
+        *l != "DONE" && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+    }).count();
+    let done_count = ordered_labels.iter().filter(|l| {
+        *l != "DONE"
+            && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+            && seen.get(*l).map(|s| !matches!(s.status, DiagStatus::Running)).unwrap_or(false)
+    }).count();
+    let is_done = seen.contains_key("DONE");
+
+    // ~60% width; 58 is the minimum to fit the progress bar + step labels legibly
+    let w = ((area.width as f32 * 0.6) as u16).max(58).min(area.width.saturating_sub(4));
+    let content_h = ordered_labels.len().saturating_sub(1) as u16  // visible labels (DONE hidden)
+        + if total_steps > 0 { 2 } else { 0 }  // progress bar + blank
+        + if is_done { 3 } else { 2 }           // summary+hint or running hint
+        + 5;                                     // blanks + borders + padding
+    let h = content_h.min(area.height.saturating_sub(4)).max(8);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -2463,17 +2493,14 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
 
-    // Deduplicate — only show latest status per label
-    let mut seen = std::collections::HashMap::new();
-    for step in &app.diag_steps {
-        seen.insert(step.label.clone(), step.clone());
-    }
-    // Maintain order of first appearance
-    let mut ordered_labels = Vec::new();
-    for step in &app.diag_steps {
-        if !ordered_labels.contains(&step.label) {
-            ordered_labels.push(step.label.clone());
-        }
+    // Progress bar (step N / total)
+    if total_steps > 0 {
+        let bar_inner = w.saturating_sub(14) as usize;
+        let filled = (done_count * bar_inner / total_steps).min(bar_inner);
+        let empty = bar_inner - filled;
+        let bar = format!("  [{}{}] {}/{}", "█".repeat(filled), "░".repeat(empty), done_count, total_steps);
+        lines.push(Line::from(Span::styled(bar, Style::default().fg(t.accent))));
+        lines.push(Line::from(""));
     }
 
     for label in &ordered_labels {
@@ -2484,47 +2511,75 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
                 lines.push(Line::from(""));
                 continue;
             }
-            let (icon, color) = match step.status {
-                DiagStatus::Running => ("⏳", t.pending),
-                DiagStatus::Pass => ("✓ ", t.status_online),
-                DiagStatus::Fail => ("✗ ", t.status_offline),
-                DiagStatus::Fixed => ("🔧", Color::Yellow),
-                DiagStatus::Skipped => ("⊘ ", t.text_dim),
-            };
-            let detail = if step.detail.is_empty() { String::new() } else { format!(" — {}", step.detail) };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
-                Span::styled(&step.label, Style::default().fg(t.text).bold()),
-                Span::styled(detail, Style::default().fg(t.text_dim)),
-            ]));
+            if step.status == DiagStatus::Running {
+                let c = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+                let elapsed_str = app.diag_start
+                    .map(|s| format!(" {:.1}s", s.elapsed().as_secs_f64()))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", c), Style::default().fg(t.pending)),
+                    Span::styled(&step.label, Style::default().fg(t.text).bold()),
+                    Span::styled(format!("  running{}", elapsed_str), Style::default().fg(t.text_dim)),
+                ]));
+            } else {
+                let (icon, color) = match step.status {
+                    DiagStatus::Pass => ("✓ ", t.status_online),
+                    DiagStatus::Fail => ("✗ ", t.status_offline),
+                    DiagStatus::Fixed => ("🔧", t.status_busy),
+                    DiagStatus::Skipped => ("⊘ ", t.text_dim),
+                    DiagStatus::Running => ("⏳", t.pending),
+                };
+                let detail = if step.detail.is_empty() { String::new() } else { format!(" — {}", step.detail) };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+                    Span::styled(&step.label, Style::default().fg(t.text).bold()),
+                    Span::styled(detail, Style::default().fg(t.text_dim)),
+                ]));
+            }
         }
     }
 
-    // Show done status
-    if let Some(done) = seen.get("DONE") {
+    // Summary when done, or cancel hint while running
+    if is_done {
         lines.push(Line::from(""));
-        let total = ordered_labels.len() - 2; // minus header and DONE
         let passed = ordered_labels.iter().filter(|l| {
-            *l != "DONE" && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
-                && seen.get(*l).map(|s| matches!(s.status, DiagStatus::Pass | DiagStatus::Fixed)).unwrap_or(false)
+            *l != "DONE"
+                && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+                && seen.get(*l).map(|s| s.status == DiagStatus::Pass).unwrap_or(false)
         }).count();
-        let failed = total - passed;
-        let summary = if failed == 0 {
-            format!("  All {} checks passed ✓", total)
+        let fixed = ordered_labels.iter().filter(|l| {
+            *l != "DONE"
+                && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+                && seen.get(*l).map(|s| s.status == DiagStatus::Fixed).unwrap_or(false)
+        }).count();
+        let failed = ordered_labels.iter().filter(|l| {
+            *l != "DONE"
+                && !seen.get(*l).map(|s| s.label.contains("Diagnosing")).unwrap_or(false)
+                && seen.get(*l).map(|s| s.status == DiagStatus::Fail).unwrap_or(false)
+        }).count();
+        let summary = if failed == 0 && fixed == 0 {
+            format!("  All {} checks passed ✓", total_steps)
+        } else if fixed > 0 && failed == 0 {
+            format!("  {}/{} passed, {} fixed ✓", passed, total_steps, fixed)
+        } else if fixed > 0 {
+            format!("  {}/{} passed, {} fixed, {} failed", passed, total_steps, fixed, failed)
         } else {
-            format!("  {}/{} passed, {} failed", passed, total, failed)
+            format!("  {}/{} passed, {} failed", passed, total_steps, failed)
         };
         let color = if failed == 0 { t.status_online } else { t.status_offline };
         lines.push(Line::from(Span::styled(summary, Style::default().fg(color).bold())));
-        lines.push(Line::from(Span::styled("  Press Esc to close", Style::default().fg(t.text_dim))));
+        lines.push(Line::from(Span::styled("  Press Esc or q to close", Style::default().fg(t.text_dim))));
+    } else if total_steps > 0 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  Press Esc or q to cancel", Style::default().fg(t.text_dim))));
     }
 
     let diag = Paragraph::new(lines)
         .block(Block::default()
             .title(Span::styled(title, Style::default().fg(t.accent).bold()))
             .borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(Style::default().fg(if app.diag_auto_fix { Color::Yellow } else { t.accent }))
-            .style(Style::default().bg(Color::Rgb(15, 17, 22))));
+            .border_style(Style::default().fg(if app.diag_auto_fix { t.status_busy } else { t.accent }))
+            .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(diag, popup);
 }
 
@@ -3558,6 +3613,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Esc | KeyCode::Char('q') => {
                                 app.diag_active = false;
                                 app.diag_steps.clear();
+                                app.diag_rx = None;
+                                app.diag_start = None;
                                 app.start_refresh(); // re-probe after fix
                             }
                             _ => {}
