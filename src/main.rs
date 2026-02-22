@@ -2822,7 +2822,7 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
 
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
-        Span::styled("Esc=back │ Headscale at vpn.example.com │ v=VPN │ q=quit", Style::default().fg(t.text_dim)),
+        Span::styled("Esc/q=back  │  b=bg  │  c=theme", Style::default().fg(t.text_dim)),
     ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(footer, outer[2]);
