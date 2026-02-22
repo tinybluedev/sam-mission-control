@@ -1,3 +1,8 @@
+//! S.A.M Mission Control — main entry point.
+//!
+//! Parses CLI arguments, loads configuration, and either runs a CLI subcommand
+//! (non-interactive) or launches the full Ratatui TUI event loop.
+
 mod cli;
 mod config;
 mod wizard;

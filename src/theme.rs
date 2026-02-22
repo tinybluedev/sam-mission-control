@@ -1,3 +1,9 @@
+//! Color theme definitions for the S.A.M Mission Control TUI.
+//!
+//! Each theme is a [`Theme`] struct containing named color fields used throughout
+//! the UI. Available themes: `standard`, `noir`, `paper`, `1977`, `2077`,
+//! `matrix`, `sunset`, `arctic`.
+
 use ratatui::prelude::*;
 
 // ---- Background Density ----

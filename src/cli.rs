@@ -1,3 +1,19 @@
+//! CLI subcommand definitions and implementations for S.A.M Mission Control.
+//!
+//! This module defines the [`Cli`] struct (parsed by [clap]) and all [`Commands`]
+//! variants. Each subcommand is implemented as an async function that is called
+//! from `main.rs` when no TUI is needed.
+//!
+//! ## Commands
+//! - [`Commands::Status`] — print fleet status and exit
+//! - [`Commands::Chat`] — send a direct message to an agent
+//! - [`Commands::Doctor`] — diagnose (and optionally fix) fleet issues
+//! - [`Commands::Init`] — first-time database and config setup
+//! - [`Commands::Setup`] — regenerate `config.toml`
+//! - [`Commands::Onboard`] — provision a new agent over SSH
+//! - [`Commands::Deploy`] — push a file to an agent's workspace
+//! - [`Commands::Version`] — print the binary version
+
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -135,6 +151,7 @@ pub struct SamConfig {
     pub identity: IdentityConfig,
 }
 
+/// Database connection settings from `[database]` in `config.toml`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DatabaseConfig {
     pub url: Option<String>,
@@ -151,6 +168,7 @@ impl Default for DatabaseConfig {
     }
 }
 
+/// TUI display settings from `[tui]` in `config.toml`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TuiConfig {
     #[serde(default = "default_theme")]
@@ -174,11 +192,13 @@ fn default_bg() -> String { "dark".into() }
 fn default_refresh() -> u64 { 30 }
 fn default_chat_poll() -> u64 { 3 }
 
+/// Fleet config path override from `[fleet]` in `config.toml`.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct FleetConfig {
     pub config_path: Option<String>,
 }
 
+/// Operator identity settings from `[identity]` in `config.toml`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IdentityConfig {
     #[serde(default = "default_user")]

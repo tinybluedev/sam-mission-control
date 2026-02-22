@@ -1,3 +1,18 @@
+//! Database access layer for S.A.M Mission Control.
+//!
+//! This module provides all MySQL interactions: connection pooling, fleet state
+//! queries, chat message storage, task routing, cron job tracking, context
+//! snapshots, and spawned-agent records.
+//!
+//! ## Connection
+//! A connection pool is obtained via [`get_pool`]. The pool reads credentials
+//! from environment variables (`SAM_DB_URL` or the individual `SAM_DB_*` vars).
+//!
+//! ## Password Encoding
+//! MySQL URLs percent-encode special characters in passwords via
+//! [`build_db_url`]. Raw passwords are never written to log output; see
+//! [`sanitize_error`].
+
 use mysql_async::prelude::*;
 
 /// Sanitize error messages to remove passwords/credentials
@@ -12,12 +27,19 @@ pub fn sanitize_error(msg: &str) -> String {
 use mysql_async::Pool;
 use std::env;
 
-/// Build a MySQL URL from individual components
+/// Build a MySQL connection URL from individual components, percent-encoding
+/// special characters (`$` → `%24`, `@` → `%40`, `#` → `%23`) in the password.
 pub fn build_db_url(host: &str, port: &str, user: &str, pass: &str, db: &str) -> String {
     let encoded_pass = pass.replace("$", "%24").replace("@", "%40").replace("#", "%23");
     format!("mysql://{}:{}@{}:{}/{}", user, encoded_pass, host, port, db)
 }
 
+/// Create a MySQL connection pool using environment-variable credentials.
+///
+/// Resolution order:
+/// 1. `SAM_DB_URL` — full MySQL URL (highest priority)
+/// 2. `SAM_DB_HOST` / `SAM_DB_PORT` / `SAM_DB_USER` / `SAM_DB_PASS` / `SAM_DB_NAME`
+/// 3. Defaults: `127.0.0.1:3306`, user `root`, empty password, database `sam_fleet`
 pub fn get_pool() -> Pool {
     let url = env::var("SAM_DB_URL")
         .unwrap_or_else(|_| {
@@ -48,6 +70,7 @@ pub struct DbAgent {
     pub gateway_token: Option<String>,
 }
 
+/// Load all agents from `mc_fleet_status`, ordered by name.
 pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let rows: Vec<mysql_async::Row> = conn.query(
@@ -73,6 +96,7 @@ pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error>
     Ok(agents)
 }
 
+/// Update an agent's status fields. Delegates to [`update_agent_status_full`] with `latency_ms = None`.
 pub async fn update_agent_status(
     pool: &Pool, agent_name: &str, status: &str,
     os_info: Option<&str>, kernel: Option<&str>, oc_version: Option<&str>,
@@ -80,6 +104,8 @@ pub async fn update_agent_status(
     update_agent_status_full(pool, agent_name, status, os_info, kernel, oc_version, None).await
 }
 
+/// Update an agent's status, OS info, kernel, OpenClaw version, and optionally latency.
+/// Only non-`None` values overwrite existing DB data (`COALESCE` semantics).
 pub async fn update_agent_status_full(
     pool: &Pool, agent_name: &str, status: &str,
     os_info: Option<&str>, kernel: Option<&str>, oc_version: Option<&str>,
@@ -171,6 +197,7 @@ pub async fn load_chat_history(pool: &Pool, limit: u32) -> Result<Vec<ChatMessag
     Ok(messages.into_iter().rev().collect())
 }
 
+/// Insert a chat message into `mc_chat` and return its row ID.
 pub async fn send_chat(pool: &Pool, sender: &str, target: Option<&str>, message: &str) -> Result<i64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let kind = if target.is_some() { "direct" } else { "global" };
@@ -182,6 +209,7 @@ pub async fn send_chat(pool: &Pool, sender: &str, target: Option<&str>, message:
     Ok(id.unwrap_or(0))
 }
 
+/// Retrieve all pending chat messages addressed to `agent_name`.
 pub async fn get_pending_for_agent(pool: &Pool, agent_name: &str) -> Result<Vec<ChatMessage>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let messages: Vec<ChatMessage> = conn.exec_map(
@@ -194,6 +222,7 @@ pub async fn get_pending_for_agent(pool: &Pool, agent_name: &str) -> Result<Vec<
     Ok(messages)
 }
 
+/// Mark a chat message as responded, storing the agent's reply and timestamp.
 pub async fn respond_to_chat(pool: &Pool, msg_id: i64, response: &str) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     conn.exec_drop(
@@ -275,6 +304,7 @@ pub struct Task {
     pub result: Option<String>,
 }
 
+/// Load the most recent tasks from `mc_task_routing`, ordered by priority then ID.
 pub async fn load_tasks(pool: &Pool, limit: u32) -> Result<Vec<Task>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let tasks: Vec<Task> = conn.exec_map(
@@ -287,6 +317,8 @@ pub async fn load_tasks(pool: &Pool, limit: u32) -> Result<Vec<Task>, mysql_asyn
     Ok(tasks)
 }
 
+/// Insert a new task into `mc_task_routing`. Status is set to `'assigned'` when
+/// `assigned_agent` is provided, otherwise `'queued'`. Returns the new task ID.
 pub async fn create_task(pool: &Pool, description: &str, priority: i32, created_by: &str, assigned_agent: Option<&str>) -> Result<i64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     conn.exec_drop(
@@ -297,6 +329,8 @@ pub async fn create_task(pool: &Pool, description: &str, priority: i32, created_
     Ok(id.unwrap_or(0))
 }
 
+/// Update the status of a task. Sets `completed_at` for terminal states and
+/// `assigned_at` for active transitions.
 pub async fn update_task_status(pool: &Pool, task_id: i32, status: &str) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let extra = match status {
@@ -322,6 +356,7 @@ pub struct AgentCron {
     pub description: String,
 }
 
+/// Load all cron job definitions for `agent` from `mc_agent_crons`.
 pub async fn load_agent_crons(pool: &mysql_async::Pool, agent: &str) -> Result<Vec<AgentCron>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
@@ -341,6 +376,7 @@ pub async fn load_agent_crons(pool: &mysql_async::Pool, agent: &str) -> Result<V
     }).collect())
 }
 
+/// Insert or update a cron job definition in `mc_agent_crons` (upsert on `agent_name, cron_id`).
 pub async fn upsert_agent_cron(pool: &mysql_async::Pool, c: &AgentCron) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
@@ -361,6 +397,7 @@ pub struct AgentContext {
     pub context_pct: f32,
 }
 
+/// Persist a context snapshot for an agent into `mc_agent_context`.
 pub async fn save_agent_context(pool: &mysql_async::Pool, ctx: &AgentContext) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
@@ -371,6 +408,7 @@ pub async fn save_agent_context(pool: &mysql_async::Pool, ctx: &AgentContext) ->
     Ok(())
 }
 
+/// Load the most recent context snapshot for `agent`, or `None` if no record exists.
 pub async fn load_latest_context(pool: &mysql_async::Pool, agent: &str) -> Result<Option<AgentContext>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
@@ -400,6 +438,8 @@ pub struct SpawnedAgent {
     pub created_at: String,
 }
 
+/// Queue a sub-agent spawn request in `mc_spawned_agents` with status `'queued'`.
+/// Returns the new record ID.
 pub async fn spawn_agent(pool: &mysql_async::Pool, agent: &str, agent_id: &str, prompt: &str) -> Result<i64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
@@ -410,6 +450,7 @@ pub async fn spawn_agent(pool: &mysql_async::Pool, agent: &str, agent_id: &str, 
     Ok(conn.last_insert_id().unwrap_or(0) as i64)
 }
 
+/// Load the 50 most recent spawned-agent records, newest first.
 pub async fn load_spawned_agents(pool: &mysql_async::Pool) -> Result<Vec<SpawnedAgent>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
