@@ -73,6 +73,24 @@ impl AgentStatus {
 }
 
 #[derive(Clone, Debug)]
+struct Alert {
+    time: String,
+    agent: String,
+    emoji: String,
+    message: String,
+    severity: AlertSeverity,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum AlertSeverity { Critical, Warning, Info }
+
+impl AlertSeverity {
+    fn icon(&self) -> &str {
+        match self { Self::Critical => "🔴", Self::Warning => "🟡", Self::Info => "🔵" }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ChatLine {
     sender: String,
     target: Option<String>,
@@ -87,7 +105,7 @@ struct ChatLine {
 enum Focus { Fleet, Chat, AgentChat, Command }
 
 #[derive(PartialEq)]
-enum Screen { Dashboard, AgentDetail, TaskBoard, VpnStatus, Help }
+enum Screen { Dashboard, AgentDetail, TaskBoard, VpnStatus, Alerts, Help }
 
 #[derive(PartialEq, Clone, Copy)]
 enum SortMode { Name, Status, Location, Version, Latency }
@@ -162,6 +180,9 @@ struct App {
     detail_info_area: Rect,
     detail_chat_area: Rect,
     fleet_row_start_y: u16,  // Y offset where first agent row starts
+    // Alerts
+    alerts: Vec<Alert>,
+    alert_flash: Option<Instant>,
     // Multi-select
     multi_selected: std::collections::HashSet<usize>,
     // Theme
@@ -230,6 +251,7 @@ impl App {
             wizard: wizard::AgentWizard::new(),
             tasks: vec![], task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
+            alerts: vec![], alert_flash: None,
             multi_selected: HashSet::new(),
             spinner_frame: 0, sort_mode: SortMode::Name,
             fleet_area: Rect::default(), chat_area: Rect::default(),
@@ -383,6 +405,52 @@ impl App {
         updates
     }
 
+    fn check_alerts(&mut self) {
+        let now = now_str();
+        for a in &self.agents {
+            if a.status == AgentStatus::Offline && !a.last_seen.is_empty() {
+                // Only alert if we haven't recently alerted for this agent
+                let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("offline"));
+                if !already {
+                    self.alerts.push(Alert {
+                        time: now.clone(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
+                        message: format!("{} went offline", a.name),
+                        severity: AlertSeverity::Critical,
+                    });
+                    self.alert_flash = Some(Instant::now());
+                }
+            }
+            if let Some(disk) = a.disk_pct {
+                if disk > 90.0 {
+                    let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("disk"));
+                    if !already {
+                        self.alerts.push(Alert {
+                            time: now.clone(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
+                            message: format!("{} disk at {:.0}%", a.name, disk),
+                            severity: AlertSeverity::Warning,
+                        });
+                        self.alert_flash = Some(Instant::now());
+                    }
+                }
+            }
+            if let Some(ram) = a.ram_pct {
+                if ram > 90.0 {
+                    let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("RAM"));
+                    if !already {
+                        self.alerts.push(Alert {
+                            time: now.clone(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
+                            message: format!("{} RAM at {:.0}%", a.name, ram),
+                            severity: AlertSeverity::Warning,
+                        });
+                        self.alert_flash = Some(Instant::now());
+                    }
+                }
+            }
+        }
+        // Keep last 100 alerts
+        if self.alerts.len() > 100 { self.alerts.drain(0..self.alerts.len()-100); }
+    }
+
     fn update_status_bar(&mut self) {
         let on = self.agents.iter().filter(|a| a.status == AgentStatus::Online).count();
         let total = self.agents.len();
@@ -395,9 +463,14 @@ impl App {
         let sel_info = if !self.multi_selected.is_empty() {
             format!(" │ 🔲 {}", self.multi_selected.len())
         } else { String::new() };
+        let alert_info = if !self.alerts.is_empty() {
+            let crits = self.alerts.iter().filter(|a| a.severity == AlertSeverity::Critical).count();
+            if crits > 0 { format!(" │ 🔴 {} alerts", self.alerts.len()) }
+            else { format!(" │ 🟡 {} alerts", self.alerts.len()) }
+        } else { String::new() };
         self.status_message = format!(
-            "v1.1 │ {}/{} online{}{} │ sort:{} │ chat({}) │ {}/{} │ /=cmd ?=help",
-            on, total, refresh, sel_info, self.sort_mode.label(), chat_count,
+            "v1.1 │ {}/{} online{}{}{} │ sort:{} │ chat({}) │ {}/{} │ /=cmd ?=help",
+            on, total, refresh, sel_info, alert_info, self.sort_mode.label(), chat_count,
             self.theme_name.label(), self.bg_density.label()
         );
     }
@@ -584,6 +657,9 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         Span::styled(if live { "● live" } else { "○ stale" }, Style::default().fg(if live { t.status_online } else { t.status_offline })),
         Span::raw("    "),
         Span::styled(if app.refreshing { "⟳ refreshing" } else { "" }, Style::default().fg(t.accent)),
+        if app.alert_flash.map(|f| f.elapsed() < Duration::from_secs(5)).unwrap_or(false) {
+            Span::styled("  ⚠️ NEW ALERT", Style::default().fg(t.status_offline).bold())
+        } else { Span::raw("") },
         Span::raw("    "),
         Span::styled(match app.focus {
             Focus::Fleet => "▌Fleet▐", Focus::Chat => "▌Chat▐", _ => "▌Fleet▐",
@@ -1101,6 +1177,65 @@ fn render_task_board(frame: &mut Frame, app: &App) {
 }
 
 
+fn render_alerts(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let outer = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
+        .split(frame.area());
+
+    let bg_block = Block::default().style(Style::default().bg(app.bg_density.bg()));
+    frame.render_widget(bg_block, frame.area());
+
+    let crits = app.alerts.iter().filter(|a| a.severity == AlertSeverity::Critical).count();
+    let warns = app.alerts.iter().filter(|a| a.severity == AlertSeverity::Warning).count();
+    let header = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("🔔 ALERTS", Style::default().fg(t.header_title).bold()),
+        Span::raw("    "),
+        Span::styled(format!("🔴 {}", crits), Style::default().fg(t.status_offline)),
+        Span::raw("  "),
+        Span::styled(format!("🟡 {}", warns), Style::default().fg(t.status_busy)),
+        Span::raw("  "),
+        Span::styled(format!("{} total", app.alerts.len()), Style::default().fg(t.text_dim)),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(header, outer[0]);
+
+    let lines: Vec<Line> = if app.alerts.is_empty() {
+        vec![Line::from(""), Line::from(Span::styled("  No alerts — all systems nominal ✅", Style::default().fg(t.status_online)))]
+    } else {
+        app.alerts.iter().rev().map(|a| {
+            let sev_color = match a.severity {
+                AlertSeverity::Critical => t.status_offline,
+                AlertSeverity::Warning => t.status_busy,
+                AlertSeverity::Info => t.accent,
+            };
+            Line::from(vec![
+                Span::styled(format!("  {} ", a.time), Style::default().fg(t.text_dim)),
+                Span::styled(a.severity.icon(), Style::default()),
+                Span::raw(" "),
+                Span::styled(format!("{} ", a.emoji), Style::default()),
+                Span::styled(&a.message, Style::default().fg(sev_color)),
+            ])
+        }).collect()
+    };
+
+    let alerts = Paragraph::new(lines)
+        .block(Block::default().title(Span::styled(" Alert History ", Style::default().fg(t.border_active).bold()))
+            .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(t.border_active))
+            .style(Style::default().bg(app.bg_density.bg()))
+            .padding(Padding::new(1, 1, 1, 0)));
+    frame.render_widget(alerts, outer[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Esc=back │ w=alerts │ q=quit", Style::default().fg(t.text_dim)),
+    ])).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(footer, outer[2]);
+}
+
 fn render_help(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let sections = vec![
@@ -1113,6 +1248,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("  s", "Sort: name → status → location → version"),
         ("  t", "Task board"),
         ("  v", "VPN mesh status"),
+        ("  w", "Alerts & warnings"),
         ("  Space", "Toggle agent selection"),
         ("  A (Shift)", "Select all agents"),
         ("  N (Shift)", "Clear selection"),
@@ -1258,6 +1394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
             }
+            app.check_alerts();
             app.update_status_bar();
         }
 
@@ -1267,6 +1404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Screen::AgentDetail => render_detail(f, &mut app),
                 Screen::TaskBoard => render_task_board(f, &app),
                 Screen::VpnStatus => render_vpn_status(f, &app),
+                Screen::Alerts => render_alerts(f, &app),
                 Screen::Help => render_help(f, &app),
             }
             if app.wizard.active {
@@ -1497,6 +1635,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 _ => {}
                             },
                         },
+                        Screen::Alerts => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => { app.screen = Screen::Dashboard; app.focus = Focus::Fleet; }
+                            KeyCode::Char('b') => app.cycle_bg(),
+                            KeyCode::Char('c') => app.cycle_theme(),
+                            _ => {}
+                        },
                         Screen::VpnStatus => match key.code {
                             KeyCode::Esc | KeyCode::Char('q') => { app.screen = Screen::Dashboard; app.focus = Focus::Fleet; }
                             KeyCode::Char('b') => app.cycle_bg(),
@@ -1667,6 +1811,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 .output().await;
                                         });
                                     }
+                                }
+                                KeyCode::Char('w') => {
+                                    app.screen = Screen::Alerts;
                                 }
                                 KeyCode::Char('v') => {
                                     app.screen = Screen::VpnStatus;
