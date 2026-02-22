@@ -187,6 +187,22 @@ struct ProbeResult {
     context_pct: Option<f32>,
 }
 
+#[derive(Clone, Debug)]
+struct AuditEvent {
+    actor: String,
+    action: String,
+    target: String,
+    detail: String,
+}
+
+#[derive(Clone, Debug)]
+struct AuditResult {
+    ok: bool,
+    action: String,
+    target: String,
+    hash: Option<String>,
+}
+
 
 // ── UI Helpers ──────────────────────────────────────
 fn chrono_now() -> String {
@@ -397,6 +413,10 @@ struct App {
     // Operation state persistence
     interrupted_ops: Vec<db::Operation>,
     diag_task_running: bool,
+    audit_tx: mpsc::UnboundedSender<AuditEvent>,
+    audit_rx: Option<mpsc::UnboundedReceiver<AuditResult>>,
+    audit_pending: usize,
+    audit_last: String,
 }
 
 /// Returns true for npm output lines worth showing in the overlay.
@@ -476,6 +496,18 @@ impl App {
 
         let tn = ThemeName::Standard;
         let bd = BgDensity::Dark;
+        let (audit_tx, mut audit_input_rx) = mpsc::unbounded_channel::<AuditEvent>();
+        let (audit_result_tx, audit_result_rx) = mpsc::unbounded_channel::<AuditResult>();
+        let audit_pool = pool.clone();
+        tokio::spawn(async move {
+            while let Some(evt) = audit_input_rx.recv().await {
+                let result = db::append_audit_log(&audit_pool, &evt.actor, &evt.action, &evt.target, &evt.detail).await;
+                let _ = match result {
+                    Ok(hash) => audit_result_tx.send(AuditResult { ok: true, action: evt.action, target: evt.target, hash: Some(hash) }),
+                    Err(_) => audit_result_tx.send(AuditResult { ok: false, action: evt.action, target: evt.target, hash: None }),
+                };
+            }
+        });
 
         App {
             fleet_config: fleet_config.agent,
@@ -509,6 +541,7 @@ impl App {
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
             interrupted_ops, diag_task_running: false,
+            audit_tx, audit_rx: Some(audit_result_rx), audit_pending: 0, audit_last: String::new(),
         }
     }
 
@@ -534,6 +567,18 @@ impl App {
     fn toast(&mut self, msg: &str) {
         self.toast_message = Some(msg.to_string());
         self.toast_at = Some(Instant::now());
+    }
+
+    fn queue_audit_mutation(&mut self, action: &str, target: &str, detail: &str) {
+        let evt = AuditEvent {
+            actor: self.user(),
+            action: action.to_string(),
+            target: target.to_string(),
+            detail: detail.chars().take(300).collect(),
+        };
+        if self.audit_tx.send(evt).is_ok() {
+            self.audit_pending += 1;
+        }
     }
 
     fn user(&self) -> String { std::env::var("SAM_USER").unwrap_or_else(|_| "operator".into()) }
@@ -726,6 +771,11 @@ impl App {
             response: None, time: now_str(), status: "pending".into(),
             kind: if targeted { "direct".into() } else { "global".into() },
         });
+        self.queue_audit_mutation(
+            if targeted { "chat.mention_send" } else { "chat.broadcast_send" },
+            &format!("{} agent(s)", agent_names.len()),
+            "message_queued",
+        );
 
         if let Some(pool) = &self.db_pool {
             let ids = db::send_broadcast(pool, &self.user(), &message, &agent_names).await.unwrap_or_default();
@@ -860,6 +910,7 @@ impl App {
             response: None, time: now_str(), status: "pending".into(),
             kind: "direct".into(),
         });
+        self.queue_audit_mutation("chat.direct_send", &target, "message_queued");
 
         // Store in DB (fire-and-forget, get ID via channel)
         let msg_id = if let Some(pool) = &self.db_pool {
@@ -1250,6 +1301,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let is_mac = agent.os.to_lowercase().contains("mac");
         let self_ip = self.self_ip.clone();
         let pool_opt = self.db_pool.clone();
+        self.queue_audit_mutation("agent.oc_update", &name, "requested");
 
         self.diag_active = true;
         self.diag_task_running = true;
@@ -1411,6 +1463,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let location = agent.location.clone();
         let gw_port = agent.gateway_port;
         let pool_opt = self.db_pool.clone();
+        self.queue_audit_mutation(if fix { "agent.diagnostics_fix" } else { "agent.diagnostics_check" }, &name, "requested");
         self.diag_active = true;
         self.diag_task_running = true;
         self.diag_auto_fix = fix;
@@ -2183,6 +2236,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let agent = &self.agents[self.selected];
         let host = agent.host.clone();
         let user = agent.ssh_user.clone();
+        let agent_db_name = agent.db_name.clone();
 
         let cmd = format!(
             r#"python3 -c "
@@ -2198,6 +2252,11 @@ print('ok')
 
         let toast_msg = format!("{} {} {}", svc.icon, name, if new_state { "enabled" } else { "disabled" });
         self.toast(&toast_msg);
+        self.queue_audit_mutation(
+            "agent.service_toggle",
+            &format!("{}:{}", agent_db_name, name),
+            if new_state { "enabled" } else { "disabled" },
+        );
 
         tokio::spawn(async move {
             let _ = tokio::time::timeout(
@@ -2344,11 +2403,13 @@ print('ok')
         let agent = &self.agents[self.selected];
         let host = agent.host.clone();
         let user = agent.ssh_user.clone();
+        let agent_db_name = agent.db_name.clone();
         let path = if file.path.is_empty() {
             format!("~/CLAUDE/clawd/{}", file.name)
         } else {
             file.path.clone()
         };
+        let file_name = file.name.clone();
 
         let content = self.ws_edit_buffer.join("\n");
 
@@ -2362,6 +2423,7 @@ print('ok')
 
         let escaped_content = content.replace("'", "'\''");
         let cmd = format!("mkdir -p $(dirname '{}') && cat > '{}' << 'SAMEOF'\n{}\nSAMEOF", path, path, escaped_content);
+        self.queue_audit_mutation("agent.file_save", &format!("{}:{}", agent_db_name, file_name), "requested");
 
         tokio::spawn(async move {
             let _ = tokio::time::timeout(
@@ -4655,6 +4717,18 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("  ", Style::default()),
         Span::styled(&crumb, Style::default().fg(t.accent).bold()),
     ];
+    if app.audit_pending > 0 {
+        let spin = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+        left_spans.push(Span::styled(
+            format!("  {} audit {}", spin, app.audit_pending),
+            Style::default().fg(t.pending),
+        ));
+    } else if !app.audit_last.is_empty() {
+        left_spans.push(Span::styled(
+            format!("  {}", app.audit_last),
+            Style::default().fg(t.text_dim),
+        ));
+    }
 
     // Build right side
     let mut right_spans: Vec<Span> = Vec::new();
@@ -5108,7 +5182,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let host = agent.host.clone();
                                         let user = agent.ssh_user.clone();
                                         let name = agent.name.clone();
+                                        let agent_db_name = agent.db_name.clone();
                                         let is_mac = agent.os.to_lowercase().contains("mac");
+                                        app.queue_audit_mutation("agent.gateway_restart", &agent_db_name, "requested");
                                         app.toast(&format!("🔄 Restarting gateway on {}...", name));
                                         tokio::spawn(async move {
                                             let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
@@ -5474,6 +5550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 let pool = pool.clone();
                                                 let agent = app.task_filter_agent.clone();
                                                 let user = app.user();
+                                                app.queue_audit_mutation("task.create", agent.as_deref().unwrap_or("unassigned"), "queued");
                                                 tokio::spawn(async move {
                                                     let _ = db::create_task(&pool, &desc, 5, &user, agent.as_deref()).await;
                                                 });
@@ -5512,6 +5589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             let tid = task.id;
                                             if let Some(pool) = &app.db_pool {
                                                 let pool = pool.clone();
+                                                app.queue_audit_mutation("task.complete", &tid.to_string(), "requested");
                                                 tokio::spawn(async move {
                                                     let _ = db::update_task_status(&pool, tid, "completed").await;
                                                 });
@@ -5970,6 +6048,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.wizard.testing_ssh = false;
                 app.wizard.ssh_result = Some(result);
                 app.wizard_ssh_rx = None;
+            }
+        }
+
+        if let Some(ref mut rx) = app.audit_rx {
+            while let Ok(result) = rx.try_recv() {
+                app.audit_pending = app.audit_pending.saturating_sub(1);
+                app.audit_last = if result.ok {
+                    let short = result.hash.unwrap_or_default().chars().take(10).collect::<String>();
+                    format!("🧾 {} {} #{}", result.action, result.target, short)
+                } else {
+                    format!("🧾 {} {} (write failed)", result.action, result.target)
+                };
             }
         }
 

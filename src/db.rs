@@ -100,6 +100,21 @@ pub async fn run_migrations(pool: &Pool) -> Result<(), mysql_async::Error> {
         )",
         (),
     ).await;
+    let _ = conn.exec_drop(
+        r"CREATE TABLE IF NOT EXISTS mc_audit_log (
+            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            actor VARCHAR(128) NOT NULL,
+            action VARCHAR(64) NOT NULL,
+            target VARCHAR(255) NOT NULL,
+            detail TEXT NOT NULL,
+            prev_hash CHAR(64) NOT NULL,
+            entry_hash CHAR(64) NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT NOW(),
+            INDEX idx_audit_created (created_at),
+            INDEX idx_audit_action (action)
+        )",
+        (),
+    ).await;
     Ok(())
 }
 
@@ -446,6 +461,20 @@ mod tests {
         assert!(static_query.contains("status='interrupted'"));
         assert!(static_query.contains("LIMIT 20"));
     }
+
+    #[test]
+    fn audit_payload_changes_when_content_changes() {
+        let base = compute_audit_payload("", "sam", "task.create", "agent-1", "priority=5");
+        let changed = compute_audit_payload("", "sam", "task.create", "agent-1", "priority=1");
+        assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn audit_payload_depends_on_prev_hash() {
+        let p1 = compute_audit_payload("abc", "sam", "chat.send", "all", "broadcast");
+        let p2 = compute_audit_payload("def", "sam", "chat.send", "all", "broadcast");
+        assert_ne!(p1, p2);
+    }
 }
 
 // ---- Task Board ----
@@ -650,6 +679,36 @@ pub async fn complete_operation(pool: &Pool, id: i64, status: &str, output: Opti
         (status, output, id),
     ).await?;
     Ok(())
+}
+
+fn compute_audit_payload(prev_hash: &str, actor: &str, action: &str, target: &str, detail: &str) -> String {
+    format!("{}|{}|{}|{}|{}", prev_hash, actor, action, target, detail)
+}
+
+/// Append an immutable audit row with hash chaining for tamper-evidence.
+/// Returns the inserted row hash.
+pub async fn append_audit_log(
+    pool: &Pool,
+    actor: &str,
+    action: &str,
+    target: &str,
+    detail: &str,
+) -> Result<String, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let prev_hash = conn
+        .query_first::<String, _>("SELECT entry_hash FROM mc_audit_log ORDER BY id DESC LIMIT 1")
+        .await?
+        .unwrap_or_default();
+    let payload = compute_audit_payload(&prev_hash, actor, action, target, detail);
+    let entry_hash = conn
+        .exec_first::<String, _, _>("SELECT LOWER(SHA2(?, 256))", (payload,))
+        .await?
+        .unwrap_or_default();
+    conn.exec_drop(
+        "INSERT INTO mc_audit_log (actor, action, target, detail, prev_hash, entry_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())",
+        (actor, action, target, detail, prev_hash, entry_hash.clone()),
+    ).await?;
+    Ok(entry_hash)
 }
 
 /// Mark all `running` operations that started more than 5 minutes ago as `interrupted`.
