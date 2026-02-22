@@ -308,3 +308,123 @@ pub async fn update_task_status(pool: &Pool, task_id: i32, status: &str) -> Resu
     conn.exec_drop(sql, (status, task_id)).await?;
     Ok(())
 }
+
+// ── Cron Jobs ──────────────────────────────────────
+#[derive(Debug, Clone)]
+pub struct AgentCron {
+    pub agent_name: String,
+    pub cron_id: String,
+    pub name: String,
+    pub schedule_kind: String,
+    pub schedule_value: String,
+    pub enabled: bool,
+    pub session_target: String,
+    pub description: String,
+}
+
+pub async fn load_agent_crons(pool: &mysql_async::Pool, agent: &str) -> Result<Vec<AgentCron>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    let rows: Vec<mysql_async::Row> = conn.exec(
+        "SELECT agent_name, cron_id, name, schedule_kind, schedule_value, enabled, session_target, description FROM mc_agent_crons WHERE agent_name = ? ORDER BY enabled DESC, name",
+        (agent,)
+    ).await?;
+    Ok(rows.into_iter().map(|r| AgentCron {
+        agent_name: r.get::<Option<String>, _>(0).flatten().unwrap_or_default(),
+        cron_id: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
+        name: r.get::<Option<String>, _>(2).flatten().unwrap_or_default(),
+        schedule_kind: r.get::<Option<String>, _>(3).flatten().unwrap_or_default(),
+        schedule_value: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
+        enabled: r.get::<Option<i32>, _>(5).flatten().unwrap_or(0) != 0,
+        session_target: r.get::<Option<String>, _>(6).flatten().unwrap_or_default(),
+        description: r.get::<Option<String>, _>(7).flatten().unwrap_or_default(),
+    }).collect())
+}
+
+pub async fn upsert_agent_cron(pool: &mysql_async::Pool, c: &AgentCron) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    conn.exec_drop(
+        "INSERT INTO mc_agent_crons (agent_name, cron_id, name, schedule_kind, schedule_value, enabled, session_target, description, last_collected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE name=VALUES(name), schedule_kind=VALUES(schedule_kind), schedule_value=VALUES(schedule_value), enabled=VALUES(enabled), session_target=VALUES(session_target), description=VALUES(description), last_collected_at=NOW()",
+        (&c.agent_name, &c.cron_id, &c.name, &c.schedule_kind, &c.schedule_value, c.enabled as i32, &c.session_target, &c.description)
+    ).await?;
+    Ok(())
+}
+
+// ── Context Snapshots ──────────────────────────────
+#[derive(Debug, Clone)]
+pub struct AgentContext {
+    pub agent_name: String,
+    pub session_count: i32,
+    pub context_tokens_used: i32,
+    pub context_tokens_max: i32,
+    pub context_pct: f32,
+}
+
+pub async fn save_agent_context(pool: &mysql_async::Pool, ctx: &AgentContext) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    conn.exec_drop(
+        "INSERT INTO mc_agent_context (agent_name, session_count, context_tokens_used, context_tokens_max, context_pct) VALUES (?, ?, ?, ?, ?)",
+        (&ctx.agent_name, ctx.session_count, ctx.context_tokens_used, ctx.context_tokens_max, ctx.context_pct)
+    ).await?;
+    Ok(())
+}
+
+pub async fn load_latest_context(pool: &mysql_async::Pool, agent: &str) -> Result<Option<AgentContext>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    let rows: Vec<mysql_async::Row> = conn.exec(
+        "SELECT agent_name, session_count, context_tokens_used, context_tokens_max, context_pct FROM mc_agent_context WHERE agent_name = ? ORDER BY collected_at DESC LIMIT 1",
+        (agent,)
+    ).await?;
+    Ok(rows.into_iter().next().map(|r| AgentContext {
+        agent_name: r.get::<Option<String>, _>(0).flatten().unwrap_or_default(),
+        session_count: r.get::<Option<i32>, _>(1).flatten().unwrap_or(0),
+        context_tokens_used: r.get::<Option<i32>, _>(2).flatten().unwrap_or(0),
+        context_tokens_max: r.get::<Option<i32>, _>(3).flatten().unwrap_or(1000000),
+        context_pct: r.get::<Option<f32>, _>(4).flatten().unwrap_or(0.0),
+    }))
+}
+
+// ── Spawned Agents ─────────────────────────────────
+#[derive(Debug, Clone)]
+pub struct SpawnedAgent {
+    pub id: i64,
+    pub agent_name: String,
+    pub agent_id: String,
+    pub session_key: Option<String>,
+    pub prompt: String,
+    pub status: String,
+    pub response: Option<String>,
+    pub created_at: String,
+}
+
+pub async fn spawn_agent(pool: &mysql_async::Pool, agent: &str, agent_id: &str, prompt: &str) -> Result<i64, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    conn.exec_drop(
+        "INSERT INTO mc_spawned_agents (agent_name, agent_id, prompt, status) VALUES (?, ?, ?, 'queued')",
+        (agent, agent_id, prompt)
+    ).await?;
+    Ok(conn.last_insert_id().unwrap_or(0) as i64)
+}
+
+pub async fn load_spawned_agents(pool: &mysql_async::Pool) -> Result<Vec<SpawnedAgent>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    let rows: Vec<mysql_async::Row> = conn.exec(
+        "SELECT id, agent_name, agent_id, session_key, prompt, status, response, created_at FROM mc_spawned_agents ORDER BY created_at DESC LIMIT 50",
+        ()
+    ).await?;
+    Ok(rows.into_iter().map(|r| SpawnedAgent {
+        id: r.get::<Option<i64>, _>(0).flatten().unwrap_or(0),
+        agent_name: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
+        agent_id: r.get::<Option<String>, _>(2).flatten().unwrap_or("main".into()),
+        session_key: r.get::<Option<String>, _>(3).flatten(),
+        prompt: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
+        status: r.get::<Option<String>, _>(5).flatten().unwrap_or("unknown".into()),
+        response: r.get::<Option<String>, _>(6).flatten(),
+        created_at: r.get::<Option<String>, _>(7).flatten().unwrap_or_default(),
+    }).collect())
+}

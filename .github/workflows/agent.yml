@@ -1,0 +1,24 @@
+name: SAM Agent
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+jobs:
+  dispatch:
+    if: |
+      (github.event.label.name == 'agent' && github.event.action == 'labeled') ||
+      (github.event.comment.body == '/agent' && github.event.issue.state == 'open')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run cargo check
+        run: cargo check
+      - name: Issue context
+        run: |
+          echo "Issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
+          echo "---"
+          echo "${{ github.event.issue.body }}"
