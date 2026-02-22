@@ -379,7 +379,7 @@ impl App {
                         oc_version: da.oc_version.unwrap_or_default(),
                         last_seen: String::new(),
                         current_task: None,
-                        ssh_user: cfg.map(|c| c.ssh_user().to_string()).unwrap_or_else(|| "root".into()),
+                        ssh_user: da.ssh_user.or_else(|| cfg.map(|c| c.ssh_user().to_string())).unwrap_or_else(|| "root".into()),
                         capabilities: caps,
                         token_burn: da.token_burn_today,
                         latency_ms: None,
@@ -1160,75 +1160,130 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let cur = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw --version 2>/dev/null || echo '(not installed)'", pfx)).await;
             let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Pass, detail: cur.trim().to_string() });
 
-            // Step 2: stream npm install (stdout + stderr merged via 2>&1)
-            let _ = tx.send(DiagStep { label: "Installing openclaw@latest".into(), status: DiagStatus::Running, detail: "running npm install...".into() });
-            // 2>&1 merges stderr so we capture error messages too
-            let install_cmd = format!("{}sudo npm install -g openclaw@latest 2>&1; echo EXITCODE:$?:DONE", pfx);
-            use tokio::io::AsyncBufReadExt;
-            let mut child = if host == "localhost" || host == self_ip {
-                tokio::process::Command::new("bash").args(["-c", &install_cmd])
-                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()
+            // Step 2: try install strategies in sequence until one succeeds
+            // Strategy names for display
+            let strategy_names: &[&str] = if is_mac {
+                &["sudo npm install -g", "npm install -g (no sudo)", "~/.npm-global/bin/npm install -g", "brew upgrade openclaw"]
             } else {
-                tokio::process::Command::new("ssh").args([
-                    "-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
-                    &format!("{}@{}", user, host), &install_cmd])
-                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()
+                &["sudo npm install -g", "npm install -g (no sudo)", "~/.npm-global/bin/npm install -g"]
             };
+            // Build install commands (all capture stdout+stderr, emit exit code marker)
+            let strategies: Vec<String> = {
+                let mut v = vec![
+                    format!("{}sudo npm install -g openclaw@latest 2>&1; echo EXITCODE:$?:DONE", pfx),
+                    format!("{}npm install -g openclaw@latest 2>&1; echo EXITCODE:$?:DONE", pfx),
+                    "~/.npm-global/bin/npm install -g openclaw@latest 2>&1; echo EXITCODE:$?:DONE".to_string(),
+                ];
+                if is_mac {
+                    v.push(format!("{}brew upgrade openclaw 2>&1 || {}brew install openclaw 2>&1; echo EXITCODE:$?:DONE", pfx, pfx));
+                }
+                v
+            };
+            use tokio::io::AsyncBufReadExt;
             let mut install_ok = false;
             let mut last_line = String::new();
-            let mut error_lines: Vec<String> = Vec::new();
-            if let Ok(ref mut child) = child {
-                if let Some(stdout) = child.stdout.take() {
-                    let mut reader = tokio::io::BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        let clean = line.trim().to_string();
-                        if clean.is_empty() { continue; }
-                        // Parse exit code marker
-                        if clean.starts_with("EXITCODE:") {
-                            let code = clean.trim_start_matches("EXITCODE:").trim_end_matches(":DONE");
-                            install_ok = code == "0";
-                            continue;
+            'strategies: for (i, install_cmd) in strategies.iter().enumerate() {
+                let strategy_name = strategy_names.get(i).copied().unwrap_or("unknown");
+                let _ = tx.send(DiagStep {
+                    label: format!("Install attempt {}/{}", i + 1, strategies.len()),
+                    status: DiagStatus::Running,
+                    detail: format!("trying: {}", strategy_name),
+                });
+                let mut child = if host == "localhost" || host == self_ip {
+                    tokio::process::Command::new("bash").args(["-c", install_cmd])
+                        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()
+                } else {
+                    tokio::process::Command::new("ssh").args([
+                        "-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), install_cmd])
+                        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()
+                };
+                let mut attempt_ok = false;
+                last_line = String::new();
+                let mut error_lines: Vec<String> = Vec::new();
+                if let Ok(ref mut child) = child {
+                    if let Some(stdout) = child.stdout.take() {
+                        let mut reader = tokio::io::BufReader::new(stdout).lines();
+                        while let Ok(Some(line)) = reader.next_line().await {
+                            let clean = line.trim().to_string();
+                            if clean.is_empty() { continue; }
+                            if clean.starts_with("EXITCODE:") {
+                                let code = clean.trim_start_matches("EXITCODE:").trim_end_matches(":DONE");
+                                attempt_ok = code == "0";
+                                continue;
+                            }
+                            last_line = clean.clone();
+                            if clean.to_lowercase().contains("err") || clean.starts_with("npm ERR") {
+                                error_lines.push(clean.chars().take(80).collect());
+                            }
+                            let _ = tx.send(DiagStep {
+                                label: format!("  {} (try {})", strategy_name, i + 1),
+                                status: DiagStatus::Running,
+                                detail: clean.chars().take(70).collect(),
+                            });
                         }
-                        last_line = clean.clone();
-                        // Track error lines for failure reporting
-                        if clean.to_lowercase().contains("err") || clean.starts_with("npm ERR") {
-                            error_lines.push(clean.chars().take(80).collect());
-                        }
-                        let _ = tx.send(DiagStep { label: "  npm".into(), status: DiagStatus::Running, detail: clean.chars().take(70).collect() });
+                    }
+                    if let Ok(status) = child.wait().await {
+                        if !attempt_ok { attempt_ok = status.success(); }
                     }
                 }
-                // If we didn't parse exit code, use process exit status
-                if let Ok(status) = child.wait().await {
-                    if !install_ok { install_ok = status.success(); }
+                if attempt_ok {
+                    install_ok = true;
+                    let _ = tx.send(DiagStep {
+                        label: format!("Install attempt {}/{}", i + 1, strategies.len()),
+                        status: DiagStatus::Fixed,
+                        detail: format!("✓ via {}: {}", strategy_name, last_line.chars().take(50).collect::<String>()),
+                    });
+                    break 'strategies;
+                } else {
+                    let fail_detail = error_lines.last().cloned().unwrap_or_else(|| {
+                        if last_line.is_empty() { "no output — trying next method".into() }
+                        else { last_line.chars().take(60).collect() }
+                    });
+                    let _ = tx.send(DiagStep {
+                        label: format!("Install attempt {}/{}", i + 1, strategies.len()),
+                        status: DiagStatus::Fail,
+                        detail: fail_detail,
+                    });
                 }
             }
-            // Remove stale "running" npm step — replace with outcome
-            let fail_detail = if !error_lines.is_empty() {
-                error_lines.last().cloned().unwrap_or("install failed".into())
-            } else if !last_line.is_empty() {
-                last_line.chars().take(60).collect()
-            } else {
-                "no output — check npm/sudo permissions".into()
-            };
+            if !install_ok {
+                let _ = tx.send(DiagStep {
+                    label: "Installing openclaw@latest".into(),
+                    status: DiagStatus::Fail,
+                    detail: "all install strategies failed — check npm/sudo/brew".into(),
+                });
+            }
+
+            // Step 3: verify openclaw is in PATH
+            let _ = tx.send(DiagStep { label: "Verifying PATH".into(), status: DiagStatus::Running, detail: String::new() });
+            let path_check = App::ssh_run(&host, &user, &self_ip, &format!("{}which openclaw 2>/dev/null || echo NOT_FOUND", pfx)).await;
+            let path_check = path_check.trim().to_string();
+            let path_ok = !path_check.is_empty() && path_check != "NOT_FOUND";
             let _ = tx.send(DiagStep {
-                label: "Installing openclaw@latest".into(),
-                status: if install_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
-                detail: if install_ok {
-                    last_line.chars().take(60).collect()
-                } else {
-                    fail_detail
-                },
+                label: "Verifying PATH".into(),
+                status: if path_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: path_check,
             });
 
-            // Step 3: new version
+            // Step 4: new version
             let _ = tx.send(DiagStep { label: "New version".into(), status: DiagStatus::Running, detail: String::new() });
             let new_v = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw --version 2>/dev/null || echo '?'", pfx)).await;
             let _ = tx.send(DiagStep { label: "New version".into(), status: DiagStatus::Pass, detail: new_v.trim().to_string() });
 
-            // Step 4: restart gateway
+            // Step 5: restart gateway
+            // macOS LaunchAgent needs a GUI session — show instructions instead of attempting SSH restart
             let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Running, detail: String::new() });
-            let restart_msg = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)).await;
-            let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Fixed, detail: restart_msg.trim().to_string() });
+            if is_mac {
+                let _ = tx.send(DiagStep {
+                    label: "Restarting gateway".into(),
+                    status: DiagStatus::Pass,
+                    detail: "macOS: run in Terminal → openclaw gateway restart".into(),
+                });
+            } else {
+                let restart_msg = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)).await;
+                let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Fixed, detail: restart_msg.trim().to_string() });
+            }
 
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
         });

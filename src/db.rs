@@ -72,13 +72,14 @@ pub struct DbAgent {
     pub current_task_id: Option<i32>,
     pub gateway_port: i32,
     pub gateway_token: Option<String>,
+    pub ssh_user: Option<String>,
 }
 
 /// Load all agents from `mc_fleet_status`, ordered by name.
 pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let rows: Vec<mysql_async::Row> = conn.query(
-        "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token FROM mc_fleet_status ORDER BY agent_name",
+        "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token, ssh_user FROM mc_fleet_status ORDER BY agent_name",
     ).await?;
     let agents = rows.into_iter().map(|r| {
         DbAgent {
@@ -95,6 +96,7 @@ pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error>
             current_task_id: r.get::<Option<i32>, _>(10).flatten(),
             gateway_port: r.get::<Option<i32>, _>(11).flatten().unwrap_or(18789),
             gateway_token: r.get::<Option<String>, _>(12).flatten(),
+            ssh_user: r.get::<Option<String>, _>(13).flatten(),
         }
     }).collect();
     Ok(agents)
