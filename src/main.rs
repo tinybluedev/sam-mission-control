@@ -579,7 +579,7 @@ impl App {
                                 let response = match tokio::time::timeout(
                                     std::time::Duration::from_secs(60),
                                     tokio::process::Command::new("ssh")
-                                        .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                                        .args(["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                                             &format!("{}@{}", bcast_user, bcast_host), &ssh_cmd])
                                         .output()
                                 ).await {
