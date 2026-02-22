@@ -397,6 +397,17 @@ struct App {
     // Operation state persistence
     interrupted_ops: Vec<db::Operation>,
     diag_task_running: bool,
+    // Scheduled operations
+    schedule_active: bool,
+    schedule_ops: Vec<db::ScheduledOp>,
+    schedule_selected: usize,
+    schedule_time_input: String,
+    schedule_target_input: String,
+    schedule_edit_target: bool,
+    schedule_kind_idx: usize,
+    schedule_last_check: Instant,
+    schedule_rx: Option<mpsc::UnboundedReceiver<ScheduleMsg>>,
+    schedule_running: bool,
 }
 
 /// Returns true for npm output lines worth showing in the overlay.
@@ -509,6 +520,16 @@ impl App {
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
             interrupted_ops, diag_task_running: false,
+            schedule_active: false,
+            schedule_ops: vec![],
+            schedule_selected: 0,
+            schedule_time_input: SCHEDULE_DEFAULT_TIME.into(),
+            schedule_target_input: SCHEDULE_DEFAULT_TARGET.into(),
+            schedule_edit_target: false,
+            schedule_kind_idx: 0,
+            schedule_last_check: Instant::now(),
+            schedule_rx: None,
+            schedule_running: false,
         }
     }
 
@@ -534,6 +555,78 @@ impl App {
     fn toast(&mut self, msg: &str) {
         self.toast_message = Some(msg.to_string());
         self.toast_at = Some(Instant::now());
+    }
+
+    fn schedule_kind(&self) -> &'static str {
+        SCHEDULE_OPS[self.schedule_kind_idx % SCHEDULE_OPS.len()].0
+    }
+
+    fn start_schedule_refresh(&mut self) {
+        if self.schedule_running {
+            return;
+        }
+        if let Some(pool) = self.db_pool.clone() {
+            self.schedule_running = true;
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.schedule_rx = Some(rx);
+            tokio::spawn(async move {
+                let ops = db::load_pending_scheduled_ops(&pool).await.unwrap_or_default();
+                let _ = tx.send(ScheduleMsg::Queue(ops));
+            });
+        }
+    }
+
+    fn start_schedule_submit(&mut self) {
+        if self.schedule_running {
+            return;
+        }
+        let time_input = self.schedule_time_input.trim().to_string();
+        let target = self.schedule_target_input.trim().to_string();
+        if time_input.is_empty() || target.is_empty() {
+            self.toast("⚠️ Schedule requires time and target");
+            return;
+        }
+        let op_type = self.schedule_kind().to_string();
+        if let Some(pool) = self.db_pool.clone() {
+            self.schedule_running = true;
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.schedule_rx = Some(rx);
+            tokio::spawn(async move {
+                let result = if let Some(minutes) = parse_relative_schedule_minutes(&time_input) {
+                    db::create_scheduled_op_relative_minutes(&pool, minutes, &op_type, &target, "{}").await
+                } else {
+                    db::create_scheduled_op_absolute(&pool, &time_input, &op_type, &target, "{}").await
+                };
+                let notice = match result {
+                    Ok(_) => "✅ Scheduled operation queued".to_string(),
+                    Err(e) => format!("⚠️ Failed to queue operation: {}", e),
+                };
+                let _ = tx.send(ScheduleMsg::Notice(notice));
+                let ops = db::load_pending_scheduled_ops(&pool).await.unwrap_or_default();
+                let _ = tx.send(ScheduleMsg::Queue(ops));
+            });
+        }
+    }
+
+    fn start_schedule_cancel_selected(&mut self) {
+        if self.schedule_running {
+            return;
+        }
+        let Some(op) = self.schedule_ops.get(self.schedule_selected).cloned() else { return; };
+        if let Some(pool) = self.db_pool.clone() {
+            self.schedule_running = true;
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.schedule_rx = Some(rx);
+            tokio::spawn(async move {
+                let notice = match db::cancel_scheduled_op(&pool, op.id).await {
+                    Ok(_) => format!("✋ Cancelled scheduled op #{}", op.id),
+                    Err(e) => format!("⚠️ Failed to cancel op #{}: {}", op.id, e),
+                };
+                let _ = tx.send(ScheduleMsg::Notice(notice));
+                let ops = db::load_pending_scheduled_ops(&pool).await.unwrap_or_default();
+                let _ = tx.send(ScheduleMsg::Queue(ops));
+            });
+        }
     }
 
     fn user(&self) -> String { std::env::var("SAM_USER").unwrap_or_else(|_| "operator".into()) }
@@ -2697,6 +2790,23 @@ struct ChatPollResult {
     new_routed_ids: Vec<i64>,
 }
 
+enum ScheduleMsg {
+    /// Replace the currently displayed pending queue.
+    Queue(Vec<db::ScheduledOp>),
+    /// User-facing toast/notification message.
+    Notice(String),
+}
+
+const SCHEDULE_OPS: [(&str, &str); 4] = [
+    ("update_agent", "Update Agent"),
+    ("bulk_update_group", "Bulk Update Group"),
+    ("restart_gateway", "Restart Gateway"),
+    ("config_push", "Config Push"),
+];
+const SCHEDULE_DEFAULT_TIME: &str = "+30m";
+const SCHEDULE_DEFAULT_TARGET: &str = "all";
+const SCHEDULE_CHECK_INTERVAL_SECS: u64 = 60;
+
 /// Minimum content width (chars) for message word-wrap, preventing extremely narrow wrapping.
 const MIN_WRAP_WIDTH: usize = 10;
 /// Approximate lines rendered per chat message (header + body + blank), used to estimate
@@ -2710,6 +2820,100 @@ const INPUT_POLL_MS: u64 = 10;
 
 fn fmt_hhmm(t: &str) -> String {
     t.chars().take(5).collect()
+}
+
+/// Parse relative schedule strings (`+30m`, `+2h`) into minute offsets.
+/// Returns `None` when the input does not match supported relative syntax.
+fn parse_relative_schedule_minutes(input: &str) -> Option<i64> {
+    let s = input.trim();
+    if !s.starts_with('+') || s.len() < 3 {
+        return None;
+    }
+    let unit = s.chars().last()?;
+    if !matches!(unit, 'm' | 'M' | 'h' | 'H') {
+        return None;
+    }
+    let value = s[1..s.len().saturating_sub(1)].parse::<i64>().ok()?;
+    match unit {
+        'm' | 'M' => Some(value.max(0)),
+        'h' | 'H' => Some(value.max(0).saturating_mul(60)),
+        _ => None,
+    }
+}
+
+/// Resolve a scheduled-op target to concrete agents.
+/// Supports `all`, `agent:<name>`, `group:<name>`, bare group names, and bare agent names.
+fn resolve_schedule_targets(op: &db::ScheduledOp, agents: &[Agent], fleet_cfg: &[config::AgentConfig]) -> Vec<Agent> {
+    let raw = op.target.trim();
+    if raw.eq_ignore_ascii_case("all") {
+        return agents.to_vec();
+    }
+    let (kind, value) = if let Some((k, v)) = raw.split_once(':') { (k.trim(), v.trim()) } else { ("", raw) };
+    let known_groups: HashSet<String> = fleet_cfg.iter()
+        .map(|a| a.location().to_ascii_lowercase())
+        .collect();
+    let lower_value = value.to_ascii_lowercase();
+    if kind.eq_ignore_ascii_case("agent") || (!value.is_empty() && !known_groups.contains(&lower_value)) {
+        return agents.iter().filter(|a| a.db_name.eq_ignore_ascii_case(value)).cloned().collect();
+    }
+    let group = if kind.eq_ignore_ascii_case("group") { value } else { raw };
+    let names: HashSet<String> = fleet_cfg.iter()
+        .filter(|a| a.location().eq_ignore_ascii_case(group))
+        .map(|a| a.name.clone())
+        .collect();
+    agents.iter().filter(|a| names.contains(&a.db_name)).cloned().collect()
+}
+
+/// Execute one scheduled operation against all resolved targets.
+/// Runs locally when target host is localhost/self IP, otherwise uses SSH.
+/// Returns `true` only when all target executions succeed.
+async fn run_scheduled_op(op: db::ScheduledOp, agents: &[Agent], fleet_cfg: &[config::AgentConfig], self_ip: &str) -> bool {
+    let targets = resolve_schedule_targets(&op, agents, fleet_cfg);
+    if targets.is_empty() {
+        return false;
+    }
+    let mut ok = true;
+    for agent in targets {
+        let remote = format!("{}@{}", agent.ssh_user, agent.host);
+        let command = match op.op_type.as_str() {
+            "update_agent" | "bulk_update_group" => "sudo npm install -g openclaw@latest 2>&1 | tail -3 && openclaw gateway restart 2>&1 | tail -1",
+            "restart_gateway" => "openclaw gateway restart 2>&1 | tail -1",
+            "config_push" => "test -f ~/.openclaw/openclaw.json && openclaw gateway restart 2>&1 | tail -1 || echo 'no config found'",
+            _ => "echo 'unknown scheduled op'",
+        };
+        let success = if agent.host == "localhost" || agent.host == self_ip {
+            Command::new("bash").args(["-c", command]).output().await.map(|o| o.status.success()).unwrap_or(false)
+        } else {
+            Command::new("ssh")
+                .args(["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes", &remote, command])
+                .output().await.map(|o| o.status.success()).unwrap_or(false)
+        };
+        if !success {
+            eprintln!("scheduled op failed on target {}", agent.db_name);
+            ok = false;
+        }
+    }
+    ok
+}
+
+/// Fetch due operations, mark them running, execute, then mark completed/failed.
+/// Returns user-facing notification lines for the UI/daemon output.
+async fn process_due_scheduled_ops(pool: &mysql_async::Pool, agents: &[Agent], fleet_cfg: &[config::AgentConfig], self_ip: &str) -> Vec<String> {
+    let mut notices = Vec::new();
+    let due = db::load_due_scheduled_ops(pool).await.unwrap_or_default();
+    for op in due {
+        let _ = db::update_scheduled_op_status(pool, op.id, "running").await;
+        let success = run_scheduled_op(op.clone(), agents, fleet_cfg, self_ip).await;
+        let final_status = if success { "completed" } else { "failed" };
+        let _ = db::update_scheduled_op_status(pool, op.id, final_status).await;
+        notices.push(format!(
+            "{} {} [{}]",
+            if success { "✅ Scheduled op complete:" } else { "❌ Scheduled op failed:" },
+            op.op_type,
+            op.target
+        ));
+    }
+    notices
 }
 
 fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme, area_width: u16, spinner_frame: usize) -> Vec<Line<'static>> {
@@ -4385,6 +4589,61 @@ fn render_task_board(frame: &mut Frame, app: &App) {
     frame.render_widget(footer, outer[3]);
 }
 
+fn render_schedule_queue(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = frame.area();
+    let w = ((area.width as f32 * 0.72) as u16).max(70).min(area.width.saturating_sub(4));
+    let h = ((area.height as f32 * 0.7) as u16).max(14).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+
+    let mut lines = vec![
+        Line::from(Span::styled("  Pending queue", Style::default().fg(t.text_bold).bold())),
+        Line::from(""),
+    ];
+    if app.schedule_ops.is_empty() {
+        lines.push(Line::from(Span::styled("  (none)", Style::default().fg(t.text_dim))));
+    } else {
+        for (i, op) in app.schedule_ops.iter().enumerate() {
+            let selected = i == app.schedule_selected;
+            let style = if selected { Style::default().bg(t.accent).fg(t.text).bold() } else { Style::default().fg(t.text) };
+            lines.push(Line::from(Span::styled(
+                format!("  {} #{:<4} {}  {:<18} {}", if selected { "▶" } else { " " }, op.id, op.scheduled_at, op.op_type, op.target),
+                style,
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  New: [{}]  {}={}  {}={}",
+            SCHEDULE_OPS[app.schedule_kind_idx % SCHEDULE_OPS.len()].1,
+            if app.schedule_edit_target { "time" } else { ">time<" },
+            app.schedule_time_input,
+            if app.schedule_edit_target { ">target<" } else { "target" },
+            app.schedule_target_input
+        ),
+        Style::default().fg(t.accent2),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ select  Enter queue  x cancel  t type  Tab edit target  r refresh  Esc close",
+        Style::default().fg(t.text_dim),
+    )));
+
+    let block = Paragraph::new(lines).block(
+        Block::default()
+            .title(Span::styled(" ⏱ Schedule Queue ", Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(t.accent))
+            .style(Style::default().bg(app.bg_density.bg()))
+            .padding(Padding::new(1, 1, 1, 0)),
+    );
+    frame.render_widget(block, popup);
+}
+
 
 fn render_alerts(frame: &mut Frame, app: &App) {
     let t = &app.theme;
@@ -4627,7 +4886,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Dashboard => match app.focus {
             Focus::Chat => vec![("Tab","fleet"),("⏎","send"),("@","target"),("Esc","back")],
             Focus::Command => vec![("⏎","run"),("Esc","cancel")],
-            _ => vec![("⏎","open"),("d","check"),("D","fix"),("U","update"),("u","update all"),("g","group"),("t","tasks"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
+            _ => vec![("⏎","open"),("d","check"),("D","fix"),("U","update"),("u","update all"),("g","group"),("Q","schedule"),("t","tasks"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
         },
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
@@ -4729,6 +4988,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cli::Commands::Log { agent, tail }) => {
             return cli::run_log(agent.as_deref(), tail).await.map_err(|e| e.into());
         }
+        Some(cli::Commands::Daemon) => {
+            let fleet_config = config::load_fleet_config().map_err(|e| format!("Error: {}", e))?;
+            let pool = db::get_pool();
+            let _ = db::run_migrations(&pool).await;
+            let self_ip = std::env::var("SAM_SELF_IP").unwrap_or_else(|_| "localhost".into());
+            loop {
+                let db_agents = db::load_fleet(&pool).await.unwrap_or_default();
+                let agents: Vec<Agent> = db_agents.into_iter().map(|da| {
+                    let cfg = fleet_config.agent.iter().find(|c| c.name == da.agent_name);
+                    Agent {
+                        name: cfg.map(|c| c.display_name().to_string()).unwrap_or_else(|| da.agent_name.clone()),
+                        db_name: da.agent_name.clone(),
+                        emoji: cfg.map(|c| c.emoji().to_string()).unwrap_or_else(|| "🤖".to_string()),
+                        host: da.tailscale_ip.unwrap_or_else(|| "localhost".into()),
+                        location: cfg.map(|c| c.location().to_string()).unwrap_or_else(|| "Unknown".into()),
+                        status: AgentStatus::from_str(&da.status),
+                        os: da.os_info.unwrap_or_default(),
+                        kernel: da.kernel.unwrap_or_default(),
+                        oc_version: da.oc_version.unwrap_or_default(),
+                        last_seen: String::new(),
+                        current_task: None,
+                        ssh_user: cfg.map(|c| c.ssh_user().to_string()).unwrap_or_else(|| "root".into()),
+                        capabilities: vec![],
+                        token_burn: da.token_burn_today,
+                        latency_ms: None,
+                        cpu_pct: None,
+                        ram_pct: None,
+                        disk_pct: None,
+                        gateway_port: da.gateway_port,
+                        gateway_token: da.gateway_token.clone(),
+                        uptime_seconds: da.uptime_seconds,
+                        activity: String::new(),
+                        context_pct: None,
+                        last_probe_at: None,
+                    }
+                }).collect();
+                for notice in process_due_scheduled_ops(&pool, &agents, &fleet_config.agent, &self_ip).await {
+                    println!("{} {}", now_str(), notice);
+                }
+                tokio::time::sleep(Duration::from_secs(SCHEDULE_CHECK_INTERVAL_SECS)).await;
+            }
+        }
         Some(cli::Commands::Version) => {
             println!("sam v{}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -4808,6 +5109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 render_fleet_diagnostics(f, &app);
             } else if app.diag_active {
                 render_diagnostics(f, &app);
+            }
+            if app.schedule_active {
+                render_schedule_queue(f, &app);
             }
 
             // Config viewer overlay
@@ -5036,6 +5340,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(idx) = agent_idx {
                                     app.selected = idx;
                                     app.start_diagnostics(fix);
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else
+                    if app.schedule_active {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => app.schedule_active = false,
+                            KeyCode::Up => app.schedule_selected = app.schedule_selected.saturating_sub(1),
+                            KeyCode::Down => {
+                                if app.schedule_selected < app.schedule_ops.len().saturating_sub(1) {
+                                    app.schedule_selected += 1;
+                                }
+                            }
+                            KeyCode::Char('r') => app.start_schedule_refresh(),
+                            KeyCode::Char('x') | KeyCode::Char('c') => app.start_schedule_cancel_selected(),
+                            KeyCode::Char('t') => app.schedule_kind_idx = (app.schedule_kind_idx + 1) % SCHEDULE_OPS.len(),
+                            KeyCode::Tab => app.schedule_edit_target = !app.schedule_edit_target,
+                            KeyCode::Backspace => {
+                                if app.schedule_edit_target {
+                                    app.schedule_target_input.pop();
+                                } else {
+                                    app.schedule_time_input.pop();
+                                }
+                            }
+                            KeyCode::Enter => app.start_schedule_submit(),
+                            KeyCode::Char(ch) => {
+                                if app.schedule_edit_target {
+                                    app.schedule_target_input.push(ch);
+                                } else {
+                                    app.schedule_time_input.push(ch);
                                 }
                             }
                             _ => {}
@@ -5572,6 +5907,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.filter_text.clear();
                                 }
                                 KeyCode::Char('?') => app.screen = Screen::Help,
+                                KeyCode::Char('Q') => {
+                                    app.schedule_active = true;
+                                    app.schedule_time_input = SCHEDULE_DEFAULT_TIME.into();
+                                    app.schedule_target_input = SCHEDULE_DEFAULT_TARGET.into();
+                                    app.schedule_edit_target = false;
+                                    app.start_schedule_refresh();
+                                }
                                 KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('c') => app.cycle_theme(),
@@ -5919,6 +6261,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.last_task_poll = Instant::now();
         }
 
+        // Execute due scheduled operations every minute (non-blocking)
+        if !app.schedule_running && app.schedule_last_check.elapsed() > Duration::from_secs(SCHEDULE_CHECK_INTERVAL_SECS) {
+            if let Some(pool) = app.db_pool.clone() {
+                app.schedule_running = true;
+                app.schedule_last_check = Instant::now();
+                let (tx, rx) = mpsc::unbounded_channel();
+                app.schedule_rx = Some(rx);
+                let agents = app.agents.clone();
+                let fleet_cfg = app.fleet_config.clone();
+                let self_ip = app.self_ip.clone();
+                tokio::spawn(async move {
+                    let notices = process_due_scheduled_ops(&pool, &agents, &fleet_cfg, &self_ip).await;
+                    for notice in notices {
+                        let _ = tx.send(ScheduleMsg::Notice(notice));
+                    }
+                    let ops = db::load_pending_scheduled_ops(&pool).await.unwrap_or_default();
+                    let _ = tx.send(ScheduleMsg::Queue(ops));
+                });
+            }
+        }
+
         // Receive diagnostic steps (non-blocking)
         if app.diag_active {
             if let Some(ref mut rx) = app.diag_rx {
@@ -5970,6 +6333,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.wizard.testing_ssh = false;
                 app.wizard.ssh_result = Some(result);
                 app.wizard_ssh_rx = None;
+            }
+        }
+
+        if let Some(ref mut rx) = app.schedule_rx {
+            let mut notices = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    ScheduleMsg::Queue(ops) => {
+                        app.schedule_ops = ops;
+                        app.schedule_selected = app.schedule_selected.min(app.schedule_ops.len().saturating_sub(1));
+                        app.schedule_running = false;
+                    }
+                    ScheduleMsg::Notice(msg) => notices.push(msg),
+                }
+            }
+            for notice in notices {
+                app.toast(&notice);
             }
         }
 
