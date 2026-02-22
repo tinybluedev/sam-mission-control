@@ -325,6 +325,8 @@ struct App {
     // Config viewer
     config_text: Option<String>,
     config_scroll: u16,
+    // Help screen
+    help_scroll: u16,
     // Multi-select
     multi_selected: std::collections::HashSet<usize>,
     // Theme
@@ -409,7 +411,7 @@ impl App {
             tasks: vec![], task_filter_agent: None, task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
             spawned_agents: vec![], show_splash: true, splash_start: Instant::now(),
-            config_text: None, config_scroll: 0,
+            config_text: None, config_scroll: 0, help_scroll: 0,
             filter_active: false, filter_text: String::new(),
             alerts: vec![], alert_flash: None,
             multi_selected: HashSet::new(),
@@ -3083,68 +3085,101 @@ fn render_alerts(frame: &mut Frame, app: &App) {
 
 fn render_help(frame: &mut Frame, app: &App) {
     let t = &app.theme;
-    let sections = vec![
-        ("", ""),
-        ("DASHBOARD", ""),
-        ("  Tab", "Switch focus: Fleet ↔ Chat"),
-        ("  ↑↓ / j k", "Navigate fleet list"),
-        ("  Enter", "Open agent detail"),
-        ("  r", "Refresh all agents (SSH)"),
-        ("  s", "Sort: name → status → location → version"),
-        ("  t", "Task board"),
-        ("  v", "VPN mesh status"),
-        ("  w", "Alerts & warnings"),
-        ("  Space", "Toggle agent selection"),
-        ("  A (Shift)", "Select all agents"),
-        ("  N (Shift)", "Clear selection"),
-        ("  a", "New agent wizard"),
-        ("  /", "Fleet command (runs on all agents)"),
-        ("  g", "Restart gateway (selected)"),
-        ("  G (Shift)", "Investigate gateway (selected)"),
-        ("  o", "OpenClaw version audit"),
-        ("  u", "Bulk update OpenClaw"),
-        ("  g", "Restart gateway (selected agent)"),
-        ("  c", "Cycle color theme"),
-        ("  b", "Cycle background density"),
-        ("  q", "Quit"),
-        ("", ""),
-        ("AGENT DETAIL", ""),
-        ("  e", "View agent config (openclaw.json)"),
-        ("  Tab", "Switch: Info ↔ Chat"),
-        ("  Enter", "Send direct message"),
-        ("  Esc", "Back to dashboard"),
-        ("", ""),
-        ("TASK BOARD", ""),
-        ("  j / k", "Navigate tasks"),
-        ("  n", "Create new task"),
-        ("  d", "Mark done"),
-        ("  Esc", "Back"),
-        ("", ""),
-        ("MOUSE", ""),
-        ("  Click", "Focus panel / select agent"),
-        ("  Scroll", "Scroll chat panels"),
-        ("", ""),
-        ("THEMES (10)", "standard noir paper 1977 2077 matrix sunset arctic ocean ember"),
-        ("BACKGROUNDS", "dark medium light white terminal"),
+    let theme_label = app.theme_name.label();
+    let version = env!("CARGO_PKG_VERSION");
+
+    // Category color helpers
+    let nav_style   = Style::default().fg(t.accent);          // navigation keys (cyan)
+    let act_style   = Style::default().fg(t.accent2);         // action keys (yellow/secondary)
+    let dest_style  = Style::default().fg(t.status_offline);  // destructive keys (red)
+    let dim_style   = Style::default().fg(t.text_dim);
+    let head_style  = Style::default().fg(t.accent).bold();
+    let text_style  = Style::default().fg(t.text);
+
+    // (key, description, key_style)
+    let sections: Vec<(&str, &str, Style)> = vec![
+        ("", "", dim_style),
+        // --- Global keys ---
+        ("GLOBAL", "", dim_style),
+        ("  ?", "Open this help screen", nav_style),
+        ("  q", "Quit", dest_style),
+        ("  c", "Cycle color theme", act_style),
+        ("  b", "Cycle background density", act_style),
+        ("", "", dim_style),
+        // --- Dashboard ---
+        ("DASHBOARD", "", dim_style),
+        ("  Tab", "Switch focus: Fleet ↔ Chat", nav_style),
+        ("  ↑↓ / j k", "Navigate fleet list", nav_style),
+        ("  Enter", "Open agent detail", nav_style),
+        ("  r", "Refresh all agents (SSH)", act_style),
+        ("  s", "Sort: name → status → location → version", act_style),
+        ("  f", "Filter fleet list", act_style),
+        ("  t", "Task board", nav_style),
+        ("  v", "VPN mesh status", nav_style),
+        ("  w", "Alerts & warnings", nav_style),
+        ("  Space", "Toggle agent selection", act_style),
+        ("  A (Shift)", "Select all agents", act_style),
+        ("  N (Shift)", "Clear selection", act_style),
+        ("  a", "New agent wizard", act_style),
+        ("  /", "Fleet command (runs on all agents)", act_style),
+        ("  g", "Restart gateway (selected)", act_style),
+        ("  G (Shift)", "Investigate gateway (selected)", act_style),
+        ("  o", "OpenClaw version audit", act_style),
+        ("  u", "Bulk update OpenClaw", act_style),
+        ("", "", dim_style),
+        // --- Agent Detail ---
+        ("AGENT DETAIL", "", dim_style),
+        ("  1-5", "Switch tabs: Info / Chat / Files / Tasks / Services", nav_style),
+        ("  Tab", "Switch: Info ↔ Chat", nav_style),
+        ("  e", "View agent config (openclaw.json)", act_style),
+        ("  d", "Run diagnostics", act_style),
+        ("  D (Shift)", "Run diagnostics + auto-fix", act_style),
+        ("  Enter", "Send direct message", act_style),
+        ("  Esc", "Back to dashboard", nav_style),
+        ("", "", dim_style),
+        // --- Task Board ---
+        ("TASK BOARD", "", dim_style),
+        ("  j / k", "Navigate tasks", nav_style),
+        ("  n", "Create new task", act_style),
+        ("  d", "Mark done", act_style),
+        ("  Esc", "Back", nav_style),
+        ("", "", dim_style),
+        // --- Mouse ---
+        ("MOUSE", "", dim_style),
+        ("  Click", "Focus panel / select agent", nav_style),
+        ("  Scroll", "Scroll chat panels", nav_style),
     ];
 
-    let lines: Vec<Line> = sections.iter().map(|(l, r)| {
+    let mut lines: Vec<Line> = sections.iter().map(|(l, r, style)| {
         if r.is_empty() && !l.is_empty() && !l.starts_with(' ') {
-            Line::from(Span::styled(format!("  {}", l), Style::default().fg(t.accent).bold()))
+            Line::from(Span::styled(format!("  {}", l), head_style))
         } else {
             Line::from(vec![
-                Span::styled(format!("  {:<14}", l), Style::default().fg(t.sender_self)),
-                Span::styled(r.to_string(), Style::default().fg(t.text)),
+                Span::styled(format!("  {:<14}", l), *style),
+                Span::styled(r.to_string(), text_style),
             ])
         }
     }).collect();
 
-    let help = Paragraph::new(lines).block(Block::default()
-        .title(Span::styled(" Help — press any key to close ", Style::default().fg(t.accent).bold()))
-        .borders(Borders::ALL).border_type(t.border_type)
-        .border_style(Style::default().fg(t.accent))
-        .style(Style::default().bg(app.bg_density.bg()))
-        .padding(Padding::new(2, 2, 1, 1)));
+    // Footer: theme and version info
+    lines.push(Line::from(vec![]));
+    lines.push(Line::from(vec![
+        Span::styled("  Theme: ", dim_style),
+        Span::styled(theme_label, Style::default().fg(t.accent2).bold()),
+        Span::styled("   Background: ", dim_style),
+        Span::styled(app.bg_density.label(), Style::default().fg(t.accent2).bold()),
+        Span::styled("   SAM v", dim_style),
+        Span::styled(version, Style::default().fg(t.text_bold).bold()),
+    ]));
+
+    let help = Paragraph::new(lines)
+        .scroll((app.help_scroll, 0))
+        .block(Block::default()
+            .title(Span::styled(" ◆── Help ──◆  Esc=close  ↑↓=scroll ", Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(t.border_type)
+            .border_style(Style::default().fg(t.accent))
+            .style(Style::default().bg(app.bg_density.bg()))
+            .padding(Padding::new(2, 2, 1, 1)));
     frame.render_widget(help, frame.area());
 }
 
@@ -3565,7 +3600,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                     match app.screen {
                         Screen::SpawnManager => { if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc { app.screen = Screen::Dashboard; } },
-                    Screen::Help => { app.screen = Screen::Dashboard; }
+                    Screen::Help => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => { app.screen = Screen::Dashboard; app.help_scroll = 0; }
+                            KeyCode::Up | KeyCode::Char('k') => { app.help_scroll = app.help_scroll.saturating_sub(1); }
+                            KeyCode::Down | KeyCode::Char('j') => { app.help_scroll = app.help_scroll.saturating_add(1); }
+                            KeyCode::PageUp => { app.help_scroll = app.help_scroll.saturating_sub(10); }
+                            KeyCode::PageDown => { app.help_scroll = app.help_scroll.saturating_add(10); }
+                            _ => {}
+                        },
                         Screen::AgentDetail if app.config_text.is_some() => match key.code {
                             KeyCode::Esc => { app.config_text = None; }
                             KeyCode::PageUp | KeyCode::Up => { app.config_scroll = app.config_scroll.saturating_add(3); }
