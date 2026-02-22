@@ -337,6 +337,13 @@ struct App {
     diag_title: Option<String>,
     diag_start: Option<Instant>,
     diag_overlay_scroll: u16,
+    // Fleet-wide diagnostics (multi-agent D)
+    fleet_diag_active: bool,
+    fleet_diag_fix: bool,
+    fleet_diag_selected: usize,
+    fleet_diag_done: bool,
+    fleet_diag_results: Vec<FleetDiagResult>,
+    fleet_diag_rx: Option<mpsc::UnboundedReceiver<FleetDiagMsg>>,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -494,6 +501,7 @@ impl App {
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
             diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None, diag_overlay_scroll: 0,
+            fleet_diag_active: false, fleet_diag_fix: false, fleet_diag_selected: 0, fleet_diag_done: false, fleet_diag_results: vec![], fleet_diag_rx: None,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: vec![], ws_cursor: (0, 0), ws_undo_stack: vec![], ws_discard_confirm: false,
@@ -3542,6 +3550,7 @@ fn render_fleet_diagnostics(frame: &mut Frame, app: &App) {
                     Some(DiagStatus::Fixed) => (" 🔧 ", t.status_busy),
                     Some(DiagStatus::Skipped) => ("  — ", t.text_dim),
                     Some(DiagStatus::Running) => ("  … ", t.pending),
+                    Some(DiagStatus::Rollback) => (" ↩ ", t.pending),
                 };
                 spans.push(Span::styled(icon.to_string(), if selected { row_style } else { Style::default().fg(color) }));
             }
