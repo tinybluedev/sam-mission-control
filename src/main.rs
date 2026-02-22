@@ -3253,7 +3253,15 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
         let a = &app.agents[i];
         let sel = i == app.selected && active;
         let is_multi = app.selected_agents.contains(&a.db_name);
-        let bg = if sel || is_multi { t.selected_bg } else if row_idx % 2 == 1 { ratatui::style::Color::Rgb(20, 22, 28) } else { app.bg_density.bg() };
+        let bg = if sel {
+            t.selected_bg
+        } else if is_multi {
+            ratatui::style::Color::Rgb(34, 38, 48)
+        } else if row_idx % 2 == 1 {
+            ratatui::style::Color::Rgb(20, 22, 28)
+        } else {
+            app.bg_density.bg()
+        };
         let loc_color = match a.location.as_str() {
             "Home" => t.loc_home, "SM" => t.loc_sm, "VPS" => t.loc_vps, "Mobile" => t.loc_mobile, _ => t.text,
         };
@@ -3335,8 +3343,9 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     } else {
         vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Length(12), Constraint::Min(10)]
     };
-    let selected_info = if app.selected_agent_count() > 0 {
-        format!(" • {} selected", app.selected_agent_count())
+    let selected_count = app.selected_agent_count();
+    let selected_info = if selected_count > 0 {
+        format!(" • {} selected", selected_count)
     } else {
         String::new()
     };
@@ -4303,8 +4312,7 @@ fn render_task_board(frame: &mut Frame, app: &App) {
     let rows: Vec<Row> = app.tasks.iter().enumerate().map(|(i, task)| {
         let sel = i == app.task_selected;
         let bg = if sel { t.selected_bg } else if i % 2 == 1 { ratatui::style::Color::Rgb(20, 22, 28) } else { app.bg_density.bg() };
-        let is_multi = task.assigned_agent.as_ref().map(|a| app.selected_agents.contains(a)).unwrap_or(false);
-        let cursor = if sel && is_multi { "▶✓" } else if sel { "▶ " } else if is_multi { " ✓" } else { "  " };
+        let cursor = if sel { "▶ " } else { "  " };
 
         let st_color = match task.status.as_str() {
             "queued" => t.pending,
@@ -4600,7 +4608,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("  w", "Alerts & warnings", nav_style),
         ("  Space", "Toggle agent selection", act_style),
         ("  a", "Select all agents", act_style),
-        ("  A (Shift)", "Clear selection", act_style),
+        ("  A", "Clear selection", act_style),
         ("  g", "Select all in current filter group", act_style),
         ("  Esc", "Clear selection", act_style),
         ("  /", "Fleet command (runs on selection/all)", act_style),
@@ -5641,6 +5649,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             app.selected_agents.insert(agent.db_name.clone());
                                         }
                                     }
+                                    app.next();
                                 }
                                 KeyCode::Char('f') => {
                                     app.filter_active = true;
@@ -5648,19 +5657,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 KeyCode::Char('?') => app.screen = Screen::Help,
                                 KeyCode::Char('r') => {
-                                    let targets: Vec<(String, String, String, bool)> = if app.selected_agents.is_empty() {
-                                        app.agents.get(app.selected).map(|a| (a.name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"))).into_iter().collect()
+                                    let targets: Vec<(String, String, bool)> = if app.selected_agents.is_empty() {
+                                        app.agents.get(app.selected).map(|a| (a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"))).into_iter().collect()
                                     } else {
                                         app.selected_agent_indices().into_iter()
                                             .filter_map(|i| app.agents.get(i))
-                                            .map(|a| (a.name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac")))
+                                            .map(|a| (a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac")))
                                             .collect()
                                     };
                                     let count = targets.len();
                                     if count > 0 {
                                         app.status_message = format!("🔄 Restarting gateway on {} agent(s)...", count);
                                         let self_ip = app.self_ip.clone();
-                                        for (_name, host, user, is_mac) in targets {
+                                        for (host, user, is_mac) in targets {
                                             tokio::spawn({
                                                 let self_ip = self_ip.clone();
                                                 async move {
@@ -5693,7 +5702,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 KeyCode::Char('a') => {
                                     for agent in &app.agents { app.selected_agents.insert(agent.db_name.clone()); }
-                                    app.toast(&format!("✓ Selected all {} agents", app.agents.len()));
+                                    app.toast(&format!("✓ Selected all {} agents (unfiltered)", app.agents.len()));
                                 }
                                 KeyCode::Char('A') => {
                                     app.selected_agents.clear();
