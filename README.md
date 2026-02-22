@@ -12,7 +12,6 @@ A terminal-based fleet orchestration tool for managing distributed AI agents ove
 - **Agent Detail** — Deep-dive into individual agent info and direct messaging
 - **Multi-select** — Batch operations on groups of agents
 - **8 Color Themes** — Standard, Noir, Paper, 1977, 2077, Matrix, Sunset, Arctic
-- **Fleet Doctor** — Diagnose and auto-fix common fleet issues
 - **Zero Network Exposure** — SSH + Unix socket only, no open ports
 
 ## Screenshots
@@ -29,14 +28,8 @@ A terminal-based fleet orchestration tool for managing distributed AI agents ove
 ### Keybindings
 ![Help](docs/screenshots/help.png)
 
-### Fleet Doctor
-![Doctor](docs/screenshots/doctor.png)
-
 ### CLI Status
 ![Status](docs/screenshots/status-cli.png)
-
-### Themes
-![Sunset Theme](docs/screenshots/theme-sunset.png)
 
 ## Quick Start
 
