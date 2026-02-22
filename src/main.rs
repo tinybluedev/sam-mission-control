@@ -383,6 +383,8 @@ fn npm_line_is_meaningful(line: &str) -> bool {
 impl App {
     async fn new(fleet_config: config::FleetConfig) -> Self {
         let pool = db::get_pool();
+        // Run schema migrations on startup (idempotent)
+        let _ = db::run_migrations(&pool).await;
         let self_ip = std::env::var("SAM_SELF_IP").unwrap_or_else(|_| "localhost".into());
         let mut agents = Vec::new();
 
