@@ -61,10 +61,18 @@ pub async fn update_agent_status(
     pool: &Pool, agent_name: &str, status: &str,
     os_info: Option<&str>, kernel: Option<&str>, oc_version: Option<&str>,
 ) -> Result<(), mysql_async::Error> {
+    update_agent_status_full(pool, agent_name, status, os_info, kernel, oc_version, None).await
+}
+
+pub async fn update_agent_status_full(
+    pool: &Pool, agent_name: &str, status: &str,
+    os_info: Option<&str>, kernel: Option<&str>, oc_version: Option<&str>,
+    latency_ms: Option<u32>,
+) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     conn.exec_drop(
-        "UPDATE mc_fleet_status SET status=?, os_info=COALESCE(?, os_info), kernel=COALESCE(?, kernel), oc_version=COALESCE(?, oc_version), last_heartbeat=NOW(), updated_at=NOW() WHERE agent_name=?",
-        (status, os_info, kernel, oc_version, agent_name),
+        "UPDATE mc_fleet_status SET status=?, os_info=COALESCE(?, os_info), kernel=COALESCE(?, kernel), oc_version=COALESCE(?, oc_version), latency_ms=?, last_heartbeat=NOW(), updated_at=NOW() WHERE agent_name=?",
+        (status, os_info, kernel, oc_version, latency_ms, agent_name),
     ).await?;
     Ok(())
 }
