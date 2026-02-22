@@ -673,10 +673,9 @@ impl App {
         let on = self.agents.iter().filter(|a| a.status == AgentStatus::Online).count();
         let total = self.agents.len();
         let spinner_chars = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
-        let refresh = if self.refreshing {
-            self.spinner_frame = (self.spinner_frame + 1) % spinner_chars.len();
-            format!(" {} ", spinner_chars[self.spinner_frame])
-        } else { String::new() };
+        // Always advance spinner for a live "app is alive" indicator
+        self.spinner_frame = (self.spinner_frame + 1) % spinner_chars.len();
+        let refresh = format!(" {} ", spinner_chars[self.spinner_frame]);
         let chat_count = self.chat_history.len();
         let sel_info = if !self.multi_selected.is_empty() {
             format!(" │ 🔲 {}", self.multi_selected.len())
@@ -849,6 +848,68 @@ fn truncate_str(s: &str, max: usize) -> String {
     else { format!("{}…", s.chars().take(max - 1).collect::<String>()) }
 }
 
+fn os_ascii_art(os: &str) -> &'static [&'static str] {
+    let os_lower = os.to_lowercase();
+    if os_lower.contains("mac") || os_lower.contains("darwin") {
+        &[
+            "       .:'",
+            "    _ :'_",
+            " .`_`-'_`.",
+            ":________.-'",
+            "`-._._._.'",
+        ]
+    } else if os_lower.contains("ubuntu") {
+        &[
+            "   _____",
+            "  /  __ \\",
+            " | /  \\/ |",
+            " | \\__/  |",
+            "  \\____/",
+        ]
+    } else if os_lower.contains("arch") {
+        &[
+            "      /\\",
+            "     /  \\",
+            "    / /\\ \\",
+            "   / /  \\ \\",
+            "  /_/    \\_\\",
+        ]
+    } else if os_lower.contains("fedora") {
+        &[
+            "   ,''''.",
+            "  |   ,--'",
+            "  |  |",
+            "  |  '---.",
+            "   '----'",
+        ]
+    } else if os_lower.contains("linux") {
+        &[
+            "    ___",
+            "   (.. |",
+            "   (<> |",
+            "  / __  \\",
+            " ( /  \\ )|",
+        ]
+    } else if os_lower.contains("windows") {
+        &[
+            "  ,--.--.",
+            " |  |  |",
+            " |  |  |",
+            " '------'",
+            "  \\\\  //",
+        ]
+    } else {
+        &[
+            "  .------.",
+            " | SERVER |",
+            " |        |",
+            " '--------'",
+            "    |  |",
+        ]
+    }
+}
+
+
 fn render_too_small(frame: &mut Frame) {
     let area = frame.area();
     let msg = Paragraph::new(vec![
@@ -888,13 +949,32 @@ fn render_splash(frame: &mut Frame, app: &App) {
         "    Press any key to continue...",
     ];
 
+    // Animated gradient: cycle through blue shades using elapsed time
+    let elapsed_ms = app.splash_start.elapsed().as_millis() as u32;
+    let phase = (elapsed_ms / 80) % 6;
+    let gradient_colors = [
+        Color::Rgb(40, 140, 220),
+        Color::Rgb(60, 170, 255),
+        Color::Rgb(80, 200, 255),
+        Color::Rgb(100, 220, 255),
+        Color::Rgb(80, 200, 255),
+        Color::Rgb(60, 170, 255),
+    ];
+
     let cy = area.height / 2;
     let start_y = cy.saturating_sub(logo.len() as u16 / 2);
 
     for (i, line) in logo.iter().enumerate() {
         let y = start_y + i as u16;
         if y >= area.height { break; }
-        let color = if i < 7 { t.accent } else if i == 8 { t.header_title } else { t.text_dim };
+        let color = if i >= 1 && i <= 5 {
+            // Animated gradient on logo lines
+            gradient_colors[((i as u32 + phase) % 6) as usize]
+        } else if i == 8 {
+            t.header_title
+        } else {
+            t.text_dim
+        };
         let p = Paragraph::new(Line::from(Span::styled(line.to_string(), Style::default().fg(color).bold())))
             .alignment(Alignment::Center);
         frame.render_widget(p, Rect::new(0, y, area.width, 1));
@@ -938,7 +1018,7 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
             Focus::Fleet => "▌Fleet▐", Focus::Chat => "▌Chat▐", _ => "▌Fleet▐",
         }, Style::default().fg(t.accent).bold()),
     ]))
-    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(header, outer[0]);
 
@@ -1057,13 +1137,13 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
         vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Min(12), Constraint::Length(0)]
     };
     let fleet_title = if app.filter_active {
-        format!(" Fleet 🔍 {} ", app.filter_text)
+        format!(" ◆── Fleet 🔍 {} ──◆ ", app.filter_text)
     } else {
-        " Fleet ".to_string()
+        " ◆── Fleet ──◆ ".to_string()
     };
     let table = Table::new(rows, widths).header(hrow)
     .block(Block::default().title(Span::styled(fleet_title, Style::default().fg(fb).bold()))
-        .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(fb))
+        .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(fb))
         .style(Style::default().bg(app.bg_density.bg()))
         .padding(Padding::new(1, 1, 0, 0)));
     frame.render_widget(table, area);
@@ -1099,7 +1179,7 @@ fn render_chat_panel(frame: &mut Frame, app: &App, area: Rect, active: bool, age
 
     let chat = Paragraph::new(messages).scroll((scroll_pos, 0))
         .block(Block::default().title(Span::styled(title, Style::default().fg(cb).bold()))
-            .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(cb))
+            .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(cb))
             .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(chat, cl[0]);
 
@@ -1120,7 +1200,7 @@ fn render_chat_panel(frame: &mut Frame, app: &App, area: Rect, active: bool, age
         Span::styled(display_text, Style::default().fg(t.text)),
         if is_active { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
     ])).block(Block::default().title(prompt)
-        .borders(Borders::ALL).border_type(BorderType::Rounded)
+        .borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(if is_active { t.border_active } else { t.border }))
         .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(input, cl[1]);
@@ -1153,7 +1233,7 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
             _ => "▌Info▐",
         }, Style::default().fg(t.accent).bold()),
     ]))
-    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(header, chunks[0]);
 
@@ -1169,6 +1249,10 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     let ib = if info_active { t.border_active } else { t.border };
 
     let caps = if a.capabilities.is_empty() { "none".into() } else { a.capabilities.join(", ") };
+
+    // OS-based ASCII art decoration
+    let os_art = os_ascii_art(&a.os);
+
     let rows = vec![
         ("Host", a.host.clone(), t.text),
         ("Location", a.location.clone(), match a.location.as_str() {
@@ -1193,15 +1277,21 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         ("Task", a.current_task.as_deref().unwrap_or("none").to_string(), t.text_dim),
     ];
 
-    let info: Vec<Line> = rows.iter().map(|(l, v, c)| Line::from(vec![
+    let mut info: Vec<Line> = rows.iter().map(|(l, v, c)| Line::from(vec![
         Span::raw("  "),
         Span::styled(format!("{:<14}", l), Style::default().fg(t.text_bold).bold()),
         Span::styled(v.clone(), Style::default().fg(*c)),
     ])).collect();
 
+    // Append OS art decoration at the bottom of info panel
+    info.push(Line::from(""));
+    for art_line in os_art {
+        info.push(Line::from(Span::styled(art_line.to_string(), Style::default().fg(t.text_dim))));
+    }
+
     let detail = Paragraph::new(info).block(Block::default()
-        .title(Span::styled(" Info ", Style::default().fg(ib).bold()))
-        .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(ib))
+        .title(Span::styled(" ◆── Info ──◆ ", Style::default().fg(ib).bold()))
+        .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(ib))
         .style(Style::default().bg(app.bg_density.bg()))
         .padding(Padding::new(1, 1, 1, 0)));
     frame.render_widget(detail, body[0]);
@@ -1236,7 +1326,7 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
         Span::raw("    "),
         Span::styled("Headscale (self-hosted)", Style::default().fg(t.text_dim)),
     ]))
-    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(header, outer[0]);
 
@@ -1269,8 +1359,8 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
         Constraint::Length(4), Constraint::Length(16), Constraint::Length(15),
         Constraint::Length(14), Constraint::Length(9), Constraint::Min(12),
     ]).header(hrow)
-    .block(Block::default().title(Span::styled(" Mesh Nodes ", Style::default().fg(t.border_active).bold()))
-        .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(t.border_active))
+    .block(Block::default().title(Span::styled(" ◆── Mesh Nodes ──◆ ", Style::default().fg(t.border_active).bold()))
+        .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(t.border_active))
         .style(Style::default().bg(app.bg_density.bg()))
         .padding(Padding::new(1, 1, 0, 0)));
     frame.render_widget(table, outer[1]);
@@ -1278,7 +1368,7 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
         Span::styled("Esc=back │ Headscale at vpn.example.com │ v=VPN │ q=quit", Style::default().fg(t.text_dim)),
-    ])).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(footer, outer[2]);
 }
@@ -1312,7 +1402,7 @@ fn render_task_board(frame: &mut Frame, app: &App) {
         Span::raw("    "),
         Span::styled(format!("{} total", app.tasks.len()), Style::default().fg(t.text_dim)),
     ]))
-    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(header, outer[0]);
 
@@ -1357,11 +1447,18 @@ fn render_task_board(frame: &mut Frame, app: &App) {
             _ => t.status_online,
         };
 
+        // Priority indicator: 🔥 for P9-10, ▶ for P7-8, · for <7
+        let pri_indicator = match task.priority {
+            9..=10 => "🔥",
+            7..=8 => "▶",
+            _ => "·",
+        };
+
         let desc: String = task.description.chars().take(30).collect();
 
         Row::new(vec![
             Cell::from(format!("{}{}", cursor, task.id)),
-            Cell::from(format!("{}", task.priority)).style(Style::default().fg(pri_color).bold()),
+            Cell::from(format!("{} {}", pri_indicator, task.priority)).style(Style::default().fg(pri_color).bold()),
             Cell::from(format!("{} {}", st_icon, task.status)).style(Style::default().fg(st_color)),
             Cell::from(task.assigned_agent.as_deref().unwrap_or("—").to_string()).style(Style::default().fg(t.accent2)),
             Cell::from(desc).style(Style::default().fg(t.text)),
@@ -1369,11 +1466,11 @@ fn render_task_board(frame: &mut Frame, app: &App) {
     }).collect();
 
     let table = Table::new(rows, [
-        Constraint::Length(5), Constraint::Length(3), Constraint::Length(14),
+        Constraint::Length(5), Constraint::Length(5), Constraint::Length(14),
         Constraint::Length(14), Constraint::Min(15),
     ]).header(hrow)
-    .block(Block::default().title(Span::styled(" Tasks ", Style::default().fg(t.border_active).bold()))
-        .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(t.border_active))
+    .block(Block::default().title(Span::styled(" ◆── Tasks ──◆ ", Style::default().fg(t.border_active).bold()))
+        .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(t.border_active))
         .style(Style::default().bg(app.bg_density.bg()))
         .padding(Padding::new(1, 1, 0, 0)));
     frame.render_widget(table, body[0]);
@@ -1384,6 +1481,11 @@ fn render_task_board(frame: &mut Frame, app: &App) {
             "completed" => t.status_online, "failed" => t.status_offline,
             "running" => t.status_busy, _ => t.text,
         };
+        let pri_indicator = match task.priority {
+            9..=10 => "🔥",
+            7..=8 => "▶",
+            _ => "·",
+        };
         vec![
             Line::from(vec![
                 Span::styled("  ID          ", Style::default().fg(t.text_bold).bold()),
@@ -1391,7 +1493,7 @@ fn render_task_board(frame: &mut Frame, app: &App) {
             ]),
             Line::from(vec![
                 Span::styled("  Priority    ", Style::default().fg(t.text_bold).bold()),
-                Span::styled(format!("{}", task.priority), Style::default().fg(t.text)),
+                Span::styled(format!("{} {}", pri_indicator, task.priority), Style::default().fg(t.text)),
             ]),
             Line::from(vec![
                 Span::styled("  Status      ", Style::default().fg(t.text_bold).bold()),
@@ -1430,8 +1532,8 @@ fn render_task_board(frame: &mut Frame, app: &App) {
     };
 
     let detail = Paragraph::new(detail_lines)
-        .block(Block::default().title(Span::styled(" Detail ", Style::default().fg(t.border).bold()))
-            .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(t.border))
+        .block(Block::default().title(Span::styled(" ◆── Detail ──◆ ", Style::default().fg(t.border).bold()))
+            .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(t.border))
             .style(Style::default().bg(app.bg_density.bg()))
             .padding(Padding::new(0, 1, 1, 0)));
     frame.render_widget(detail, body[1]);
@@ -1445,7 +1547,7 @@ fn render_task_board(frame: &mut Frame, app: &App) {
         Span::styled(&app.task_input, Style::default().fg(t.text)),
         if input_active { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
     ])).block(Block::default().title(prompt)
-        .borders(Borders::ALL).border_type(BorderType::Rounded)
+        .borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(ib))
         .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(input, outer[2]);
@@ -1456,7 +1558,7 @@ fn render_task_board(frame: &mut Frame, app: &App) {
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
         Span::styled(footer_msg, Style::default().fg(t.text_dim)),
-    ])).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(t.border))
         .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(footer, outer[3]);
@@ -1484,7 +1586,7 @@ fn render_alerts(frame: &mut Frame, app: &App) {
         Span::raw("  "),
         Span::styled(format!("{} total", app.alerts.len()), Style::default().fg(t.text_dim)),
     ]))
-    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(header, outer[0]);
 
@@ -1508,8 +1610,8 @@ fn render_alerts(frame: &mut Frame, app: &App) {
     };
 
     let alerts = Paragraph::new(lines)
-        .block(Block::default().title(Span::styled(" Alert History ", Style::default().fg(t.border_active).bold()))
-            .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(t.border_active))
+        .block(Block::default().title(Span::styled(" ◆── Alert History ──◆ ", Style::default().fg(t.border_active).bold()))
+            .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(t.border_active))
             .style(Style::default().bg(app.bg_density.bg()))
             .padding(Padding::new(1, 1, 1, 0)));
     frame.render_widget(alerts, outer[1]);
@@ -1517,7 +1619,7 @@ fn render_alerts(frame: &mut Frame, app: &App) {
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
         Span::styled("Esc=back │ w=alerts │ q=quit", Style::default().fg(t.text_dim)),
-    ])).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(footer, outer[2]);
 }
@@ -1565,7 +1667,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("  Click", "Focus panel / select agent"),
         ("  Scroll", "Scroll chat panels"),
         ("", ""),
-        ("THEMES (8)", "standard noir paper 1977 2077 matrix sunset arctic"),
+        ("THEMES (10)", "standard noir paper 1977 2077 matrix sunset arctic ocean ember"),
         ("BACKGROUNDS", "dark medium light white terminal"),
     ];
 
@@ -1582,7 +1684,7 @@ fn render_help(frame: &mut Frame, app: &App) {
 
     let help = Paragraph::new(lines).block(Block::default()
         .title(Span::styled(" Help — press any key to close ", Style::default().fg(t.accent).bold()))
-        .borders(Borders::ALL).border_type(BorderType::Rounded)
+        .borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(t.accent))
         .style(Style::default().bg(app.bg_density.bg()))
         .padding(Padding::new(2, 2, 1, 1)));
@@ -1595,7 +1697,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
         Span::styled(&app.status_message, Style::default().fg(t.text_dim)),
-    ])).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
         .border_style(Style::default().fg(t.border))
         .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(footer, area);
@@ -1728,7 +1830,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let p = Paragraph::new(lines).scroll((app.config_scroll, 0))
                     .block(Block::default()
                         .title(Span::styled(" openclaw.json — Esc to close ", Style::default().fg(t.accent).bold()))
-                        .borders(Borders::ALL).border_type(BorderType::Rounded)
+                        .borders(Borders::ALL).border_type(t.border_type)
                         .border_style(Style::default().fg(t.accent))
                         .style(Style::default().bg(app.bg_density.bg()))
                         .padding(Padding::new(1, 1, 1, 0)));
