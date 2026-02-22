@@ -76,6 +76,33 @@ pub struct DbAgent {
 }
 
 /// Load all agents from `mc_fleet_status`, ordered by name.
+
+/// Run schema migrations to ensure required columns exist.
+/// Called on startup — idempotent, safe to run every launch.
+pub async fn run_migrations(pool: &Pool) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    // Ensure ssh_user column exists (added in v1.3)
+    let _ = conn.exec_drop(
+        "ALTER TABLE mc_fleet_status ADD COLUMN IF NOT EXISTS ssh_user VARCHAR(64) DEFAULT NULL",
+        (),
+    ).await;
+    // Ensure mc_operations table exists
+    let _ = conn.exec_drop(
+        r"CREATE TABLE IF NOT EXISTS mc_operations (
+            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            agent VARCHAR(64) NOT NULL,
+            op_type VARCHAR(32) NOT NULL,
+            status ENUM('running','pass','fail','fixed','interrupted') NOT NULL DEFAULT 'running',
+            output TEXT,
+            started_at DATETIME NOT NULL DEFAULT NOW(),
+            completed_at DATETIME
+        )",
+        (),
+    ).await;
+    Ok(())
+}
+
 pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let rows: Vec<mysql_async::Row> = conn.query(
