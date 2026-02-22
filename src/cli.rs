@@ -26,6 +26,17 @@ pub enum Commands {
     },
     /// Run interactive setup wizard
     Setup,
+    /// Onboard a new agent on a remote machine
+    Onboard {
+        /// Tailscale IP or hostname of the target machine
+        host: String,
+        /// SSH username (default: papasmurf)
+        #[arg(short, long, default_value = "papasmurf")]
+        user: String,
+        /// Agent name/ID
+        #[arg(short, long)]
+        name: Option<String>,
+    },
     /// Print version info
     Version,
 }
@@ -347,4 +358,179 @@ pub async fn send_chat(agent: &str, message: &str) -> Result<(), Box<dyn std::er
     println!("⏳ Timed out after 30s — check `sam` TUI for response");
     pool.disconnect().await?;
     Ok(())
+}
+
+
+/// Onboard a new agent on a remote machine
+pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::process::Command;
+    use std::time::Duration;
+
+    println!("\n🛰️  S.A.M Mission Control — Agent Onboarding");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  Target:  {}@{}", user, host);
+    println!();
+
+    let ssh_target = format!("{}@{}", user, host);
+    let ssh_args = |cmd: &str| -> Vec<String> {
+        vec![
+            "-o".into(), "ConnectTimeout=5".into(),
+            "-o".into(), "StrictHostKeyChecking=no".into(),
+            "-o".into(), "BatchMode=yes".into(),
+            ssh_target.clone(), cmd.into(),
+        ]
+    };
+
+    // Step 1: Test SSH connectivity
+    print!("  [1/8] Testing SSH connection... ");
+    let out = tokio::time::timeout(Duration::from_secs(8),
+        Command::new("ssh").args(ssh_args("hostname")).output()
+    ).await;
+    match out {
+        Ok(Ok(o)) if o.status.success() => {
+            let hostname = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            println!("✅ {}", hostname);
+        }
+        _ => {
+            println!("❌ Cannot reach {}@{}", user, host);
+            return Err("SSH connection failed".into());
+        }
+    }
+
+    // Step 2: Check OS
+    print!("  [2/8] Detecting OS... ");
+    let out = Command::new("ssh").args(ssh_args(
+        ". /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\" || sw_vers -productName 2>/dev/null || echo unknown"
+    )).output().await?;
+    let os_name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let is_mac = os_name.to_lowercase().contains("mac");
+    println!("✅ {}", os_name);
+
+    // Step 3: Check if OpenClaw is installed
+    print!("  [3/8] Checking OpenClaw... ");
+    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+    let out = Command::new("ssh").args(ssh_args(&format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx))).output().await?;
+    let oc_version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if oc_version.contains("NOT_INSTALLED") {
+        println!("⚠️  Not installed — installing...");
+        print!("       Installing OpenClaw... ");
+        let install_cmd = if is_mac {
+            format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx)
+        } else {
+            "sudo npm install -g openclaw@latest 2>&1 | tail -1".into()
+        };
+        let out = tokio::time::timeout(Duration::from_secs(120),
+            Command::new("ssh").args(ssh_args(&install_cmd)).output()
+        ).await;
+        match out {
+            Ok(Ok(o)) if o.status.success() => println!("✅"),
+            _ => {
+                println!("❌ Install failed");
+                return Err("OpenClaw installation failed".into());
+            }
+        }
+    } else {
+        println!("✅ {}", oc_version);
+    }
+
+    // Step 4: Get/generate hostname for agent name
+    let agent_name = if let Some(n) = name {
+        n.to_string()
+    } else {
+        let out = Command::new("ssh").args(ssh_args("hostname")).output().await?;
+        String::from_utf8_lossy(&out.stdout).trim().to_lowercase().replace(' ', "-")
+    };
+    println!("  [4/8] Agent name: {}", agent_name);
+
+    // Step 5: Generate auth token
+    print!("  [5/8] Configuring gateway... ");
+    let token: String = (0..24).map(|_| format!("{:02x}", rand_byte())).collect();
+    let config_script = format!(r#"python3 -c "
+import json,os
+p=os.path.expanduser('~/.openclaw/openclaw.json')
+os.makedirs(os.path.dirname(p), exist_ok=True)
+c={{}}
+if os.path.exists(p):
+    with open(p) as f: c=json.load(f)
+gw=c.setdefault('gateway',{{}})
+gw['bind']='lan'
+gw.setdefault('auth',{{}})['mode']='token'
+gw['auth']['token']='{}'
+h=gw.setdefault('http',{{}})
+e=h.setdefault('endpoints',{{}})
+e['chatCompletions']={{'enabled':True}}
+with open(p,'w') as f: json.dump(c,f,indent=2)
+print('ok')
+""#, token);
+    let out = Command::new("ssh").args(ssh_args(&config_script)).output().await?;
+    let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if result == "ok" {
+        println!("✅ bind=lan, chatCompletions, auth token");
+    } else {
+        println!("⚠️  {}", result);
+    }
+
+    // Step 6: Get gateway port
+    print!("  [6/8] Reading gateway port... ");
+    let out = Command::new("ssh").args(ssh_args(&format!(
+        "{}python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{{}}).get('port',18789))\"", pfx
+    ))).output().await?;
+    let port: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(18789);
+    println!("✅ {}", port);
+
+    // Step 7: Register in DB
+    print!("  [7/8] Registering in fleet DB... ");
+    let pool = crate::db::get_pool();
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    conn.exec_drop(
+        "INSERT INTO mc_fleet_status (agent_name, tailscale_ip, status, gateway_port, gateway_token, os_info) VALUES (?, ?, 'offline', ?, ?, ?) ON DUPLICATE KEY UPDATE tailscale_ip=VALUES(tailscale_ip), gateway_port=VALUES(gateway_port), gateway_token=VALUES(gateway_token), os_info=VALUES(os_info)",
+        (&agent_name, host, port, &token, &os_name),
+    ).await?;
+    println!("✅");
+
+    // Step 8: Restart gateway and verify
+    print!("  [8/8] Restarting gateway... ");
+    let restart_cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
+    let _ = tokio::time::timeout(Duration::from_secs(15),
+        Command::new("ssh").args(ssh_args(&restart_cmd)).output()
+    ).await;
+    
+    // Verify via HTTP API
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let url = format!("http://{}:{}/v1/chat/completions", host, port);
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let body = serde_json::json!({
+        "model": "openclaw:main",
+        "messages": [{"role": "user", "content": "Say 'online' in one word."}]
+    });
+    match client.post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body).send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                println!("✅ Gateway responding!");
+                // Update status
+                conn.exec_drop("UPDATE mc_fleet_status SET status='online' WHERE agent_name=?", (&agent_name,)).await?;
+            } else {
+                println!("⚠️  Gateway returned {}", resp.status());
+            }
+        }
+        Err(_) => println!("⚠️  Gateway not responding yet (may need manual restart on macOS)"),
+    }
+
+    pool.disconnect().await?;
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  ✅ Agent '{}' onboarded at {}", agent_name, host);
+    println!("     Port: {} | Token: {}...", port, &token[..12]);
+    println!("     Run `sam` to see it in the fleet.\n");
+
+    Ok(())
+}
+
+fn rand_byte() -> u8 {
+    use std::time::SystemTime;
+    let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    ((t.subsec_nanos() ^ (t.as_secs() as u32).wrapping_mul(2654435761)) & 0xFF) as u8
 }
