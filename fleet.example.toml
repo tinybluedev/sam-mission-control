@@ -1,0 +1,26 @@
+# S.A.M Mission Control — Fleet Configuration
+# Copy to fleet.toml and customize for your fleet
+
+[[agent]]
+name = "hub"
+display = "Hub Node"
+emoji = "🛰️"
+location = "Home"
+ssh_user = "admin"
+
+[[agent]]
+name = "worker-1"
+display = "Worker 1"
+emoji = "🖥️"
+location = "Home"
+ssh_user = "admin"
+
+[[agent]]
+name = "cloud-1"
+display = "Cloud Node"
+emoji = "☁️"
+location = "VPS"
+ssh_user = "ubuntu"
+
+# Locations: Home, SM, VPS, Mobile
+# SSH uses key-based auth (BatchMode=yes)
