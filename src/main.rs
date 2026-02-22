@@ -746,7 +746,21 @@ fn now_str() -> String {
 
 // ---- Chat Line Rendering ----
 
-fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme) -> Vec<Line<'static>> {
+const BRAILLE_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Minimum content width (chars) for message word-wrap, preventing extremely narrow wrapping.
+const MIN_WRAP_WIDTH: usize = 10;
+/// Approximate lines rendered per chat message (header + body + blank), used to estimate
+/// the number of unseen messages from a raw line count.
+const LINES_PER_MSG_EST: usize = 3;
+/// Spinner frame duration in milliseconds.  Dividing subsecond millis by this value gives
+/// a 0–9 index that advances ~10 times per second.
+const SPINNER_FRAME_MS: u64 = 100;
+
+fn fmt_hhmm(t: &str) -> String {
+    t.chars().take(5).collect()
+}
+
+fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme, area_width: u16, spinner_frame: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if messages.is_empty() {
         lines.push(Line::from(""));
@@ -765,59 +779,126 @@ fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme) -> Vec<Line<'s
         }
         return lines;
     }
+
+    let inner_w = area_width.saturating_sub(2) as usize;
+    let wrap_w = inner_w.saturating_sub(8).max(20);
+
     for msg in messages {
-        let ts = msg.target.as_ref().map(|t| format!("→@{}", t)).unwrap_or_else(|| "→all".into());
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {} ", msg.time), Style::default().fg(t.text_dim)),
-            Span::styled(msg.sender.clone(), Style::default().fg(
-                if msg.sender == user { t.sender_self } else { t.sender_other }
-            ).bold()),
-            Span::styled(format!(" {}", ts), Style::default().fg(t.text_dim)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("     "),
-            Span::styled(msg.message.clone(), Style::default().fg(t.text)),
-        ]));
-        if let Some(resp) = &msg.response {
-            let max_w = 50;
-            let words: Vec<&str> = resp.split_whitespace().collect();
-            let (mut cur, mut first) = (String::new(), true);
+        let ts = fmt_hhmm(&msg.time);
+        let is_outgoing = msg.sender == user;
+
+        if is_outgoing {
+            // Right-aligned outgoing message (operator)
+            let tgt = msg.target.as_ref()
+                .map(|tgt| format!(" → @{}", tgt))
+                .unwrap_or_else(|| " → all".into());
+            let header_content = format!("{}{}   {}", msg.sender, tgt, ts);
+            let hlen = header_content.chars().count();
+            let hpad = inner_w.saturating_sub(hlen);
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(hpad)),
+                Span::styled(format!("{}{}", msg.sender, tgt), Style::default().fg(t.sender_self).bold()),
+                Span::styled(format!("   {}", ts), Style::default().fg(t.text_dim)),
+            ]));
+
+            // Word-wrap body and right-align each line
+            let body_wrap = wrap_w.saturating_sub(2).max(MIN_WRAP_WIDTH);
+            let words: Vec<&str> = msg.message.split_whitespace().collect();
+            let mut wrapped: Vec<String> = Vec::new();
+            let mut cur = String::new();
             for w in &words {
-                if cur.len() + w.len() + 1 > max_w && !cur.is_empty() {
-                    let prefix = if first { "↳ ".to_string() } else { "  ".to_string() };
-                    lines.push(Line::from(vec![
-                        Span::raw("     "),
-                        Span::styled(prefix, Style::default().fg(t.sender_other)),
-                        Span::styled(cur.clone(), Style::default().fg(t.response)),
-                    ]));
-                    cur.clear(); first = false;
+                if !cur.is_empty() && cur.chars().count() + w.len() + 1 > body_wrap {
+                    wrapped.push(cur.clone());
+                    cur.clear();
                 }
                 if !cur.is_empty() { cur.push(' '); }
                 cur.push_str(w);
             }
-            if !cur.is_empty() {
-                let prefix = if first { "↳ ".to_string() } else { "  ".to_string() };
+            if !cur.is_empty() { wrapped.push(cur); }
+            if wrapped.is_empty() { wrapped.push(msg.message.clone()); }
+
+            for bl in &wrapped {
+                let blen = bl.chars().count();
+                let bpad = inner_w.saturating_sub(blen + 2);
                 lines.push(Line::from(vec![
-                    Span::raw("     "),
-                    Span::styled(prefix, Style::default().fg(t.sender_other)),
-                    Span::styled(cur, Style::default().fg(t.response)),
+                    Span::raw(" ".repeat(bpad)),
+                    Span::styled(bl.clone(), Style::default().fg(t.text)),
+                    Span::raw("  "),
                 ]));
             }
-        } else {
-            let status_text = match msg.status.as_str() {
-                "pending" => "⏳ pending...",
-                "processing" => "🔄 processing...",
-                "thinking" => "💭 thinking...",
-                "received" => "📨 received",
-                _ => "",
+
+            // Status indicator (right-aligned)
+            let st_icon: String = if msg.response.is_some() {
+                "✓✓".into()
+            } else {
+                match msg.status.as_str() {
+                    "pending" => "⏳".into(),
+                    "thinking" | "processing" => {
+                        let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
+                        c.to_string()
+                    }
+                    "failed" => "✗".into(),
+                    _ => "✓".into(),
+                }
             };
-            if !status_text.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::raw("     "),
-                    Span::styled(status_text.to_string(), Style::default().fg(t.pending)),
-                ]));
+            let spad = inner_w.saturating_sub(st_icon.chars().count() + 1);
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(spad)),
+                Span::styled(st_icon, Style::default().fg(t.text_dim)),
+                Span::raw(" "),
+            ]));
+        } else {
+            // Left-aligned incoming message (agent)
+            let avatar = msg.sender.chars().next()
+                .map(|c| c.to_ascii_uppercase())
+                .unwrap_or('?');
+            lines.push(Line::from(vec![
+                Span::styled(format!("  [{}] ", avatar), Style::default().fg(t.sender_other).bold()),
+                Span::styled(msg.sender.clone(), Style::default().fg(t.sender_other).bold()),
+                Span::styled(format!("   {}", ts), Style::default().fg(t.text_dim)),
+            ]));
+
+            if let Some(resp) = &msg.response {
+                // Word-wrapped response
+                let words: Vec<&str> = resp.split_whitespace().collect();
+                let mut cur = String::new();
+                let mut first = true;
+                for w in &words {
+                    if !cur.is_empty() && cur.chars().count() + w.len() + 1 > wrap_w {
+                        let prefix = if first { "  ↳ " } else { "    " };
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix.to_string(), Style::default().fg(t.sender_other)),
+                            Span::styled(cur.clone(), Style::default().fg(t.response)),
+                        ]));
+                        cur.clear();
+                        first = false;
+                    }
+                    if !cur.is_empty() { cur.push(' '); }
+                    cur.push_str(w);
+                }
+                if !cur.is_empty() {
+                    let prefix = if first { "  ↳ " } else { "    " };
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), Style::default().fg(t.sender_other)),
+                        Span::styled(cur, Style::default().fg(t.response)),
+                    ]));
+                }
+            } else {
+                let status_text: String = match msg.status.as_str() {
+                    "thinking" => {
+                        let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
+                        format!("  {} agent is thinking...", c)
+                    }
+                    "pending" | "processing" => "  ⏳ processing...".into(),
+                    "received" => "  📨 received".into(),
+                    _ => String::new(),
+                };
+                if !status_text.is_empty() {
+                    lines.push(Line::from(Span::styled(status_text, Style::default().fg(t.pending))));
+                }
             }
         }
+
         lines.push(Line::from(""));
     }
     lines
@@ -1157,12 +1238,18 @@ fn render_chat_panel(frame: &mut Frame, app: &App, area: Rect, active: bool, age
         .constraints([Constraint::Min(5), Constraint::Length(3)])
         .split(area);
 
+    // Time-based spinner frame for typing animation (advances once per SPINNER_FRAME_MS).
+    let spin_frame = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis() as u64 / SPINNER_FRAME_MS) as usize;
+
     let (messages, scroll, input_text) = if agent_mode {
         let msgs = app.agent_chat_lines();
-        let lines = build_chat_lines(msgs, &app.user(), t);
+        let lines = build_chat_lines(msgs, &app.user(), t, cl[0].width, spin_frame);
         (lines, app.agent_chat_scroll, &app.agent_chat_input)
     } else {
-        let lines = build_chat_lines(&app.chat_history, &app.user(), t);
+        let lines = build_chat_lines(&app.chat_history, &app.user(), t, cl[0].width, spin_frame);
         (lines, app.chat_scroll, &app.chat_input)
     };
 
@@ -1170,11 +1257,21 @@ fn render_chat_panel(frame: &mut Frame, app: &App, area: Rect, active: bool, age
     let tl = messages.len();
     let scroll_pos = if tl > vh && scroll == 0 { (tl - vh) as u16 } else { scroll };
 
+    // Scroll indicator: count lines below the current viewport
+    let lines_below = tl.saturating_sub(scroll_pos as usize + vh);
+    let new_indicator = if lines_below > 0 {
+        format!(" ▼ {} new ", (lines_below / LINES_PER_MSG_EST).max(1))
+    } else {
+        String::new()
+    };
+
     let title = if agent_mode {
-        format!(" {} {} Chat ", app.agents[app.selected].emoji, app.agents[app.selected].name)
+        let base = format!(" {} {} Chat", app.agents[app.selected].emoji, app.agents[app.selected].name);
+        format!("{}{} ", base, new_indicator)
     } else {
         let count = app.chat_history.len();
-        if count > 0 { format!(" Chat ({}) ", count) } else { " Chat ".to_string() }
+        let base = if count > 0 { format!(" Chat ({})", count) } else { " Chat".to_string() };
+        format!("{}{} ", base, new_indicator)
     };
 
     let chat = Paragraph::new(messages).scroll((scroll_pos, 0))
