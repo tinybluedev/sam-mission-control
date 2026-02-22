@@ -3880,7 +3880,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         last_probe_at: None,
                                     });
                                     app.wizard.active = false;
-                                    app.status_message = format!("✅ Agent '{}' created", app.wizard.agent_name);
+                                    let created_name = app.wizard.agent_name.clone();
+                                    app.toast(&format!("✅ Agent '{}' created", created_name));
                                 }
                             }
                             KeyCode::Tab => {
