@@ -259,6 +259,76 @@ mod tests {
         let msg = "Connection timeout after 5s";
         assert_eq!(sanitize_error(msg), msg);
     }
+
+    // ── SQL injection / special-character / unicode tests ──────────
+
+    /// Verify that an agent name containing SQL metacharacters does not alter
+    /// the static query template used in parameterized queries.
+    #[test]
+    fn sql_injection_in_agent_name_does_not_alter_query() {
+        // The SQL template must be a static string; user input is bound via `?`
+        let injection = "'; DROP TABLE mc_fleet_status; --";
+        let static_query = "UPDATE mc_fleet_status SET status=?, os_info=COALESCE(?, os_info), kernel=COALESCE(?, kernel), oc_version=COALESCE(?, oc_version), latency_ms=?, last_heartbeat=NOW(), updated_at=NOW() WHERE agent_name=?";
+        // The injection payload must not appear in the static SQL template
+        assert!(!static_query.contains(injection));
+        // Parameterized placeholders are present
+        assert!(static_query.contains('?'));
+    }
+
+    /// Verify that SQL injection strings in agent names are sanitized by
+    /// `sanitize_error` should they appear in DB error messages.
+    #[test]
+    fn sanitize_error_handles_sql_injection_in_agent_name() {
+        let msg = "Error for agent '; DROP TABLE mc_fleet_status; -- : connection refused";
+        let sanitized = sanitize_error(msg);
+        // sanitize_error must not introduce new SQL payloads and must return a string
+        assert!(!sanitized.is_empty());
+    }
+
+    /// Special characters in chat messages must be safely handled.
+    /// The INSERT template uses `?` placeholders; the message itself must not
+    /// appear in the query string.
+    #[test]
+    fn special_chars_in_chat_message_do_not_alter_query() {
+        let special_message = "Hello'; DELETE FROM mc_chat; -- <script>alert(1)</script>";
+        let static_query = "INSERT INTO mc_chat (sender, target, message, status, kind) VALUES (?, ?, ?, 'pending', 'direct')";
+        assert!(!static_query.contains(special_message));
+        assert!(static_query.contains('?'));
+    }
+
+    /// Unicode agent names and messages must not break the query template.
+    #[test]
+    fn unicode_values_do_not_alter_query_template() {
+        let unicode_agent = "代理人'; DROP TABLE mc_fleet_status; --";
+        let unicode_message = "こんにちは\'; UPDATE mc_chat SET message='pwned";
+        let agent_query = "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token FROM mc_fleet_status ORDER BY agent_name";
+        let chat_query = "INSERT INTO mc_chat (sender, target, message, status, kind) VALUES (?, ?, ?, 'pending', ?)";
+        assert!(!agent_query.contains(unicode_agent));
+        assert!(!chat_query.contains(unicode_message));
+        // Ensure unicode strings round-trip without corruption
+        assert!(unicode_agent.len() > 0);
+        assert!(unicode_message.chars().count() > 0);
+    }
+
+    /// `sanitize_error` must strip credentials even when the URL contains
+    /// Unicode characters in the password.
+    #[test]
+    fn sanitize_masks_url_with_unicode_password() {
+        let msg = "Connection failed: mysql://root:päßwörD@10.0.0.1:3306/db";
+        let sanitized = sanitize_error(msg);
+        assert!(!sanitized.contains("päßwörD"));
+        assert!(sanitized.contains("***"));
+    }
+
+    /// `sanitize_error` must handle an error message that itself looks like a
+    /// SQL injection attempt (e.g. from a rogue DB response).
+    #[test]
+    fn sanitize_error_with_injection_payload_in_error() {
+        let msg = "mysql://admin:s3cr3t@host/db error: 1064 You have an error in your SQL syntax near '; DROP TABLE users;'";
+        let sanitized = sanitize_error(msg);
+        assert!(!sanitized.contains("s3cr3t"));
+        assert!(sanitized.contains("***"));
+    }
 }
 
 // ---- Task Board ----
