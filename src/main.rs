@@ -1166,7 +1166,7 @@ impl App {
                         s.contains(&host)
                     }).unwrap_or(false);
 
-                    if peer_found {
+                    let peer_result = if peer_found {
                         let _ = tx.send(DiagStep { label: "  → Tailscale route".into(), status: DiagStatus::Pass, detail: "peer known to Tailscale".into() });
                         // Try DERP relay ping
                         let _ = tx.send(DiagStep { label: "  → Tailscale ping".into(), status: DiagStatus::Running, detail: "trying direct WireGuard...".into() });
@@ -1177,22 +1177,182 @@ impl App {
                         if ts_ping_ok {
                             let ping_detail = ts_ping.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
                             let _ = tx.send(DiagStep { label: "  → Tailscale ping".into(), status: DiagStatus::Pass, detail: ping_detail.chars().take(80).collect::<String>() });
-                            // WireGuard works but SSH doesn't — might be firewall or sshd
                             let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
                                 detail: "Tailscale reachable but SSH refused — check sshd on target".into() });
+                            false
                         } else {
                             let _ = tx.send(DiagStep { label: "  → Tailscale ping".into(), status: DiagStatus::Fail, detail: "WireGuard unreachable".into() });
-                            // Machine is probably off or Tailscale is down on that end
-                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
-                                detail: "machine offline or Tailscale down on target — cannot auto-fix".into() });
+
+                            // === LAN FALLBACK: Try to reach via mDNS or known LAN ===
+                            let _ = tx.send(DiagStep { label: "  → LAN discovery".into(), status: DiagStatus::Running, detail: "searching local network...".into() });
+
+                            // Try mDNS (.local) resolution — macOS/Linux machines broadcast this
+                            let hostname_clean = name.to_lowercase().replace(' ', "").replace('_', "");
+                            let mdns_names = vec![
+                                format!("{}.local", hostname_clean),
+                                format!("{}.local", name.to_lowercase()),
+                            ];
+                            let mut lan_ip: Option<String> = None;
+                            for mdns in &mdns_names {
+                                let resolve = tokio::time::timeout(Duration::from_secs(3),
+                                    Command::new("getent").args(["hosts", mdns]).output()
+                                ).await.ok().and_then(|r| r.ok());
+                                if let Some(o) = resolve {
+                                    let out = String::from_utf8_lossy(&o.stdout);
+                                    if let Some(ip) = out.split_whitespace().next() {
+                                        if !ip.is_empty() && ip != "0.0.0.0" {
+                                            lan_ip = Some(ip.to_string());
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Also try ping for .local
+                                let ping_local = tokio::time::timeout(Duration::from_secs(3),
+                                    Command::new("ping").args(["-c", "1", "-W", "2", mdns]).output()
+                                ).await.ok().and_then(|r| r.ok());
+                                if let Some(o) = ping_local {
+                                    if o.status.success() {
+                                        // Extract IP from ping output
+                                        let out = String::from_utf8_lossy(&o.stdout);
+                                        // "PING host.local (192.168.1.x)"
+                                        if let Some(start) = out.find('(') {
+                                            if let Some(end) = out[start..].find(')') {
+                                                let ip = &out[start+1..start+end];
+                                                lan_ip = Some(ip.to_string());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Also check ARP cache
+                            if lan_ip.is_none() {
+                                let arp = Command::new("bash").args(["-c",
+                                    &format!("arp -n 2>/dev/null | grep -i '{}' | awk '{{print $1}}' | head -1", hostname_clean)
+                                ]).output().await;
+                                if let Ok(o) = arp {
+                                    let ip = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                    if !ip.is_empty() { lan_ip = Some(ip); }
+                                }
+                            }
+
+                            // Also check DB for lan_ip field
+                            // Try common IPs from /etc/hosts or fleet knowledge
+                            if lan_ip.is_none() {
+                                let etc_hosts = Command::new("bash").args(["-c",
+                                    &format!("grep -i '{}' /etc/hosts 2>/dev/null | awk '{{print $1}}' | head -1", hostname_clean)
+                                ]).output().await;
+                                if let Ok(o) = etc_hosts {
+                                    let ip = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                    if !ip.is_empty() && !ip.starts_with('#') { lan_ip = Some(ip); }
+                                }
+                            }
+
+                            let lan_fixed = if let Some(ref lip) = lan_ip {
+                                let _ = tx.send(DiagStep { label: "  → LAN discovery".into(), status: DiagStatus::Pass, detail: format!("found at {}", lip) });
+
+                                // Try SSH via LAN IP
+                                let _ = tx.send(DiagStep { label: "  → LAN SSH".into(), status: DiagStatus::Running, detail: format!("ssh {}@{}...", user, lip) });
+                                let lan_ssh = tokio::time::timeout(Duration::from_secs(8),
+                                    Command::new("ssh").args(["-o","ConnectTimeout=3","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                        &format!("{}@{}", user, lip), "echo ok"]).output()
+                                ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+
+                                if lan_ssh {
+                                    let _ = tx.send(DiagStep { label: "  → LAN SSH".into(), status: DiagStatus::Pass, detail: "connected via LAN!".into() });
+
+                                    // FIX: Restart Tailscale on the target machine
+                                    let _ = tx.send(DiagStep { label: "  → Restart Tailscale".into(), status: DiagStatus::Running, detail: "bringing Tailscale back up...".into() });
+                                    let is_mac_target = Command::new("ssh").args([
+                                        "-o","ConnectTimeout=3","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                        &format!("{}@{}", user, lip), "uname -s"
+                                    ]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim() == "Darwin").unwrap_or(false);
+
+                                    let ts_restart_cmd = if is_mac_target {
+                                        // macOS: use the Tailscale CLI to bring it up
+                                        "sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || /usr/local/bin/tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || echo FAIL"
+                                    } else {
+                                        "sudo systemctl restart tailscaled && sleep 2 && sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || echo FAIL"
+                                    };
+
+                                    let ts_result = tokio::time::timeout(Duration::from_secs(30),
+                                        Command::new("ssh").args(["-o","ConnectTimeout=3","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                            &format!("{}@{}", user, lip), ts_restart_cmd]).output()
+                                    ).await.ok().and_then(|r| r.ok());
+
+                                    let ts_ok = ts_result.as_ref().map(|o| {
+                                        let out = String::from_utf8_lossy(&o.stdout);
+                                        !out.contains("FAIL")
+                                    }).unwrap_or(false);
+
+                                    if ts_ok {
+                                        let _ = tx.send(DiagStep { label: "  → Restart Tailscale".into(), status: DiagStatus::Fixed, detail: "Tailscale restarted!".into() });
+                                        // Wait a beat and verify the original Tailscale IP works
+                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                                        let _ = tx.send(DiagStep { label: "  → Verify Tailscale".into(), status: DiagStatus::Running, detail: format!("re-testing {}...", host) });
+                                        let verify = tokio::time::timeout(Duration::from_secs(6),
+                                            Command::new("ssh").args(["-o","ConnectTimeout=3","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                                &format!("{}@{}", user, host), "echo ok"]).output()
+                                        ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+                                        if verify {
+                                            let _ = tx.send(DiagStep { label: "  → Verify Tailscale".into(), status: DiagStatus::Pass, detail: "Tailscale SSH working!".into() });
+                                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fixed,
+                                                detail: format!("fixed — restarted Tailscale via LAN ({})", lip) });
+                                            // Continue with remaining checks since we're now connected
+                                        } else {
+                                            let _ = tx.send(DiagStep { label: "  → Verify Tailscale".into(), status: DiagStatus::Fail, detail: "still unreachable via Tailscale IP".into() });
+                                            let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                                detail: format!("Tailscale restarted but mesh route not established — may need re-auth. LAN SSH works: {}@{}", user, lip) });
+                                        }
+                                        verify
+                                    } else {
+                                        let detail = ts_result.map(|o| String::from_utf8_lossy(&o.stdout).trim().chars().take(80).collect::<String>()).unwrap_or("timeout".into());
+                                        let _ = tx.send(DiagStep { label: "  → Restart Tailscale".into(), status: DiagStatus::Fail, detail });
+                                        let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                            detail: format!("LAN reachable at {} but Tailscale restart failed — may need manual login", lip) });
+                                        false
+                                    }
+                                } else {
+                                    let _ = tx.send(DiagStep { label: "  → LAN SSH".into(), status: DiagStatus::Fail, detail: "LAN SSH also failed — machine may be asleep/off".into() });
+
+                                    // Try Wake-on-LAN if we can find the MAC address
+                                    let _ = tx.send(DiagStep { label: "  → Wake-on-LAN".into(), status: DiagStatus::Running, detail: "checking for MAC address...".into() });
+                                    let mac_lookup = Command::new("bash").args(["-c",
+                                        &format!("arp -n {} 2>/dev/null | awk '/ether/{{print $3}}' || ip neigh show {} 2>/dev/null | awk '{{print $5}}'", lip, lip)
+                                    ]).output().await;
+                                    let mac = mac_lookup.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                                    if mac.contains(':') && mac.len() >= 17 {
+                                        // Send WoL magic packet
+                                        let _ = tx.send(DiagStep { label: "  → Wake-on-LAN".into(), status: DiagStatus::Running, detail: format!("sending WoL to {}...", mac) });
+                                        let wol_cmd = format!("wakeonlan {} 2>/dev/null || etherwake -i eth0 {} 2>/dev/null || echo NOWOL", mac, mac);
+                                        let _ = Command::new("bash").args(["-c", &wol_cmd]).output().await;
+                                        let _ = tx.send(DiagStep { label: "  → Wake-on-LAN".into(), status: DiagStatus::Fixed, detail: format!("WoL sent to {} — wait 30-60s for boot", mac) });
+                                        let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                            detail: format!("WoL sent — press D again in 60s to re-check") });
+                                    } else {
+                                        let _ = tx.send(DiagStep { label: "  → Wake-on-LAN".into(), status: DiagStatus::Skipped, detail: "no MAC address in ARP cache".into() });
+                                        let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                            detail: "machine unreachable on both Tailscale and LAN — likely powered off".into() });
+                                    }
+                                    false
+                                }
+                            } else {
+                                let _ = tx.send(DiagStep { label: "  → LAN discovery".into(), status: DiagStatus::Fail, detail: "could not find LAN IP (no mDNS, ARP, or /etc/hosts entry)".into() });
+                                let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
+                                    detail: "Tailscale down, no LAN path — add LAN IP to /etc/hosts or wake machine manually".into() });
+                                false
+                            };
+                            lan_fixed
                         }
                     } else {
                         let _ = tx.send(DiagStep { label: "  → Tailscale route".into(), status: DiagStatus::Fail,
                             detail: format!("{} not in Tailscale peer list — may need re-enrollment", host) });
                         let _ = tx.send(DiagStep { label: "SSH connectivity".into(), status: DiagStatus::Fail,
                             detail: "not in mesh — needs Tailscale login on target machine".into() });
-                    }
-                    false
+                        false
+                    };
+                    peer_result
                 } else {
                     // Ping works but SSH failed — try again with longer timeout
                     let _ = tx.send(DiagStep { label: "  → Ping".into(), status: DiagStatus::Pass, detail: format!("{} responds to ping", host) });
