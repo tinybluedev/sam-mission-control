@@ -1,357 +1,104 @@
 # 🛰️ S.A.M Mission Control
 
-**Real-time fleet orchestration for coordinated AI agent deployment — from a single terminal.**
+Fleet orchestration TUI for AI agents. Monitor, chat with, and manage your entire fleet from one terminal.
 
-[![CI](https://github.com/tinybluedev/sam-mission-control/actions/workflows/ci.yml/badge.svg)](https://github.com/tinybluedev/sam-mission-control/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-
-<p align="center">
-  <img src="docs/screenshot-dashboard.svg" alt="S.A.M Mission Control Dashboard" width="100%">
-</p>
-
-### Dashboard View
-
-```
-╭───────────────────────────────────────────────────────────────────────────╮
-│  🛰️  S.A.M MISSION CONTROL   18/20 agents   ● live   ⟳ refreshing  ▌Fleet▐ │
-╰───────────────────────────────────────────────────────────────────────────╯
-╭─ Fleet ──────────────────────────────╮╭─ Chat ────────────────────────────╮
-│     Agent         Location  Status   ││  16:22:14 nick →all               │
-│  🖥️  agent-01      Home   ●  online  ││     system health check           │
-│  🐘  agent-02      Cloud  ●  online  ││     ↳ All 20 agents reporting in  │
-│  🔥  agent-03      Home   ◉  busy    ││                                   │
-│  🌐  agent-04      VPS    ○  offline ││  16:24:01 nick →all               │
-│  📱  agent-05      Mobile ●  online  ││     check disk space              │
-│  ⚡  agent-06      SM     ●  online  ││     🔄 processing...              │
-│  🐝  agent-07      Home   ●  online  ││                                   │
-│  🗡️  agent-08      Home   ●  online  ││  16:25:33 nick →all               │
-│  🎬  agent-09      Home   ●  online  ││     uptime report                 │
-│  🐜  agent-10      Home   ?  unknown ││     ⏳ pending...                 │
-│  ...               ...    ...        ││                                   │
-╰──────────────────────────────────────╯╰───────────────────────────────────╯
-                                        ╭─ broadcast to all ⏎ ─────────────╮
-                                        │ › check memory usage▌             │
-                                        ╰───────────────────────────────────╯
-╭───────────────────────────────────────────────────────────────────────────╮
-│  v1.0 │ 18/20 online │ theme:standard/dark │ r=refresh b=bg c=color ?=help │
-╰───────────────────────────────────────────────────────────────────────────╯
-```
-
-### Agent Detail View
-
-Select any agent and press Enter to open their dedicated view with private chat:
-
-```
-╭───────────────────────────────────────────────────────────────────────────╮
-│  🐘 agent-02  —  ●  online    ▌Chat▐                                      │
-╰───────────────────────────────────────────────────────────────────────────╯
-╭─ Info ───────────────────────╮╭─ 🐘 agent-02 Chat ───────────────────────╮
-│                              ││  16:30:01 nick →@agent-02                 │
-│  Host           10.0.0.2     ││     check disk space                      │
-│  Location       Cloud        ││     ↳ Disk: 142G/500G (28% used)         │
-│  Status         ●  online    ││                                           │
-│  OS             Ubuntu 24.04 ││  16:31:15 nick →@agent-02                 │
-│  Kernel         6.18.7       ││     show running services                 │
-│  OC Version     2026.2.21-2  ││     💭 thinking...                        │
-│  SSH User       myuser       ││                                           │
-│  Capabilities   gpu, docker  ││  16:32:44 nick →@agent-02                 │
-│  Tokens Today   1,247        ││     tail the gateway logs                 │
-│  Last Seen      16:35:27     ││     ⏳ pending...                         │
-│  Task           none         ││                                           │
-│                              ││                                           │
-╰──────────────────────────────╯╰───────────────────────────────────────────╯
-                                ╭─ @agent-02 › ────────────────────────────╮
-                                │ › restart the gateway▌                    │
-                                ╰───────────────────────────────────────────╯
-╭───────────────────────────────────────────────────────────────────────────╮
-│  Esc=back │ Tab=switch │ r=refresh agent-02 │ q=quit                       │
-╰───────────────────────────────────────────────────────────────────────────╯
-```
-
-
-### Task Board
-
-Press `t` from the dashboard to manage fleet tasks:
-
-```
-╭───────────────────────────────────────────────────────────────────────────╮
-│  📋 TASK BOARD    3 queued  1 active  12 done    16 total                  │
-╰───────────────────────────────────────────────────────────────────────────╯
-╭─ Tasks ──────────────────────────────────╮╭─ Detail ──────────────────────╮
-│    #  P  Status        Agent  Description││  ID          #42              │
-│  ▶ 42  2  ⏳ queued     —     Deploy v2  ││  Priority    2                │
-│    41  3  🔄 running   cyber  Run backup ││  Status      queued           │
-│    40  5  📨 assigned  r720   Check logs ││  Agent       unassigned       │
-│    39  5  ✅ completed  nix   Update DNS ││  Created     02-21 17:30      │
-│    38  8  ✅ completed  r410  Disk clean ││                               │
-│    ...                                   ││  Description:                 │
-│                                          ││  Deploy v2 to all SM agents   │
-╰──────────────────────────────────────────╯╰───────────────────────────────╯
-╭─ n=new task  d=done  Esc=back ───────────────────────────────────────────╮
-│ ›                                                                         │
-╰───────────────────────────────────────────────────────────────────────────╯
-```
-
-### Theme Gallery
-
-Cycle themes with `c`, backgrounds with `b`. All 8 themes adapt to light and dark modes:
-
-```
-  standard ──── Clean cyan/blue (default)
-  noir ──────── White/grey monochrome
-  paper ─────── Black on white (light mode)
-  1977 ──────── Warm amber/orange CRT feel
-  2077 ──────── Neon cyberpunk pink/cyan
-  matrix ────── Green phosphor terminal
-  sunset ────── Warm orange/red/purple
-  arctic ────── Cool blue/white/silver
-```
-
-## Features
-
-- **Fleet dashboard** — real-time status of 20+ agents with SSH probing
-- **Separated chat** — global broadcasts (dashboard) + private direct messages (agent detail)
-- **Task board** — create, assign, and track tasks with priority color-coding
-- **Agent provisioning wizard** — 7-step modal to add new agents with SSH testing
-- **CLI subcommands** — `sam status`, `sam chat`, `sam setup` for scriptable access
-- **8 color themes × 5 backgrounds** — persistent theme preferences (`c`/`b` to cycle)
-- **Mouse support** — click panels, select agents, scroll wheel in chat
-- **Fleet sorting** — sort by name, status, location, or version (`s`)
-- **Responsive layout** — adapts from 60-col narrow to 160+ ultra-wide
-- **Config file** — `~/.config/sam/config.toml` with setup wizard
-- **Panic recovery** — terminal always restored on crash
-- **Security hardened** — no secrets in source, CI audit, 0600 config permissions
-- **Non-blocking** — all SSH probes and DB writes run in background
-- **Zero network exposure** — no HTTP server, no open ports
-
-## Architecture
-
-```
-  ┌──────────────────────────┐
-  │   sam (Rust TUI)         │
-  │   your hub node          │
-  └────────┬─────────────────┘
-           │ SQL reads/writes
-           ▼
-  ┌──────────────────────────┐
-  │        MySQL             │
-  │  mc_fleet_status         │
-  │  mc_chat                 │
-  └────────┬─────────────────┘
-           │ polls mc_chat for tasks
-           ▼
-  ┌──────────────────────────┐
-  │   mc_chat_responder      │
-  │   (agent-side daemon)    │
-  └────────┬─────────────────┘
-           │ SSH
-           ▼
-  ┌──────────────────────────┐
-  │   agents (fleet nodes)   │
-  │  agent-01 … agent-20     │
-  └──────────────────────────┘
-```
-
-Mission Control writes messages to `mc_chat`. Each agent runs `mc_chat_responder`, which polls the table, executes tasks locally, and writes responses back. The TUI polls for updates every 3 seconds. SSH is used for live status probing only.
-
-## Setup
-
-### Prerequisites
-
-- **Rust 1.85+** — <https://rustup.rs>
-- **MySQL or MariaDB** — database server accessible from your hub node
-- **SSH key access** to every fleet node (key-based auth, no passwords)
-
-### Build & Install
+## Quick Start
 
 ```bash
+# Build
 git clone https://github.com/tinybluedev/sam-mission-control.git
 cd sam-mission-control
 cargo build --release
-
-# Install globally as `sam`
 sudo cp target/release/sam-mission-control /usr/local/bin/sam
+
+# Init (creates DB tables, config, everything)
+sam init --db-host 10.0.0.1 --db-pass 'yourpassword'
+
+# Launch
+sam
 ```
 
-### Configuration
+That's it. Three commands.
 
-**`.env`** (copy from `.env.example`)
-```env
-# Option 1 — single URL
-SAM_DB_URL=mysql://myuser:mypassword@10.0.0.1:3306/mission_control
-
-# Option 2 — individual fields
-SAM_DB_HOST=10.0.0.1
-SAM_DB_PORT=3306
-SAM_DB_USER=myuser
-SAM_DB_PASS=mypassword
-SAM_DB_NAME=mission_control
-
-SAM_SELF_IP=10.0.0.1   # this hub node's IP (skips SSH probe for self)
-SAM_USER=myuser         # your display name in chat
-```
-
-**`fleet.toml`** (copy from `fleet.example.toml`)
-```toml
-[[agent]]
-name = "agent-01"
-display = "Agent 01"
-emoji = "🖥️"
-location = "Home"
-ssh_user = "myuser"
-
-[[agent]]
-name = "agent-02"
-display = "Agent 02"
-emoji = "🐘"
-location = "Cloud"
-ssh_user = "myuser"
-```
-
-Config files are loaded from (in order):
-1. `$SAM_FLEET_CONFIG` / `./fleet.toml` / `~/.config/sam/fleet.toml`
-2. `./.env` / `~/.config/sam/.env`
-
-### Database Setup
-
-```sql
-CREATE TABLE mc_fleet_status (
-    agent_name       VARCHAR(64) PRIMARY KEY,
-    hostname         VARCHAR(128),
-    tailscale_ip     VARCHAR(45),
-    status           ENUM('online','busy','offline','error') DEFAULT 'offline',
-    current_task_id  INT,
-    last_heartbeat   DATETIME,
-    oc_version       VARCHAR(32),
-    os_info          VARCHAR(128),
-    kernel           VARCHAR(64),
-    capabilities     JSON,
-    token_burn_today INT DEFAULT 0,
-    uptime_seconds   BIGINT DEFAULT 0,
-    updated_at       DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-);
-
-CREATE TABLE mc_chat (
-    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
-    sender       VARCHAR(64) NOT NULL,
-    target       VARCHAR(64),
-    message      TEXT NOT NULL,
-    response     TEXT,
-    status       ENUM('pending','delivered','responded','failed') DEFAULT 'pending',
-    created_at   DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
-    responded_at DATETIME(3),
-    INDEX idx_target_status (target, status),
-    INDEX idx_created (created_at)
-);
-
--- Seed one row per agent matching the names in fleet.toml
-INSERT INTO mc_fleet_status (agent_name) VALUES ('agent-01'), ('agent-02');
-```
-
-### Run
+## Add Agents
 
 ```bash
-# From the project directory (picks up .env and fleet.toml automatically)
-sam
+# Onboard a machine (installs OpenClaw, configures gateway, registers in fleet)
+sam onboard 10.64.0.3
 
-# Or run directly without installing
-./target/release/sam-mission-control
+# Push workspace files to agents
+sam deploy all --file SOUL.md
+sam deploy dellr720 --file AGENTS.md
 ```
+
+## What It Does
+
+| Screen | Key | Description |
+|--------|-----|-------------|
+| **Dashboard** | — | Fleet status, global chat, resource bars |
+| **Agent Detail** | `Enter` | Private AI chat, config viewer, gateway logs |
+| **Task Board** | `t` | Create and track fleet tasks |
+| **Alerts** | `w` | Threshold-based notifications |
+| **VPN Status** | `v` | Tailscale mesh overview |
+| **Help** | `?` | Full keybinding reference |
 
 ## Keybindings
 
-### Dashboard
 | Key | Action |
 |-----|--------|
-| `Tab` | Switch focus: Fleet ↔ Chat |
-| `↑`/`k` `↓`/`j` | Navigate fleet list |
-| `Enter` | Open agent detail |
-| `r` | Refresh all agents (SSH) |
-| `s` | Cycle sort: name → status → location → version |
-| `t` | Open task board |
-| `a` | Open new agent wizard |
-| `c` | Cycle color theme |
-| `b` | Cycle background density |
-| `?` | Help screen |
+| `↑↓` / `jk` | Navigate |
+| `Enter` | Agent detail |
+| `Tab` | Switch panels |
+| `Space` | Toggle select |
+| `f` | Filter/search |
+| `s` | Sort fleet |
+| `/` | Run command on fleet |
+| `g` | Restart gateway |
+| `G` | Investigate gateway |
+| `e` | View agent config |
+| `a` | Add agent wizard |
+| `r` | Refresh |
+| `c` / `b` | Cycle theme / background |
+| `?` | Help |
 | `q` | Quit |
-| 🖱️ Click | Focus panel / select agent |
-| 🖱️ Scroll | Scroll chat |
-
-### Agent Detail
-| Key | Action |
-|-----|--------|
-| `Tab` | Switch: Info ↔ Agent Chat |
-| Type + `Enter` | Send direct message to agent |
-| `Esc` | Back to dashboard |
-
-### Task Board
-| Key | Action |
-|-----|--------|
-| `j`/`k` | Navigate tasks |
-| `n` | Create new task |
-| `d` | Mark selected task done |
-| `Esc` | Back to dashboard |
-
-### Agent Wizard
-| Key | Action |
-|-----|--------|
-| `Enter` | Next step / confirm |
-| `Tab` | Skip / test SSH (on confirm) |
-| `Esc` | Back / cancel |
-
-Agent names resolve by exact match, display name, or prefix — `@ag` matches `agent-01`.
 
 ## CLI
 
 ```bash
-sam              # Launch TUI (default)
-sam status       # Print fleet status table
-sam chat cyber "check disk space"  # Message agent, wait for response
-sam setup        # Interactive config wizard
-sam version      # Print version
-sam --config /path/to/config.toml  # Use specific config
+sam                  # TUI
+sam status           # Fleet status (non-interactive)
+sam chat cyber "hi"  # Message an agent
+sam onboard <ip>     # Provision new agent
+sam deploy <target> --file <file>  # Push workspace files
+sam init             # First-time setup
+sam setup            # Config wizard
 ```
 
-## Themes
+## Chat
 
-Cycle with `t`. Each theme adapts automatically to the current background density.
+Agent detail chat talks to **real AI agents** via OpenClaw's HTTP API. Each agent responds with its own personality, context, and tools.
 
-| Key | Theme | Description |
-|-----|-------|-------------|
-| 1 | `standard` | Cyan/blue — the default |
-| 2 | `noir` | White/grey on black |
-| 3 | `paper` | Black on white (light mode) |
-| 4 | `1977` | Warm amber/orange/brown |
-| 5 | `2077` | Neon pink/cyan/yellow |
-| 6 | `matrix` | Green on black |
-| 7 | `sunset` | Warm orange/red/purple |
-| 8 | `arctic` | Cool blue/white/silver |
+Dashboard chat broadcasts to all agents simultaneously.
 
-Background densities (cycle with `b`): `dark` · `medium` · `light` · `white` · `terminal`
+## Architecture
 
-## Stack
+```
+sam (Rust TUI) ──SQL──► MySQL (mc_fleet_status, mc_chat)
+       │
+       ├──SSH──► Agent probes (status, resources, latency)
+       └──HTTP──► OpenClaw gateway /v1/chat/completions (AI chat)
+```
 
-| Component | Tech |
-|-----------|------|
-| TUI | [Ratatui](https://ratatui.rs) |
-| Async runtime | [Tokio](https://tokio.rs) |
-| Database | [mysql_async](https://docs.rs/mysql_async) |
-| Config | [TOML](https://toml.io) + [dotenvy](https://docs.rs/dotenvy) |
-| Agent comms | SSH (via your existing VPN mesh) |
-| Language | Rust 1.85+ |
+- **Zero network exposure** — no HTTP server, no open ports on the hub
+- **SSH + Tailscale mesh** — rides your existing VPN
+- **Single binary** — ~6MB, zero runtime deps
 
-## Security Model
+## Requirements
 
-- **No web interface.** No HTTP server, no WebSocket, no open ports.
-- **No hardcoded credentials.** All secrets live in `.env` (gitignored).
-- **No fleet data in source.** Agent definitions live in `fleet.toml` (gitignored).
-- **SSH-only probing.** Rides your existing VPN mesh. No new attack surface.
-- **Single binary.** ~6 MB, zero runtime dependencies.
-
-## Contributing
-
-PRs welcome. The codebase is intentionally small — `main.rs`, `db.rs`, `config.rs`, `theme.rs`. Read the code, understand the architecture, submit focused changes.
+- Rust 1.85+
+- MySQL/MariaDB
+- SSH key access to fleet nodes
+- [OpenClaw](https://openclaw.ai) on each agent (installed automatically by `sam onboard`)
 
 ## License
 
