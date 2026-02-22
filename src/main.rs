@@ -2551,26 +2551,33 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
 fn render_services(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let split = Layout::default().direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(40)])
+        .constraints([Constraint::Length(32), Constraint::Min(40)])
         .split(area);
 
-    // Left: service list
+    // Left: service list with status indicators
     let mut items: Vec<Line> = Vec::new();
-    items.push(Line::from(Span::styled("  🔌 Services & Plugins", Style::default().fg(t.header_title).bold())));
+    let agent_name = app.agents.get(app.selected).map(|a| a.name.as_str()).unwrap_or("?");
+    items.push(Line::from(Span::styled(format!("  🔌 {} Services", agent_name), Style::default().fg(t.header_title).bold())));
     items.push(Line::from(""));
 
     if app.svc_loading {
-        items.push(Line::from(Span::styled("  Loading config...", Style::default().fg(t.pending))));
+        items.push(Line::from(Span::styled("  ⏳ Loading config...", Style::default().fg(t.pending))));
     } else if app.svc_list.is_empty() {
-        items.push(Line::from(Span::styled("  No config loaded", Style::default().fg(t.text_dim))));
+        items.push(Line::from(Span::styled("  ⚠ No config found", Style::default().fg(t.status_offline))));
+        items.push(Line::from(""));
+        items.push(Line::from(Span::styled("  Press 'd' to run diagnostics", Style::default().fg(t.text_dim))));
+        items.push(Line::from(Span::styled("  or 'S' to setup OpenClaw", Style::default().fg(t.text_dim))));
     } else {
         for (i, svc) in app.svc_list.iter().enumerate() {
             let selected = i == app.svc_selected;
-            let prefix = if selected { " ▸ " } else { "   " };
-            let status_icon = if svc.name == "model" || svc.name == "gateway" {
-                "◆"
-            } else if svc.enabled { "●" } else { "○" };
-            let status_color = if svc.enabled { t.status_online } else { t.text_dim };
+            let prefix = if selected { " ▶ " } else { "   " };
+            let (status_icon, status_color) = if svc.name == "model" || svc.name == "gateway" {
+                ("◆", t.accent)
+            } else if svc.enabled {
+                ("●", t.status_online)
+            } else {
+                ("○", t.text_dim)
+            };
             let name_style = if selected {
                 Style::default().fg(Color::Black).bg(t.accent).bold()
             } else {
@@ -2586,8 +2593,13 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     items.push(Line::from(""));
-    items.push(Line::from(Span::styled("  ↑↓ select  Space toggle", Style::default().fg(t.text_dim))));
-    items.push(Line::from(Span::styled("  Enter details  r reload", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  ─── Quick Actions ───", Style::default().fg(t.border))));
+    items.push(Line::from(Span::styled("  Space  toggle on/off", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  g      restart gateway", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  d      run diagnostics", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  l      view gateway logs", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  e      edit raw config", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  r      reload", Style::default().fg(t.text_dim))));
 
     let list = Paragraph::new(items)
         .block(Block::default()
@@ -2597,7 +2609,7 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(list, split[0]);
 
-    // Right: service detail
+    // Right: contextual action panel (NOT raw JSON)
     let detail_lines = if app.svc_selected < app.svc_list.len() {
         let svc = &app.svc_list[app.svc_selected];
         let mut lines = vec![
@@ -2611,41 +2623,110 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("  Summary: ", Style::default().fg(t.text_bold).bold()),
-                Span::styled(&svc.summary, Style::default().fg(t.text)),
-            ]),
-            Line::from(""),
         ];
 
-        // Show raw config section if available
-        if let Some(ref config) = app.svc_config {
-            let section = if svc.name == "gateway" {
-                config.get("gateway")
-            } else if svc.name == "model" {
-                config.get("agents")
+        // Gateway: show status + actions
+        if svc.name == "gateway" {
+            lines.push(Line::from(Span::styled("  Status", Style::default().fg(t.text_bold).bold())));
+            // Parse summary for display
+            for part in svc.summary.split("  ") {
+                let part = part.trim();
+                if part.is_empty() { continue; }
+                let (icon, color) = if part.contains("token:✓") || part.contains("on") || part.contains("lan") {
+                    ("  ✓ ", t.status_online)
+                } else if part.contains("none") || part.contains("off") || part.contains("localhost") {
+                    ("  ⚠ ", Color::Yellow)
+                } else {
+                    ("  ◦ ", t.text)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(icon, Style::default().fg(color)),
+                    Span::styled(part, Style::default().fg(t.text)),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Actions", Style::default().fg(t.text_bold).bold())));
+            lines.push(Line::from(Span::styled("  [g] Restart gateway", Style::default().fg(t.accent))));
+            lines.push(Line::from(Span::styled("  [l] View recent logs", Style::default().fg(t.accent))));
+            lines.push(Line::from(Span::styled("  [e] Edit raw config", Style::default().fg(t.accent))));
+            lines.push(Line::from(""));
+            // Warnings
+            if let Some(ref config) = app.svc_config {
+                let bind = config.get("gateway").and_then(|g| g.get("bind")).and_then(|b| b.as_str()).unwrap_or("localhost");
+                if bind == "localhost" {
+                    lines.push(Line::from(Span::styled("  ⚠ bind=localhost — not reachable over Tailscale", Style::default().fg(Color::Yellow))));
+                    lines.push(Line::from(Span::styled("    Recommended: bind=lan or bind=0.0.0.0", Style::default().fg(t.text_dim))));
+                }
+                let chat = config.get("gateway").and_then(|g| g.get("chatCompletions"))
+                    .and_then(|c| c.get("enabled")).and_then(|e| e.as_bool()).unwrap_or(false);
+                if !chat {
+                    lines.push(Line::from(Span::styled("  ⚠ Chat completions API disabled", Style::default().fg(Color::Yellow))));
+                    lines.push(Line::from(Span::styled("    SAM chat requires this. Enable it?", Style::default().fg(t.text_dim))));
+                }
+                let has_token = config.get("gateway").and_then(|g| g.get("auth")).and_then(|a| a.get("token")).is_some();
+                if !has_token {
+                    lines.push(Line::from(Span::styled("  ⚠ No auth token set — API is open", Style::default().fg(Color::Yellow))));
+                }
+            }
+        } else if svc.name == "model" {
+            // Model: show current config
+            lines.push(Line::from(Span::styled("  Configuration", Style::default().fg(t.text_bold).bold())));
+            for part in svc.summary.split("  ") {
+                let part = part.trim();
+                if part.is_empty() { continue; }
+                lines.push(Line::from(Span::styled(format!("  ◦ {}", part), Style::default().fg(t.text))));
+            }
+            if let Some(ref config) = app.svc_config {
+                let ctx = config.get("agents").and_then(|a| a.get("defaults"))
+                    .and_then(|d| d.get("contextTokens")).and_then(|c| c.as_u64()).unwrap_or(0);
+                if ctx < 500_000 {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(format!("  ⚠ Context window {}K — consider 1000K", ctx/1000), Style::default().fg(Color::Yellow))));
+                }
+            }
+        } else {
+            // Plugin/channel service
+            lines.push(Line::from(Span::styled("  Status", Style::default().fg(t.text_bold).bold())));
+            if svc.enabled && svc.has_channel_config {
+                lines.push(Line::from(Span::styled("  ✓ Plugin enabled", Style::default().fg(t.status_online))));
+                lines.push(Line::from(Span::styled("  ✓ Channel configured", Style::default().fg(t.status_online))));
+                // Parse summary for details
+                for part in svc.summary.split("  ") {
+                    let part = part.trim();
+                    if part.is_empty() { continue; }
+                    lines.push(Line::from(Span::styled(format!("    {}", part), Style::default().fg(t.text))));
+                }
+            } else if svc.enabled && !svc.has_channel_config {
+                lines.push(Line::from(Span::styled("  ✓ Plugin enabled", Style::default().fg(t.status_online))));
+                lines.push(Line::from(Span::styled("  ⚠ No channel config", Style::default().fg(Color::Yellow))));
+                lines.push(Line::from(Span::styled("    This plugin won't work without channel settings", Style::default().fg(t.text_dim))));
+            } else if !svc.enabled && svc.has_channel_config {
+                lines.push(Line::from(Span::styled("  ✗ Plugin disabled", Style::default().fg(t.status_offline))));
+                lines.push(Line::from(Span::styled("  ✓ Channel config exists", Style::default().fg(t.text_dim))));
+                lines.push(Line::from(Span::styled("    Press Space to enable this plugin", Style::default().fg(t.text_dim))));
             } else {
-                // Show channel config if exists, otherwise plugin config
-                config.get("channels").and_then(|c| c.get(&svc.name))
-                    .or_else(|| config.get("plugins").and_then(|p| p.get("entries")).and_then(|e| e.get(&svc.name)))
-            };
+                lines.push(Line::from(Span::styled("  ✗ Plugin disabled", Style::default().fg(t.status_offline))));
+                lines.push(Line::from(Span::styled("  ✗ No channel config", Style::default().fg(t.text_dim))));
+            }
 
-            if let Some(section) = section {
-                lines.push(Line::from(Span::styled("  Configuration:", Style::default().fg(t.text_bold).bold())));
-                lines.push(Line::from(""));
-                let pretty = serde_json::to_string_pretty(section).unwrap_or_default();
-                for line in pretty.lines() {
-                    // Syntax highlight JSON
-                    let styled = if line.contains(':') {
-                        let parts: Vec<&str> = line.splitn(2, ':').collect();
-                        Line::from(vec![
-                            Span::styled(format!("  {}", parts[0]), Style::default().fg(t.accent)),
-                            Span::styled(format!(":{}", parts.get(1).unwrap_or(&"")), Style::default().fg(t.text)),
-                        ])
-                    } else {
-                        Line::from(Span::styled(format!("  {}", line), Style::default().fg(t.text_dim)))
-                    };
-                    lines.push(styled);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Actions", Style::default().fg(t.text_bold).bold())));
+            lines.push(Line::from(Span::styled(
+                if svc.enabled { "  [Space] Disable plugin" } else { "  [Space] Enable plugin" },
+                Style::default().fg(t.accent),
+            )));
+            lines.push(Line::from(Span::styled("  [e]     Edit raw config", Style::default().fg(t.accent))));
+
+            // Health warnings
+            if svc.enabled {
+                let has_token = svc.summary.contains("token:✓");
+                let has_bot_id = svc.summary.contains("botId:✓");
+                if !has_token {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled("  ⚠ No bot token configured", Style::default().fg(Color::Yellow))));
+                }
+                if !has_bot_id && (svc.name == "discord" || svc.name == "telegram") {
+                    lines.push(Line::from(Span::styled("  ⚠ No bot ID set", Style::default().fg(Color::Yellow))));
                 }
             }
         }
@@ -3602,12 +3683,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                 }
-                                KeyCode::Char('5') => { app.focus = Focus::Services; app.start_services_load(); }
                                 KeyCode::Char('5') => {} // already here
                                 KeyCode::Up => { if app.svc_selected > 0 { app.svc_selected -= 1; app.svc_detail_scroll = 0; } }
                                 KeyCode::Down => { if app.svc_selected < app.svc_list.len().saturating_sub(1) { app.svc_selected += 1; app.svc_detail_scroll = 0; } }
                                 KeyCode::Char(' ') => app.toggle_service(),
                                 KeyCode::Char('r') => app.start_services_load(),
+                                KeyCode::Char('d') => app.start_diagnostics(false),
+                                KeyCode::Char('D') => app.start_diagnostics(true),
+                                KeyCode::Char('g') => {
+                                    // Restart gateway from services tab
+                                    if let Some(agent) = app.agents.get(app.selected) {
+                                        let host = agent.host.clone();
+                                        let user = agent.ssh_user.clone();
+                                        let name = agent.name.clone();
+                                        let is_mac = agent.os.to_lowercase().contains("mac");
+                                        app.toast(&format!("🔄 Restarting gateway on {}...", name));
+                                        tokio::spawn(async move {
+                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                            let cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
+                                            let _ = tokio::process::Command::new("ssh")
+                                                .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                    &format!("{}@{}", user, host), &cmd])
+                                                .output().await;
+                                        });
+                                    }
+                                }
+                                KeyCode::Char('l') => {
+                                    // View gateway logs from services tab
+                                    if let Some(agent) = app.agents.get(app.selected) {
+                                        let host = agent.host.clone();
+                                        let user = agent.ssh_user.clone();
+                                        let self_ip = app.self_ip.clone();
+                                        let is_mac = agent.os.to_lowercase().contains("mac");
+                                        app.toast("📋 Fetching logs...");
+                                        let (tx, rx) = mpsc::unbounded_channel();
+                                        app.config_load_rx = Some(rx);
+                                        tokio::spawn(async move {
+                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                                            let cmd = format!("{}journalctl -u openclaw-gateway --no-pager -n 30 --output=short-iso 2>/dev/null || openclaw gateway status 2>/dev/null || echo 'no logs available'", pfx);
+                                            let output = if host == "localhost" || host == self_ip {
+                                                tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                                            } else {
+                                                tokio::time::timeout(
+                                                    std::time::Duration::from_secs(5),
+                                                    tokio::process::Command::new("ssh")
+                                                        .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                                            &format!("{}@{}", user, host), &cmd])
+                                                        .output()
+                                                ).await.ok().and_then(|r| r.ok())
+                                            };
+                                            let text = output.map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                                                .unwrap_or_else(|| "Timeout fetching logs".into());
+                                            let _ = tx.send(Some(text));
+                                        });
+                                    }
+                                }
+                                KeyCode::Char('e') => {
+                                    // Open raw config viewer
+                                    if let Some(ref config) = app.svc_config {
+                                        let pretty = serde_json::to_string_pretty(config).unwrap_or_default();
+                                        app.config_text = Some(pretty);
+                                        app.config_scroll = 0;
+                                    }
+                                }
                                 KeyCode::PageUp => app.svc_detail_scroll = app.svc_detail_scroll.saturating_add(5),
                                 KeyCode::PageDown => app.svc_detail_scroll = app.svc_detail_scroll.saturating_sub(5),
                                 KeyCode::Char('q') => app.should_quit = true,
