@@ -105,13 +105,6 @@ impl AlertSeverity {
     }
 }
 
-/// Events sent from background tasks to the main event loop.
-#[derive(Debug)]
-enum AppEvent {
-    /// A fleet-health alert: (agent db_name, human-readable reason).
-    AgentAlert(String, String),
-}
-
 #[derive(Clone, Debug)]
 struct ChatLine {
     sender: String,
@@ -314,6 +307,7 @@ struct App {
     diag_auto_fix: bool,
     diag_title: Option<String>,
     diag_start: Option<Instant>,
+    diag_overlay_scroll: u16,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -361,9 +355,29 @@ struct App {
     ac_matches: Vec<String>,
     ac_selected: usize,
     ac_start_pos: usize,  // cursor position of the '@'
-    // Health watch (proactive fleet monitoring)
-    health_alert_rx: Option<mpsc::UnboundedReceiver<AppEvent>>,
-    unread_alerts: usize,
+    // Operation state persistence
+    interrupted_ops: Vec<db::Operation>,
+    diag_task_running: bool,
+}
+
+/// Returns true for npm output lines worth showing in the overlay.
+/// Filters out transitive-dependency deprecation noise and pure whitespace.
+fn npm_line_is_meaningful(line: &str) -> bool {
+    if line.trim().is_empty() { return false; }
+    let lower = line.to_lowercase();
+    // Skip noisy deprecated warnings for transitive deps
+    if lower.contains("npm warn deprecated") { return false; }
+    if lower.contains("npm warn notsup") { return false; }
+    // Always keep error lines
+    if lower.contains("err") { return true; }
+    // Keep final result lines (added/changed/removed/updated X packages)
+    if lower.contains("added") && lower.contains("package") { return true; }
+    if (lower.contains("changed") || lower.contains("updated") || lower.contains("removed")) && lower.contains("package") { return true; }
+    // Keep timing/progress lines
+    if lower.contains("packages in") { return true; }
+    // Keep non-deprecated warnings
+    if lower.starts_with("npm warn") { return true; }
+    false
 }
 
 impl App {
@@ -415,6 +429,10 @@ impl App {
             Err(_) => vec![],
         };
 
+        // Detect operations interrupted by a previous session (started > 5 min ago, still 'running')
+        let _ = db::mark_stale_operations_interrupted(&pool).await;
+        let interrupted_ops = db::load_interrupted_operations(&pool).await.unwrap_or_default();
+
         let tn = ThemeName::Standard;
         let bd = BgDensity::Dark;
 
@@ -441,13 +459,13 @@ impl App {
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
-            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None,
+            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None, diag_overlay_scroll: 0,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
-            health_alert_rx: None, unread_alerts: 0,
+            interrupted_ops, diag_task_running: false,
         }
     }
 
@@ -1145,6 +1163,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
     out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|| "timeout".into())
 }
 
+
     fn start_oc_update(&mut self) {
         if self.selected >= self.agents.len() { return; }
         let agent = &self.agents[self.selected];
@@ -1153,17 +1172,24 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let name = agent.db_name.clone();
         let is_mac = agent.os.to_lowercase().contains("mac");
         let self_ip = self.self_ip.clone();
+        let pool_opt = self.db_pool.clone();
 
         self.diag_active = true;
+        self.diag_task_running = true;
         self.diag_auto_fix = false;
         self.diag_title = Some(format!("⬆️  Update — {}", name));
         self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
         self.diag_steps = vec![DiagStep { label: format!("Updating OpenClaw on {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
         let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
         self.diag_rx = Some(rx);
 
         tokio::spawn(async move {
+            let op_id = if let Some(ref pool) = pool_opt {
+                db::create_operation(pool, &name, "oc_update").await.ok()
+            } else { None };
+
             let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
             // Step 1: current version
@@ -1171,10 +1197,36 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let cur = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw --version 2>/dev/null || echo '(not installed)'", pfx)).await;
             let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Pass, detail: cur.trim().to_string() });
 
-            // Step 2: stream npm install (stdout + stderr merged via 2>&1)
+            // Pre-flight checks before install
+            let _ = tx.send(DiagStep { label: "Pre-flight checks".into(), status: DiagStatus::Running, detail: String::new() });
+            let preflight_cmd = format!(
+                "{}node --version 2>/dev/null && npm --version 2>/dev/null && df -k $(npm config get prefix 2>/dev/null || echo /usr) | awk 'NR==2{{print $4}}' | xargs -I{{}} bash -c 'if [ {{}} -lt 512000 ]; then echo LOW_DISK; else echo OK_DISK; fi' 2>/dev/null || echo OK_DISK",
+                pfx
+            );
+            let preflight_out = App::ssh_run(&host, &user, &self_ip, &preflight_cmd).await;
+            if preflight_out.contains("LOW_DISK") {
+                let _ = tx.send(DiagStep { label: "Pre-flight checks".into(), status: DiagStatus::Fail, detail: "< 512MB disk space — aborting update".into() });
+                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Aborted — free up disk space first".into() });
+                return;
+            }
+            // Determine install strategy
+            let has_sudo_npm = App::ssh_run(&host, &user, &self_ip, &format!("{}sudo -n npm --version 2>/dev/null && echo HAS_SUDO_NPM || echo NO_SUDO_NPM", pfx)).await.contains("HAS_SUDO_NPM");
+            let npm_prefix = App::ssh_run(&host, &user, &self_ip, &format!("{}npm config get prefix 2>/dev/null", pfx)).await.trim().to_string();
+            let needs_ignore_scripts = App::ssh_run(&host, &user, &self_ip, &format!("{}gcc --version 2>/dev/null && echo HAS_GCC || echo NO_GCC", pfx)).await.contains("NO_GCC");
+            let node_ver = preflight_out.lines().next().unwrap_or("?").trim().to_string();
+            let npm_ver = preflight_out.lines().nth(1).unwrap_or("?").trim().to_string();
+            let _ = tx.send(DiagStep { label: "Pre-flight checks".into(), status: DiagStatus::Pass,
+                detail: format!("node {} | npm {} | prefix: {}", node_ver, npm_ver, npm_prefix.chars().take(30).collect::<String>()) });
+
+            // Step 2: stream npm install with smart flags
             let _ = tx.send(DiagStep { label: "Installing openclaw@latest".into(), status: DiagStatus::Running, detail: "running npm install...".into() });
-            // 2>&1 merges stderr so we capture error messages too
-            let install_cmd = format!("{}sudo npm install -g openclaw@latest 2>&1; echo EXITCODE:$?:DONE", pfx);
+            let ignore_scripts = if needs_ignore_scripts { " --ignore-scripts" } else { "" };
+            let install_cmd = if has_sudo_npm {
+                format!("{}sudo npm install -g openclaw@latest{} 2>&1; echo EXITCODE:$?:DONE", pfx, ignore_scripts)
+            } else {
+                // No sudo or sudo npm broken — install to user prefix
+                format!("{}npm install -g openclaw@latest{} 2>&1; echo EXITCODE:$?:DONE", pfx, ignore_scripts)
+            };
             use tokio::io::AsyncBufReadExt;
             let mut child = if host == "localhost" || host == self_ip {
                 tokio::process::Command::new("bash").args(["-c", &install_cmd])
@@ -1205,7 +1257,10 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
                         if clean.to_lowercase().contains("err") || clean.starts_with("npm ERR") {
                             error_lines.push(clean.chars().take(80).collect());
                         }
-                        let _ = tx.send(DiagStep { label: "  npm".into(), status: DiagStatus::Running, detail: clean.chars().take(70).collect() });
+                        // Only stream meaningful lines; skip deprecated noise / whitespace
+                        if npm_line_is_meaningful(&clean) {
+                            let _ = tx.send(DiagStep { label: "  npm".into(), status: DiagStatus::Running, detail: clean.chars().take(70).collect() });
+                        }
                     }
                 }
                 // If we didn't parse exit code, use process exit status
@@ -1221,6 +1276,17 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             } else {
                 "no output — check npm/sudo permissions".into()
             };
+            // Resolve the "  npm" sub-step so it no longer shows as running
+            let npm_summary: String = if install_ok {
+                last_line.chars().take(60).collect()
+            } else {
+                fail_detail.clone()
+            };
+            let _ = tx.send(DiagStep {
+                label: "  npm".into(),
+                status: if install_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                detail: npm_summary,
+            });
             let _ = tx.send(DiagStep {
                 label: "Installing openclaw@latest".into(),
                 status: if install_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
@@ -1236,12 +1302,25 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let new_v = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw --version 2>/dev/null || echo '?'", pfx)).await;
             let _ = tx.send(DiagStep { label: "New version".into(), status: DiagStatus::Pass, detail: new_v.trim().to_string() });
 
-            // Step 4: restart gateway
+            // Step 4: restart gateway (try full path if openclaw not in PATH)
             let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Running, detail: String::new() });
-            let restart_msg = App::ssh_run(&host, &user, &self_ip, &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)).await;
-            let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Fixed, detail: restart_msg.trim().to_string() });
+            let restart_cmd = format!(
+                "{}openclaw gateway restart 2>&1 | tail -1 || ~/.npm-global/bin/openclaw gateway restart 2>&1 | tail -1 || systemctl --user restart openclaw-gateway 2>&1 | tail -1 || echo 'restart skipped - run manually'",
+                pfx
+            );
+            let restart_msg = App::ssh_run(&host, &user, &self_ip, &restart_cmd).await;
+            let restart_ok = !restart_msg.contains("skipped") && !restart_msg.is_empty();
+            let _ = tx.send(DiagStep {
+                label: "Restarting gateway".into(),
+                status: if restart_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
+                detail: restart_msg.trim().chars().take(70).collect(),
+            });
 
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
+            if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                let status = if install_ok { "completed" } else { "failed" };
+                let _ = db::complete_operation(pool, op_id, status, None).await;
+            }
         });
     }
 
@@ -1253,16 +1332,24 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let name = agent.db_name.clone();
         let location = agent.location.clone();
         let gw_port = agent.gateway_port;
+        let pool_opt = self.db_pool.clone();
         self.diag_active = true;
+        self.diag_task_running = true;
         self.diag_auto_fix = fix;
         self.diag_title = None;
         self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
         self.diag_steps = vec![DiagStep { label: format!("Diagnosing {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.diag_rx = Some(rx);
 
         tokio::spawn(async move {
+            let op_id = if let Some(ref pool) = pool_opt {
+                let op_type = if fix { "diagnostics_fix" } else { "diagnostics" };
+                db::create_operation(pool, &name, op_type).await.ok()
+            } else { None };
+
             let is_mac_check = Command::new("ssh").args([
                 "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), "uname -s"
@@ -1604,6 +1691,9 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
 
             if !ssh_ok {
                 let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cannot proceed without SSH — see details above".into() });
+                if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                    let _ = db::complete_operation(pool, op_id, "failed", Some("SSH unreachable")).await;
+                }
                 return;
             }
 
@@ -1772,8 +1862,10 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             }
 
             // Done
-            let passes = 7; // we'll count from received steps
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "diagnostic complete".into() });
+            if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                let _ = db::complete_operation(pool, op_id, "completed", None).await;
+            }
         });
     }
 
@@ -2032,14 +2124,8 @@ SAMEOF", path, path, escaped_content);
 
     fn check_alerts(&mut self) {
         let now = now_str();
-        let cpu_threshold = std::env::var("ALERT_CPU_THRESHOLD")
-            .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(90.0);
-        let ram_threshold = std::env::var("ALERT_RAM_THRESHOLD")
-            .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(90.0);
-        let alert_offline = std::env::var("ALERT_OFFLINE")
-            .map(|v| v != "false" && v != "0").unwrap_or(true);
         for a in &self.agents {
-            if alert_offline && a.status == AgentStatus::Offline && !a.last_seen.is_empty() {
+            if a.status == AgentStatus::Offline && !a.last_seen.is_empty() {
                 // Only alert if we haven't recently alerted for this agent
                 let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("offline"));
                 if !already {
@@ -2049,21 +2135,6 @@ SAMEOF", path, path, escaped_content);
                         severity: AlertSeverity::Critical,
                     });
                     self.alert_flash = Some(Instant::now());
-                    self.unread_alerts += 1;
-                }
-            }
-            if let Some(cpu) = a.cpu_pct {
-                if cpu > cpu_threshold {
-                    let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("CPU"));
-                    if !already {
-                        self.alerts.push(Alert {
-                            time: now.clone(), created_at: Instant::now(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
-                            message: format!("{} CPU at {:.0}%", a.name, cpu),
-                            severity: AlertSeverity::Warning,
-                        });
-                        self.alert_flash = Some(Instant::now());
-                        self.unread_alerts += 1;
-                    }
                 }
             }
             if let Some(disk) = a.disk_pct {
@@ -2076,12 +2147,11 @@ SAMEOF", path, path, escaped_content);
                             severity: AlertSeverity::Warning,
                         });
                         self.alert_flash = Some(Instant::now());
-                        self.unread_alerts += 1;
                     }
                 }
             }
             if let Some(ram) = a.ram_pct {
-                if ram > ram_threshold {
+                if ram > 90.0 {
                     let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("RAM"));
                     if !already {
                         self.alerts.push(Alert {
@@ -2090,7 +2160,6 @@ SAMEOF", path, path, escaped_content);
                             severity: AlertSeverity::Warning,
                         });
                         self.alert_flash = Some(Instant::now());
-                        self.unread_alerts += 1;
                     }
                 }
             }
@@ -2120,81 +2189,6 @@ SAMEOF", path, path, escaped_content);
             on, total, refresh, sel_info, alert_info, self.sort_mode.label(), chat_count,
             self.theme_name.label(), self.bg_density.label()
         );
-    }
-
-    /// Spawn an independent background task that probes fleet health every 60s
-    /// and sends `AppEvent::AgentAlert` events via channel regardless of TUI activity.
-    fn start_health_watch(&mut self) {
-        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
-        self.health_alert_rx = Some(rx);
-
-        let agents: Vec<(String, String, String)> = self.agents.iter()
-            .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone()))
-            .collect();
-        let self_ip = self.self_ip.clone();
-        let cpu_threshold = std::env::var("ALERT_CPU_THRESHOLD")
-            .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(90.0);
-        let ram_threshold = std::env::var("ALERT_RAM_THRESHOLD")
-            .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(90.0);
-        let alert_offline = std::env::var("ALERT_OFFLINE")
-            .map(|v| v != "false" && v != "0").unwrap_or(true);
-
-        tokio::spawn(async move {
-            let mut prev_statuses: std::collections::HashMap<String, AgentStatus> =
-                std::collections::HashMap::new();
-            // Track per-agent alerts that have already been sent to avoid redundant events.
-            let mut alerted_cpu: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut alerted_ram: std::collections::HashSet<String> = std::collections::HashSet::new();
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                // Probe all agents concurrently so that a slow agent does not delay others.
-                let probe_tx = tx.clone();
-                let (result_tx, mut result_rx) = mpsc::unbounded_channel::<(String, AgentStatus, Option<f32>, Option<f32>)>();
-                for (db_name, host, user) in &agents {
-                    let rtx = result_tx.clone();
-                    let (n, h, u, sip) = (db_name.clone(), host.clone(), user.clone(), self_ip.clone());
-                    tokio::spawn(async move {
-                        let (status, _, _, _, _, cpu, ram, _, _, _) =
-                            probe_agent(&h, &u, &sip, false).await;
-                        let _ = rtx.send((n, status, cpu, ram));
-                    });
-                }
-                drop(result_tx); // close the sender side so the channel drains
-                while let Some((db_name, status, cpu, ram)) = result_rx.recv().await {
-                    // Detect Online/Busy → Offline transition
-                    if alert_offline {
-                        let was_up = prev_statuses.get(db_name.as_str())
-                            .map(|s| matches!(s, AgentStatus::Online | AgentStatus::Busy))
-                            .unwrap_or(false);
-                        if was_up && matches!(status, AgentStatus::Offline) {
-                            let _ = probe_tx.send(AppEvent::AgentAlert(
-                                db_name.clone(), "went offline".into()));
-                        }
-                    }
-                    if let Some(p) = cpu {
-                        if p > cpu_threshold {
-                            if alerted_cpu.insert(db_name.clone()) {
-                                let _ = probe_tx.send(AppEvent::AgentAlert(
-                                    db_name.clone(), format!("CPU at {:.0}%", p)));
-                            }
-                        } else {
-                            alerted_cpu.remove(&db_name);
-                        }
-                    }
-                    if let Some(p) = ram {
-                        if p > ram_threshold {
-                            if alerted_ram.insert(db_name.clone()) {
-                                let _ = probe_tx.send(AppEvent::AgentAlert(
-                                    db_name.clone(), format!("RAM at {:.0}%", p)));
-                            }
-                        } else {
-                            alerted_ram.remove(&db_name);
-                        }
-                    }
-                    prev_statuses.insert(db_name, status);
-                }
-            }
-        });
     }
 }
 
@@ -2765,10 +2759,14 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         Span::styled(if live { "● live" } else { "○ stale" }, Style::default().fg(if live { t.status_online } else { t.status_offline })),
         Span::raw("    "),
         Span::styled(if app.refreshing { "⟳ refreshing" } else { "" }, Style::default().fg(t.accent)),
-        if app.unread_alerts > 0 {
-            Span::styled(format!("  ⚠ {}", app.unread_alerts), Style::default().fg(t.status_offline).bold())
-        } else if app.alert_flash.map(|f| f.elapsed() < Duration::from_secs(5)).unwrap_or(false) {
+        if app.alert_flash.map(|f| f.elapsed() < Duration::from_secs(5)).unwrap_or(false) {
             Span::styled("  ⚠️ NEW ALERT", Style::default().fg(t.status_offline).bold())
+        } else { Span::raw("") },
+        if !app.interrupted_ops.is_empty() {
+            Span::styled(
+                format!("  ⚠ {} interrupted op(s)", app.interrupted_ops.len()),
+                Style::default().fg(t.status_busy).bold(),
+            )
         } else { Span::raw("") },
         Span::raw("    "),
         Span::styled(chrono_now(), Style::default().fg(t.text_dim)),
@@ -3251,6 +3249,7 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
     }
 
     let diag = Paragraph::new(lines)
+        .scroll((app.diag_overlay_scroll, 0))
         .block(Block::default()
             .title(Span::styled(title, Style::default().fg(t.accent).bold()))
             .borders(Borders::ALL).border_type(BorderType::Double)
@@ -4232,47 +4231,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(fleet_config).await;
     app.update_status_bar();
-    app.start_health_watch();
 
     loop {
-        // Drain health watch events (background proactive monitoring)
-        {
-            let mut events = vec![];
-            if let Some(ref mut rx) = app.health_alert_rx {
-                while let Ok(ev) = rx.try_recv() { events.push(ev); }
-            }
-            for AppEvent::AgentAlert(db_name, reason) in events {
-                let (name, emoji) = app.agents.iter()
-                    .find(|a| a.db_name == db_name)
-                    .map(|a| (a.name.clone(), a.emoji.clone()))
-                    .unwrap_or_else(|| (db_name.clone(), "🤖".into()));
-                let severity = if reason.contains("offline") {
-                    AlertSeverity::Critical
-                } else {
-                    AlertSeverity::Warning
-                };
-                let already = app.alerts.iter()
-                    .any(|al| al.agent == db_name && al.message.contains(reason.as_str()));
-                if !already {
-                    if severity == AlertSeverity::Critical {
-                        // Terminal bell to alert operator even when TUI is idle
-                        use std::io::Write;
-                        print!("\x07");
-                        let _ = std::io::stdout().flush();
-                    }
-                    app.alerts.push(Alert {
-                        time: now_str(), created_at: Instant::now(),
-                        agent: db_name, emoji,
-                        message: format!("{} {}", name, reason),
-                        severity,
-                    });
-                    app.alert_flash = Some(Instant::now());
-                    app.unread_alerts += 1;
-                    app.update_status_bar();
-                }
-            }
-        }
-
         // Drain background probe results (non-blocking)
         let updates = app.drain_refresh_results();
         if !updates.is_empty() {
@@ -4522,6 +4482,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.diag_rx = None;
                                 app.diag_start = None;
                                 app.start_refresh(); // re-probe after fix
+                            }
+                            KeyCode::PageUp => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_sub(5);
+                            }
+                            KeyCode::PageDown => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_add(5);
+                            }
+                            KeyCode::Up => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                app.diag_overlay_scroll = app.diag_overlay_scroll.saturating_add(1);
                             }
                             _ => {}
                         }
@@ -4992,6 +4964,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 let self_ip = app.self_ip.clone();
                                                 let latest = latest.clone();
                                                 tokio::spawn(async move {
+                                                    let op_id = db::create_operation(&pool, &db_name, "bulk_update").await.ok();
                                                     let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
                                                     let cmd = format!("{}openclaw --version 2>/dev/null && sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1", pfx);
                                                     let output = if host == "localhost" || host == self_ip {
@@ -5005,6 +4978,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                 .output()
                                                         ).await.ok().and_then(|r| r.ok())
                                                     };
+                                                    let timed_out = output.is_none();
                                                     let response = output.map(|o| {
                                                         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                                                         if s.is_empty() { "(no output)".into() } else { s.chars().take(500).collect::<String>() }
@@ -5017,6 +4991,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                             "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
                                                             (&response, &sender, &db_name),
                                                         ).await;
+                                                    }
+                                                    if let Some(op_id) = op_id {
+                                                        let status = if timed_out { "failed" } else { "completed" };
+                                                        let _ = db::complete_operation(&pool, op_id, status, Some(&response)).await;
                                                     }
                                                 });
                                             }
@@ -5097,7 +5075,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('w') => {
                                     app.screen = Screen::Alerts;
                                     app.alerts_scroll = 0;
-                                    app.unread_alerts = 0;
                                 }
                                 KeyCode::Char('v') => {
                                     app.screen = Screen::VpnStatus;
@@ -5255,7 +5232,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let is_done = step.label == "DONE";
                     app.diag_steps.push(step);
                     if is_done {
-                        // Keep overlay open for user to see results
+                        // Mark task as no longer running (overlay stays open for user to read)
+                        app.diag_task_running = false;
                     }
                 }
             }
@@ -5396,7 +5374,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if app.should_quit { break; }
+        if app.should_quit {
+            // On clean exit: wait up to 3s for any active operation to complete
+            if app.diag_task_running {
+                let wait_start = std::time::Instant::now();
+                while app.diag_task_running && wait_start.elapsed() < Duration::from_secs(3) {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    if let Some(ref mut rx) = app.diag_rx {
+                        while let Ok(step) = rx.try_recv() {
+                            if step.label == "DONE" { app.diag_task_running = false; }
+                            app.diag_steps.push(step);
+                        }
+                    }
+                }
+            }
+            break;
+        }
     }
 
     if let Some(pool) = app.db_pool.take() { pool.disconnect().await?; }
