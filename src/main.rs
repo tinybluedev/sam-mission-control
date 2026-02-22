@@ -1272,12 +1272,12 @@ impl App {
 
                                     let ts_restart_cmd = if is_mac_target {
                                         // macOS: use the Tailscale CLI to bring it up
-                                        "sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || /usr/local/bin/tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || echo FAIL"
+                                        &format!("sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --hostname={} --reset --timeout=25s 2>&1 || /usr/local/bin/tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --hostname={} --reset --timeout=25s 2>&1 || echo FAIL", name, name)
                                     } else {
-                                        "sudo systemctl restart tailscaled && sleep 2 && sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || echo FAIL"
+                                        &format!("sudo systemctl restart tailscaled && sleep 2 && sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --hostname={} --reset --timeout=25s 2>&1 || echo FAIL", name)
                                     };
 
-                                    let ts_result = tokio::time::timeout(Duration::from_secs(30),
+                                    let ts_result = tokio::time::timeout(Duration::from_secs(40),
                                         Command::new("ssh").args(["-o","ConnectTimeout=3","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                                             &format!("{}@{}", user, lip), ts_restart_cmd]).output()
                                     ).await.ok().and_then(|r| r.ok());
@@ -1361,7 +1361,7 @@ impl App {
                                         let _ = tx.send(DiagStep { label: "  → SSH via alias".into(), status: DiagStatus::Pass, detail: "connected!".into() });
                                         // Restart Tailscale via alias
                                         let _ = tx.send(DiagStep { label: "  → Restart Tailscale".into(), status: DiagStatus::Running, detail: "bringing Tailscale back up...".into() });
-                                        let ts_cmd = "sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || sudo systemctl restart tailscaled && sleep 2 && sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || echo FAIL";
+                                        let ts_cmd = &format!("sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --hostname={} --reset --timeout=25s 2>&1 || sudo systemctl restart tailscaled && sleep 2 && sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --hostname={} --reset --timeout=25s 2>&1 || echo FAIL", name, name);
                                         let ts_result = tokio::time::timeout(Duration::from_secs(30),
                                             Command::new("ssh").args(["-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                                                 &name, ts_cmd]).output()
@@ -1487,9 +1487,9 @@ impl App {
             if !ts_ok && fix {
                 let _ = tx.send(DiagStep { label: "Tailscale".into(), status: DiagStatus::Running, detail: "restarting Tailscale...".into() });
                 let ts_fix_cmd = if is_mac {
-                    format!("{}sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || echo FAIL", pfx)
+                    format!("{}sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --hostname={} --reset --timeout=25s 2>&1 || echo FAIL", pfx, name)
                 } else {
-                    "sudo systemctl restart tailscaled 2>/dev/null; sleep 2; sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || echo FAIL".into()
+                    format!("sudo systemctl restart tailscaled 2>/dev/null; sleep 2; sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --hostname={} --reset --timeout=25s 2>&1 || echo FAIL", name)
                 };
                 let ts_fix = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), &ts_fix_cmd]).output().await;
