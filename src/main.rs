@@ -54,6 +54,9 @@ struct Agent {
     disk_pct: Option<f32>,
     gateway_port: i32,
     gateway_token: Option<String>,
+    uptime_seconds: i64,
+    #[serde(skip)]
+    last_probe_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -194,6 +197,30 @@ fn format_last_seen(dt: &str) -> String {
     }
 }
 
+fn format_since(instant: Option<std::time::Instant>) -> String {
+    match instant {
+        None => "—".into(),
+        Some(i) => {
+            let secs = i.elapsed().as_secs();
+            if secs < 60 { format!("{}s", secs) }
+            else if secs < 3600 { format!("{}m", secs / 60) }
+            else { format!("{}h", secs / 3600) }
+        }
+    }
+}
+
+fn last_seen_color(instant: Option<std::time::Instant>, t: &Theme) -> Color {
+    match instant {
+        None => t.text_dim,
+        Some(i) => {
+            let secs = i.elapsed().as_secs();
+            if secs < 300 { t.status_online }
+            else if secs < 1800 { t.status_busy }
+            else { t.status_offline }
+        }
+    }
+}
+
 fn ping_color(latency: Option<u32>) -> ratatui::style::Color {
     match latency {
         Some(ms) if ms < 100 => ratatui::style::Color::Green,
@@ -304,6 +331,8 @@ impl App {
                         cpu_pct: None, ram_pct: None, disk_pct: None,
                         gateway_port: da.gateway_port,
                         gateway_token: da.gateway_token.clone(),
+                        uptime_seconds: da.uptime_seconds,
+                        last_probe_at: None,
                     });
                 }
             }
@@ -596,6 +625,7 @@ impl App {
                     self.agents[r.index].ram_pct = r.ram_pct;
                     self.agents[r.index].disk_pct = r.disk_pct;
                     self.agents[r.index].last_seen = now_str();
+                    self.agents[r.index].last_probe_at = Some(Instant::now());
                     updates.push((r.index, r.status, r.os, r.kernel, r.oc_version, r.latency_ms));
                 }
             }
@@ -1077,6 +1107,9 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
     let online = app.agents.iter().filter(|a| a.status == AgentStatus::Online).count();
     let total = app.agents.len();
     let live = app.last_refresh.elapsed() < Duration::from_secs(60);
+    let total_tokens: i32 = app.agents.iter().map(|a| a.token_burn).sum();
+    let health_pct = if total > 0 { online * 100 / total } else { 0 };
+    let health_color = if health_pct >= 80 { t.status_online } else if health_pct >= 50 { t.status_busy } else { t.status_offline };
 
     let header = Paragraph::new(Line::from(vec![
         Span::raw("  "),
@@ -1085,13 +1118,16 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         Span::styled(format!("{}", online), Style::default().fg(t.status_online).bold()),
         Span::styled(format!("/{} agents", total), Style::default().fg(t.text_dim)),
         Span::raw("    "),
+        Span::styled(format!("{}% healthy", health_pct), Style::default().fg(health_color)),
+        Span::raw("    "),
+        Span::styled(format!("{}tok", total_tokens), Style::default().fg(t.text_dim)),
+        Span::raw("    "),
         Span::styled(if live { "● live" } else { "○ stale" }, Style::default().fg(if live { t.status_online } else { t.status_offline })),
         Span::raw("    "),
         Span::styled(if app.refreshing { "⟳ refreshing" } else { "" }, Style::default().fg(t.accent)),
         if app.alert_flash.map(|f| f.elapsed() < Duration::from_secs(5)).unwrap_or(false) {
             Span::styled("  ⚠️ NEW ALERT", Style::default().fg(t.status_offline).bold())
         } else { Span::raw("") },
-        Span::raw("    "),
         Span::raw("    "),
         Span::styled(chrono_now(), Style::default().fg(t.text_dim)),
         Span::raw("    "),
@@ -1146,12 +1182,16 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     let show_latency = area.width > 70;
     let show_resources = area.width > 120;
     let show_ip = area.width > 85;
+    // Last Seen is shown in the 101-120 col range; at >120 the CPU/RAM/Disk resource columns take precedence
+    let show_last_seen = area.width > 100 && !show_resources;
     let hcells_vec: Vec<&str> = if show_resources {
-        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "CPU", "RAM", "Disk", "Version"]
+        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "Uptime", "CPU", "RAM", "Disk", "Version"]
+    } else if show_last_seen {
+        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "Uptime", "Last", "Version"]
     } else if show_ip && show_latency {
-        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "Version"]
+        vec!["  ", "Agent", "IP", "Location", "Status", "Ping", "Uptime", "Version"]
     } else if show_latency {
-        vec!["  ", "Agent", "Location", "Status", "Ping", "Version"]
+        vec!["  ", "Agent", "Location", "Status", "Ping", "Uptime", "Version"]
     } else {
         vec!["  ", "Agent", "Location", "Status", "Version"]
     };
@@ -1193,6 +1233,10 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
         ]);
         if show_latency {
             cells.push(Cell::from(lat_str).style(Style::default().fg(lat_color)));
+            cells.push(Cell::from(format_uptime(a.uptime_seconds)).style(Style::default().fg(t.text_dim)));
+        }
+        if show_last_seen {
+            cells.push(Cell::from(format_since(a.last_probe_at)).style(Style::default().fg(last_seen_color(a.last_probe_at, t))));
         }
         if show_resources {
             cells.push(Cell::from(mini_bar(a.cpu_pct, 4)).style(Style::default().fg(mini_bar_color(a.cpu_pct, t, 70.0, 90.0))));
@@ -1205,17 +1249,16 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
 
     app.fleet_row_start_y = area.y + 1; // +1 for border, +1 for header handled in click calc
 
-    let show_version = area.width > 55;
-    let widths = if show_resources && show_version {
-        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Length(8), Constraint::Length(8), Constraint::Min(12)]
-    } else if show_ip && show_latency && show_version {
-        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Min(12)]
-    } else if show_latency && show_version {
-        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Min(12)]
-    } else if show_version {
-        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Length(12), Constraint::Min(12)]
+    let widths = if show_resources {
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Length(8), Constraint::Length(8), Constraint::Length(8), Constraint::Min(10)]
+    } else if show_last_seen {
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Length(8), Constraint::Min(10)]
+    } else if show_ip && show_latency {
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(13), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Min(10)]
+    } else if show_latency {
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Min(10)]
     } else {
-        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Min(12), Constraint::Length(0)]
+        vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Length(12), Constraint::Min(10)]
     };
     let fleet_title = if app.filter_active {
         format!(" ◆── Fleet 🔍 {} ──◆ ", app.filter_text)
@@ -2065,6 +2108,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         cpu_pct: None, ram_pct: None, disk_pct: None,
                                         gateway_port: 18789,
                                         gateway_token: None,
+                                        uptime_seconds: 0,
+                                        last_probe_at: None,
                                     });
                                     app.wizard.active = false;
                                     app.status_message = format!("✅ Agent '{}' created", app.wizard.agent_name);
