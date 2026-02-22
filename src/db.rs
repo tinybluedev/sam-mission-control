@@ -682,33 +682,34 @@ pub async fn complete_operation(pool: &Pool, id: i64, status: &str, output: Opti
 }
 
 fn compute_audit_payload(prev_hash: &str, actor: &str, action: &str, target: &str, detail: &str) -> String {
-    format!("{}|{}|{}|{}|{}", prev_hash, actor, action, target, detail)
+    serde_json::json!({
+        "prev_hash": prev_hash,
+        "actor": actor,
+        "action": action,
+        "target": target,
+        "detail": detail,
+    }).to_string()
 }
 
 /// Append an immutable audit row with hash chaining for tamper-evidence.
-/// Returns the inserted row hash.
 pub async fn append_audit_log(
     pool: &Pool,
     actor: &str,
     action: &str,
     target: &str,
     detail: &str,
-) -> Result<String, mysql_async::Error> {
+) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let prev_hash = conn
         .query_first::<String, _>("SELECT entry_hash FROM mc_audit_log ORDER BY id DESC LIMIT 1")
         .await?
         .unwrap_or_default();
     let payload = compute_audit_payload(&prev_hash, actor, action, target, detail);
-    let entry_hash = conn
-        .exec_first::<String, _, _>("SELECT LOWER(SHA2(?, 256))", (payload,))
-        .await?
-        .unwrap_or_default();
     conn.exec_drop(
-        "INSERT INTO mc_audit_log (actor, action, target, detail, prev_hash, entry_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())",
-        (actor, action, target, detail, prev_hash, entry_hash.clone()),
+        "INSERT INTO mc_audit_log (actor, action, target, detail, prev_hash, entry_hash, created_at) VALUES (?, ?, ?, ?, ?, LOWER(SHA2(?, 256)), NOW())",
+        (actor, action, target, detail, prev_hash, payload),
     ).await?;
-    Ok(entry_hash)
+    Ok(())
 }
 
 /// Mark all `running` operations that started more than 5 minutes ago as `interrupted`.

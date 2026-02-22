@@ -200,7 +200,7 @@ struct AuditResult {
     ok: bool,
     action: String,
     target: String,
-    hash: Option<String>,
+    error: Option<String>,
 }
 
 
@@ -502,10 +502,13 @@ impl App {
         tokio::spawn(async move {
             while let Some(evt) = audit_input_rx.recv().await {
                 let result = db::append_audit_log(&audit_pool, &evt.actor, &evt.action, &evt.target, &evt.detail).await;
-                let _ = match result {
-                    Ok(hash) => audit_result_tx.send(AuditResult { ok: true, action: evt.action, target: evt.target, hash: Some(hash) }),
-                    Err(_) => audit_result_tx.send(AuditResult { ok: false, action: evt.action, target: evt.target, hash: None }),
+                let send_result = match result {
+                    Ok(()) => audit_result_tx.send(AuditResult { ok: true, action: evt.action, target: evt.target, error: None }),
+                    Err(e) => audit_result_tx.send(AuditResult { ok: false, action: evt.action, target: evt.target, error: Some(db::sanitize_error(&e.to_string())) }),
                 };
+                if let Err(e) = send_result {
+                    eprintln!("audit result channel send failed: {}", e);
+                }
             }
         });
 
@@ -574,7 +577,7 @@ impl App {
             actor: self.user(),
             action: action.to_string(),
             target: target.to_string(),
-            detail: detail.chars().take(300).collect(),
+            detail: detail.chars().take(MAX_AUDIT_DETAIL_LENGTH).collect(),
         };
         if self.audit_tx.send(evt).is_ok() {
             self.audit_pending += 1;
@@ -2769,6 +2772,8 @@ const LINES_PER_MSG_EST: usize = 3;
 const SPINNER_FRAME_MS: u64 = 100;
 /// Input poll interval in milliseconds. Lower values improve key/menu responsiveness.
 const INPUT_POLL_MS: u64 = 10;
+/// Keep audit details concise in footer/status UX while preserving action context.
+const MAX_AUDIT_DETAIL_LENGTH: usize = 300;
 
 fn fmt_hhmm(t: &str) -> String {
     t.chars().take(5).collect()
@@ -6055,10 +6060,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok(result) = rx.try_recv() {
                 app.audit_pending = app.audit_pending.saturating_sub(1);
                 app.audit_last = if result.ok {
-                    let short = result.hash.unwrap_or_default().chars().take(10).collect::<String>();
-                    format!("🧾 {} {} #{}", result.action, result.target, short)
+                    format!("🧾 {} {}", result.action, result.target)
                 } else {
-                    format!("🧾 {} {} (write failed)", result.action, result.target)
+                    format!(
+                        "🧾 {} {} (write failed: {})",
+                        result.action,
+                        result.target,
+                        result.error.unwrap_or_else(|| "unknown".into())
+                    )
                 };
             }
         }
