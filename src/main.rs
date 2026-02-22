@@ -4756,7 +4756,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('U') => {
-                                    // Update OC on single highlighted agent with feedback
+                                    // Update OC on single agent — streaming output to chat
                                     if let Some(agent) = app.agents.get(app.selected) {
                                         let host = agent.host.clone();
                                         let user = agent.ssh_user.clone();
@@ -4769,30 +4769,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             let pool = pool.clone();
                                             let sender = app.user();
                                             tokio::spawn(async move {
+                                                // Create the chat message first (pending)
+                                                let msg_id = crate::db::send_direct(&pool, &sender, &db_name, &format!("🔄 Updating OpenClaw on {}...", name)).await.unwrap_or(0);
+                                                let _ = crate::db::update_chat_status(&pool, msg_id, "streaming").await;
+
                                                 let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-                                                let cmd = format!("{}echo '=== Before ===' && openclaw --version 2>/dev/null && echo '=== Updating ===' && sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '=== After ===' && openclaw --version 2>/dev/null && echo '=== Restarting Gateway ===' && openclaw gateway restart 2>&1 | tail -1 || echo 'gateway restart skipped'", pfx);
-                                                let output = if host == "localhost" || host == self_ip {
-                                                    tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                                                // Use script with clear phase markers for streaming
+                                                let cmd = format!(
+                                                    "{}echo '📋 Current version:' && openclaw --version 2>/dev/null || echo '(not installed)' &&                                                     echo '' && echo '⬇️  Installing openclaw@latest...' &&                                                     sudo npm install -g openclaw@latest 2>&1 &&                                                     echo '' && echo '✅ New version:' && openclaw --version 2>/dev/null &&                                                     echo '' && echo '🔄 Restarting gateway...' &&                                                     (openclaw gateway restart 2>&1 || echo 'gateway restart skipped') &&                                                     echo '' && echo '🏁 Update complete!'", pfx);
+
+                                                use tokio::io::AsyncBufReadExt;
+                                                let mut child = if host == "localhost" || host == self_ip {
+                                                    tokio::process::Command::new("bash")
+                                                        .args(["-c", &cmd])
+                                                        .stdout(std::process::Stdio::piped())
+                                                        .stderr(std::process::Stdio::piped())
+                                                        .spawn()
                                                 } else {
-                                                    tokio::time::timeout(
-                                                        std::time::Duration::from_secs(120),
-                                                        tokio::process::Command::new("ssh")
-                                                            .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                                                &format!("{}@{}", user, host), &cmd])
-                                                            .output()
-                                                    ).await.ok().and_then(|r| r.ok())
+                                                    tokio::process::Command::new("ssh")
+                                                        .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes","-tt",
+                                                            &format!("{}@{}", user, host), &cmd])
+                                                        .stdout(std::process::Stdio::piped())
+                                                        .stderr(std::process::Stdio::piped())
+                                                        .spawn()
                                                 };
-                                                let response = output.map(|o| {
-                                                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                                                    if s.is_empty() { "(no output)".into() } else { s.chars().take(1500).collect::<String>() }
-                                                }).unwrap_or_else(|| "Timeout — update may still be running".into());
-                                                let _ = crate::db::send_direct(&pool, &sender, &db_name, "🔄 openclaw update").await;
-                                                if let Ok(mut conn) = pool.get_conn().await {
-                                                    use mysql_async::prelude::*;
-                                                    let _ = conn.exec_drop(
-                                                        "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
-                                                        (&response, &sender, &db_name),
-                                                    ).await;
+
+                                                match child {
+                                                    Ok(mut child) => {
+                                                        let stdout = child.stdout.take();
+                                                        let mut full_output = String::new();
+                                                        let mut last_write = std::time::Instant::now();
+
+                                                        if let Some(stdout) = stdout {
+                                                            let mut reader = tokio::io::BufReader::new(stdout).lines();
+                                                            while let Ok(Some(line)) = reader.next_line().await {
+                                                                if !full_output.is_empty() { full_output.push('\n'); }
+                                                                full_output.push_str(&line);
+                                                                // Write partial update every 500ms
+                                                                if last_write.elapsed() > std::time::Duration::from_millis(500) {
+                                                                    let _ = crate::db::update_chat_partial(&pool, msg_id, &full_output).await;
+                                                                    last_write = std::time::Instant::now();
+                                                                }
+                                                            }
+                                                        }
+
+                                                        let _ = child.wait().await;
+                                                        if full_output.is_empty() { full_output = "(no output)".into(); }
+                                                        let _ = crate::db::respond_to_chat(&pool, msg_id, &full_output).await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = crate::db::respond_to_chat(&pool, msg_id, &format!("Failed to spawn: {}", e)).await;
+                                                    }
                                                 }
                                             });
                                         }
