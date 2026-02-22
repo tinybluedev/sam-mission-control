@@ -2,6 +2,45 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// ── ANSI Color Helpers ──────────────────────────────────────────
+fn c_cyan(s: &str) -> String { format!("\x1b[36m{}\x1b[0m", s) }
+fn c_green(s: &str) -> String { format!("\x1b[32m{}\x1b[0m", s) }
+fn c_red(s: &str) -> String { format!("\x1b[31m{}\x1b[0m", s) }
+fn c_yellow(s: &str) -> String { format!("\x1b[33m{}\x1b[0m", s) }
+fn c_magenta(s: &str) -> String { format!("\x1b[35m{}\x1b[0m", s) }
+fn c_bold(s: &str) -> String { format!("\x1b[1m{}\x1b[0m", s) }
+fn c_dim(s: &str) -> String { format!("\x1b[2m{}\x1b[0m", s) }
+fn c_bold_cyan(s: &str) -> String { format!("\x1b[1;36m{}\x1b[0m", s) }
+fn c_bold_green(s: &str) -> String { format!("\x1b[1;32m{}\x1b[0m", s) }
+fn c_bold_red(s: &str) -> String { format!("\x1b[1;31m{}\x1b[0m", s) }
+fn c_bold_yellow(s: &str) -> String { format!("\x1b[1;33m{}\x1b[0m", s) }
+fn c_bold_magenta(s: &str) -> String { format!("\x1b[1;35m{}\x1b[0m", s) }
+fn c_bg_green(s: &str) -> String { format!("\x1b[42;30m {}  \x1b[0m", s) }
+fn c_bg_red(s: &str) -> String { format!("\x1b[41;37m {}  \x1b[0m", s) }
+fn c_bg_cyan(s: &str) -> String { format!("\x1b[46;30m {}  \x1b[0m", s) }
+
+const BANNER: &str = r#"
+
+    ____    _    __  __
+   / ___|  / \  |  \/  |
+   \___ \ / _ \ | |\/| |
+    ___) / ___ \| |  | |
+   |____/_/   \_\_|  |_|  MISSION CONTROL
+   "#;
+
+fn print_banner() {
+    println!("\x1b[36m{}\x1b[0m", BANNER);
+}
+
+fn print_divider() {
+    println!("   {}",c_dim("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+}
+
+fn print_step(n: usize, total: usize, msg: &str) {
+    print!("   {} {} ", c_bold_cyan(&format!("[{}/{}]", n, total)), msg);
+}
+
+
 #[derive(Parser)]
 #[command(name = "sam", version, about = "S.A.M Mission Control — Fleet orchestration TUI")]
 pub struct Cli {
@@ -346,30 +385,39 @@ pub async fn print_status() -> Result<(), Box<dyn std::error::Error>> {
     let pool = crate::db::get_pool();
     let agents = crate::db::load_fleet(&pool).await?;
 
-    println!("\n🛰️  S.A.M Fleet Status");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("{:<20} {:<12} {:<16} {}", "Agent", "Status", "Version", "IP");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    print_banner();
+    println!();
+    print_divider();
+    println!("   {:<22} {:<14} {:<18} {}", c_bold("Agent"), c_bold("Status"), c_bold("Version"), c_bold("IP"));
+    print_divider();
 
     let mut online = 0;
     for a in &agents {
-        let icon = match a.status.as_str() {
-            "online" => { online += 1; "●" },
-            "busy" => { online += 1; "◉" },
-            "offline" | "error" => "○",
-            _ => "?",
+        let (icon, status_str) = match a.status.as_str() {
+            "online" => { online += 1; (c_green("●"), c_green("online")) },
+            "busy" => { online += 1; (c_yellow("◉"), c_yellow("busy")) },
+            "offline" => (c_red("○"), c_red("offline")),
+            "error" => (c_bold_red("✖"), c_bold_red("error")),
+            _ => (c_dim("?"), c_dim("unknown")),
         };
-        println!("{:<20} {} {:<9} {:<16} {}",
-            a.agent_name,
+        let ver = a.oc_version.as_deref().unwrap_or("?");
+        let ver_str = if ver.starts_with("2026.2.21") { c_green(ver) } else if ver == "?" { c_dim(ver) } else { c_yellow(ver) };
+        println!("   {:<20} {} {:<22} {:<26} {}",
+            c_cyan(&a.agent_name),
             icon,
-            a.status,
-            a.oc_version.as_deref().unwrap_or("?"),
-            a.tailscale_ip.as_deref().unwrap_or("?"),
+            status_str,
+            ver_str,
+            c_dim(a.tailscale_ip.as_deref().unwrap_or("?")),
         );
     }
 
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("{}/{} online\n", online, agents.len());
+    print_divider();
+    let summary = if online == agents.len() {
+        c_bold_green(&format!("   ✔ {}/{} online — all systems nominal", online, agents.len()))
+    } else {
+        c_bold_yellow(&format!("   ⚠ {}/{} online — {} offline", online, agents.len(), agents.len() - online))
+    };
+    println!("{}\n", summary);
 
     pool.disconnect().await?;
     Ok(())
@@ -655,8 +703,9 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
     use mysql_async::prelude::*;
     use std::io::{self, Write};
 
-    println!("\n🛰️  S.A.M Mission Control — Setup");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+        println!("\n   {} {}\n", c_bold_cyan("🩺"), c_bold("Fleet Doctor"));
+    print_divider();
+    println!();
 
     let prompt = |label: &str, default: &str| -> String {
         print!("  {} [{}]: ", label, default);
@@ -807,8 +856,7 @@ fn whoami() -> Option<String> {
 pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::process::Command;
 
-    println!("\n🩺 S.A.M Mission Control — Doctor");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    print_banner();
 
     let pool = crate::db::get_pool();
     let agents = crate::db::load_fleet(&pool).await?;
