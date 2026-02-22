@@ -24,6 +24,15 @@ pub enum Commands {
         /// Message to send
         message: Vec<String>,
     },
+    /// Diagnose and auto-fix fleet issues
+    Doctor {
+        /// Auto-fix issues (don't just report)
+        #[arg(long)]
+        fix: bool,
+        /// Check specific agent only
+        #[arg(short, long)]
+        agent: Option<String>,
+    },
     /// Full automated setup (DB tables, config, everything)
     Init {
         /// MySQL host
@@ -791,4 +800,191 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
 fn whoami() -> Option<String> {
     std::process::Command::new("whoami").output().ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+
+/// Diagnose and auto-fix fleet issues
+pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::process::Command;
+
+    println!("\n🩺 S.A.M Mission Control — Doctor");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+    let pool = crate::db::get_pool();
+    let agents = crate::db::load_fleet(&pool).await?;
+
+    let targets: Vec<&crate::db::DbAgent> = if let Some(name) = agent_filter {
+        agents.iter().filter(|a| a.agent_name.contains(name)).collect()
+    } else {
+        agents.iter().collect()
+    };
+
+    let mut issues = 0;
+    let mut fixed = 0;
+
+    for agent in &targets {
+        let name = &agent.agent_name;
+        let ip = agent.tailscale_ip.as_deref().unwrap_or("?");
+        let user = if name == "almalinux9" { "nick" } else { "papasmurf" };
+        let is_mac = agent.os_info.as_deref().unwrap_or("").to_lowercase().contains("mac");
+        let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+
+        println!("  🔍 {} ({})", name, ip);
+
+        // Check 1: SSH connectivity
+        let ssh_ok = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Command::new("ssh").args([
+                "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                &format!("{}@{}", user, ip), "echo ok"
+            ]).output()
+        ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+
+        if !ssh_ok {
+            println!("     ❌ SSH unreachable — skipping");
+            issues += 1;
+            continue;
+        }
+        println!("     ✅ SSH");
+
+        // Check 2: OpenClaw installed
+        let oc_out = Command::new("ssh").args([
+            "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+            &format!("{}@{}", user, ip),
+            &format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx)
+        ]).output().await.ok();
+        let oc_version = oc_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        if oc_version.contains("NOT_INSTALLED") || oc_version.is_empty() {
+            println!("     ❌ OpenClaw not installed");
+            issues += 1;
+            if fix {
+                print!("        🔧 Installing... ");
+                let cmd = if is_mac { format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx) }
+                          else { "sudo npm install -g openclaw@latest 2>&1 | tail -1".into() };
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(120),
+                    Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                        &format!("{}@{}", user, ip), &cmd]).output()).await;
+                println!("done");
+                fixed += 1;
+            }
+        } else {
+            println!("     ✅ OpenClaw {}", oc_version);
+        }
+
+        // Check 3: Gateway running
+        let gw_out = Command::new("ssh").args([
+            "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+            &format!("{}@{}", user, ip), "ss -tlnp 2>/dev/null | grep 18789 | head -1"
+        ]).output().await.ok();
+        let gw_line = gw_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        if gw_line.is_empty() {
+            println!("     ❌ Gateway not running");
+            issues += 1;
+            if fix {
+                print!("        🔧 Starting gateway... ");
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(15),
+                    Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                        &format!("{}@{}", user, ip),
+                        &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)]).output()).await;
+                println!("done");
+                fixed += 1;
+            }
+        } else {
+            let binding = if gw_line.contains("0.0.0.0") { "0.0.0.0 ✅" } else { "localhost ⚠️" };
+            println!("     ✅ Gateway running ({})", binding);
+
+            // Check 3b: Binding
+            if !gw_line.contains("0.0.0.0") {
+                println!("     ❌ Gateway bound to localhost (needs bind=lan)");
+                issues += 1;
+                if fix {
+                    print!("        🔧 Setting bind=lan... ");
+                    let _ = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                        &format!("{}@{}", user, ip),
+                        "python3 -c \"import json,os;p=os.path.expanduser('~/.openclaw/openclaw.json');c=json.load(open(p));c.setdefault('gateway',{})['bind']='lan';json.dump(c,open(p,'w'),indent=2);print('ok')\""
+                    ]).output().await;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(15),
+                        Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                            &format!("{}@{}", user, ip),
+                            &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)]).output()).await;
+                    println!("done");
+                    fixed += 1;
+                }
+            }
+        }
+
+        // Check 4: chatCompletions enabled
+        let cc_out = Command::new("ssh").args([
+            "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+            &format!("{}@{}", user, ip),
+            "python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{}).get('http',{}).get('endpoints',{}).get('chatCompletions',{}).get('enabled',False))\""
+        ]).output().await.ok();
+        let cc_enabled = cc_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        if cc_enabled != "True" {
+            println!("     ❌ chatCompletions not enabled");
+            issues += 1;
+            if fix {
+                print!("        🔧 Enabling chatCompletions... ");
+                let _ = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                    &format!("{}@{}", user, ip),
+                    "python3 -c \"import json,os;p=os.path.expanduser('~/.openclaw/openclaw.json');c=json.load(open(p));gw=c.setdefault('gateway',{});h=gw.setdefault('http',{});e=h.setdefault('endpoints',{});e['chatCompletions']={'enabled':True};json.dump(c,open(p,'w'),indent=2);print('ok')\""
+                ]).output().await;
+                println!("done");
+                fixed += 1;
+            }
+        } else {
+            println!("     ✅ chatCompletions enabled");
+        }
+
+        // Check 5: Gateway token in DB
+        if agent.gateway_token.is_none() || agent.gateway_token.as_deref() == Some("") {
+            println!("     ❌ No gateway token in DB");
+            issues += 1;
+            if fix {
+                print!("        🔧 Fetching and storing token... ");
+                let tok_out = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                    &format!("{}@{}", user, ip),
+                    "python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{}).get('auth',{}).get('token',''))\""
+                ]).output().await.ok();
+                let token = tok_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                if !token.is_empty() {
+                    let mut conn = pool.get_conn().await?;
+                    use mysql_async::prelude::*;
+                    conn.exec_drop("UPDATE mc_fleet_status SET gateway_token=? WHERE agent_name=?", (&token, name)).await?;
+                    println!("done ({}...)", &token[..12.min(token.len())]);
+                    fixed += 1;
+                } else {
+                    println!("no token found in config");
+                }
+            }
+        } else {
+            println!("     ✅ Gateway token in DB");
+        }
+
+        // Check 6: HTTP API reachable
+        let http_ok = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build().unwrap_or_default()
+            .get(&format!("http://{}:18789/", ip))
+            .send().await.is_ok();
+        if http_ok {
+            println!("     ✅ HTTP API reachable");
+        } else {
+            println!("     ⚠️  HTTP API unreachable (SSH fallback will be used)");
+        }
+
+        println!();
+    }
+
+    pool.disconnect().await?;
+
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  {} agents checked, {} issues found, {} fixed",
+        targets.len(), issues, fixed);
+    if issues > 0 && !fix {
+        println!("  Run `sam doctor --fix` to auto-repair");
+    }
+    println!();
+
+    Ok(())
 }
