@@ -4456,6 +4456,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             },
                             Focus::Fleet => match key.code {
                                 KeyCode::Char('q') => app.should_quit = true,
+                                KeyCode::Char('d') => app.start_diagnostics(false),
+                                KeyCode::Char('D') => app.start_diagnostics(true),
                                 KeyCode::Tab => app.focus = Focus::Chat,
                                 KeyCode::Up | KeyCode::Char('k') => app.previous(),
                                 KeyCode::Down | KeyCode::Char('j') => app.next(),
