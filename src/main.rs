@@ -150,6 +150,9 @@ impl GroupFilter {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SplitDragTarget { Dashboard, Detail }
+
 #[derive(PartialEq, Clone, Copy)]
 enum SortMode { Name, Status, Location, Version, Latency }
 
@@ -319,6 +322,13 @@ struct App {
     chat_area: Rect,
     detail_info_area: Rect,
     detail_chat_area: Rect,
+    dashboard_body_area: Rect,
+    detail_body_area: Rect,
+    dashboard_divider_area: Rect,
+    detail_divider_area: Rect,
+    dashboard_split_pct: Option<u16>,
+    detail_split_pct: Option<u16>,
+    dragging_split: Option<SplitDragTarget>,
     fleet_row_start_y: u16,  // Y offset where first agent row starts
     // Splash
     spawned_agents: Vec<db::SpawnedAgent>,
@@ -498,6 +508,9 @@ impl App {
             spinner_frame: 0, sort_mode: SortMode::Name, group_filter: GroupFilter::All,
             fleet_area: Rect::default(), chat_area: Rect::default(),
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
+            dashboard_body_area: Rect::default(), detail_body_area: Rect::default(),
+            dashboard_divider_area: Rect::default(), detail_divider_area: Rect::default(),
+            dashboard_split_pct: None, detail_split_pct: None, dragging_split: None,
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
             diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None, diag_overlay_scroll: 0,
@@ -2707,6 +2720,10 @@ const LINES_PER_MSG_EST: usize = 3;
 const SPINNER_FRAME_MS: u64 = 100;
 /// Input poll interval in milliseconds. Lower values improve key/menu responsiveness.
 const INPUT_POLL_MS: u64 = 10;
+const DIVIDER_HIT_WIDTH: u16 = 3;
+const FLEET_TABLE_HEADER_ROWS: u16 = 1;
+const MIN_SPLIT_PCT: u16 = 20;
+const MAX_SPLIT_PCT: u16 = 80;
 
 fn fmt_hhmm(t: &str) -> String {
     t.chars().take(5).collect()
@@ -2916,16 +2933,34 @@ fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme, area_width: u1
 fn is_narrow(area: &Rect) -> bool { area.width < 80 }
 fn is_wide(area: &Rect) -> bool { area.width > 160 }
 
-fn dashboard_split(area: &Rect) -> (Constraint, Constraint) {
+fn dashboard_split(area: &Rect, custom_left_pct: Option<u16>) -> (Constraint, Constraint) {
     if is_narrow(area) { (Constraint::Percentage(100), Constraint::Percentage(0)) }
+    else if let Some(left) = custom_left_pct {
+        let left = left.clamp(MIN_SPLIT_PCT, MAX_SPLIT_PCT);
+        (Constraint::Percentage(left), Constraint::Percentage(100 - left))
+    }
     else if is_wide(area) { (Constraint::Percentage(40), Constraint::Percentage(60)) }
     else { (Constraint::Percentage(50), Constraint::Percentage(50)) }
 }
 
-fn detail_split(area: &Rect) -> (Constraint, Constraint) {
+fn detail_split(area: &Rect, custom_left_pct: Option<u16>) -> (Constraint, Constraint) {
     if is_narrow(area) { (Constraint::Percentage(100), Constraint::Percentage(0)) }
+    else if let Some(left) = custom_left_pct {
+        let left = left.clamp(MIN_SPLIT_PCT, MAX_SPLIT_PCT);
+        (Constraint::Percentage(left), Constraint::Percentage(100 - left))
+    }
     else if is_wide(area) { (Constraint::Percentage(35), Constraint::Percentage(65)) }
     else { (Constraint::Percentage(40), Constraint::Percentage(60)) }
+}
+
+fn point_in_rect(x: u16, y: u16, area: Rect) -> bool {
+    x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
+}
+
+fn split_pct_from_mouse(x: u16, area: Rect) -> u16 {
+    if area.width == 0 { return 50; }
+    let relative_x = x.saturating_sub(area.x).min(area.width);
+    (((relative_x as u32 * 100) / area.width as u32) as u16).clamp(MIN_SPLIT_PCT, MAX_SPLIT_PCT)
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -3121,14 +3156,20 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
     frame.render_widget(header, outer[0]);
 
-    let (fleet_pct, chat_pct) = dashboard_split(&outer[1]);
+    let (fleet_pct, chat_pct) = dashboard_split(&outer[1], app.dashboard_split_pct);
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([fleet_pct, chat_pct])
         .split(outer[1]);
 
+    app.dashboard_body_area = outer[1];
     app.fleet_area = body[0];
     app.chat_area = body[1];
+    app.dashboard_divider_area = if body[1].width > 0 {
+        Rect::new(body[1].x.saturating_sub(1), outer[1].y, DIVIDER_HIT_WIDTH.min(outer[1].width), outer[1].height)
+    } else {
+        Rect::default()
+    };
     render_fleet_table(frame, app, body[0], app.focus == Focus::Fleet);
     if !is_narrow(&outer[1]) {
         render_chat_panel(frame, app, body[1], app.focus == Focus::Chat, false);
@@ -3394,7 +3435,7 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     frame.render_widget(header, chunks[0]);
 
     // Body: info left, chat right (responsive)
-    let (info_pct, chat_pct) = detail_split(&chunks[1]);
+    let (info_pct, chat_pct) = detail_split(&chunks[1], app.detail_split_pct);
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([info_pct, chat_pct])
@@ -3461,6 +3502,12 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     // Store hit zones
     app.detail_info_area = body[0];
     app.detail_chat_area = body[1];
+    app.detail_body_area = chunks[1];
+    app.detail_divider_area = if body[1].width > 0 {
+        Rect::new(body[1].x.saturating_sub(1), chunks[1].y, DIVIDER_HIT_WIDTH.min(chunks[1].width), chunks[1].height)
+    } else {
+        Rect::default()
+    };
 
     // Agent chat
     render_chat_panel(frame, app, body[1], app.focus == Focus::AgentChat, true);
@@ -4851,60 +4898,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Mouse events
             if let Event::Mouse(mouse) = &ev {
-                if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                    let (mx, my) = (mouse.column, mouse.row);
-                    match app.screen {
+                let (mx, my) = (mouse.column, mouse.row);
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => match app.screen {
                         Screen::Dashboard => {
-                            // Click on fleet panel
-                            if mx >= app.fleet_area.x && mx < app.fleet_area.x + app.fleet_area.width
-                                && my >= app.fleet_area.y && my < app.fleet_area.y + app.fleet_area.height
-                            {
+                            if point_in_rect(mx, my, app.dashboard_divider_area) {
+                                app.dragging_split = Some(SplitDragTarget::Dashboard);
+                                app.dashboard_split_pct = Some(split_pct_from_mouse(mx, app.dashboard_body_area));
+                            } else if point_in_rect(mx, my, app.fleet_area) {
                                 app.focus = Focus::Fleet;
-                                // Calculate which agent row was clicked
-                                if my > app.fleet_row_start_y && app.fleet_row_start_y > 0 {
-                                    let row = (my - app.fleet_row_start_y - 1) as usize; // -1 for header
-                                    if row < app.agents.len() {
-                                        app.selected = row;
+                                let first_data_row_y = app.fleet_row_start_y.saturating_add(FLEET_TABLE_HEADER_ROWS);
+                                if my >= first_data_row_y {
+                                    let row = (my - first_data_row_y) as usize;
+                                    let filtered = app.filtered_agent_indices();
+                                    if let Some(&idx) = filtered.get(row) {
+                                        app.selected = idx;
                                     }
                                 }
-                            }
-                            // Click on chat panel
-                            else if mx >= app.chat_area.x && mx < app.chat_area.x + app.chat_area.width
-                                && my >= app.chat_area.y && my < app.chat_area.y + app.chat_area.height
-                            {
+                            } else if point_in_rect(mx, my, app.chat_area) {
                                 app.focus = Focus::Chat;
                             }
                         }
                         Screen::AgentDetail => {
-                            if mx >= app.detail_info_area.x && mx < app.detail_info_area.x + app.detail_info_area.width
-                                && my >= app.detail_info_area.y && my < app.detail_info_area.y + app.detail_info_area.height
-                            {
+                            if point_in_rect(mx, my, app.detail_divider_area) {
+                                app.dragging_split = Some(SplitDragTarget::Detail);
+                                app.detail_split_pct = Some(split_pct_from_mouse(mx, app.detail_body_area));
+                            } else if point_in_rect(mx, my, app.detail_info_area) {
                                 app.focus = Focus::Fleet;
-                            }
-                            else if mx >= app.detail_chat_area.x && mx < app.detail_chat_area.x + app.detail_chat_area.width
-                                && my >= app.detail_chat_area.y && my < app.detail_chat_area.y + app.detail_chat_area.height
-                            {
+                            } else if point_in_rect(mx, my, app.detail_chat_area) {
                                 app.focus = Focus::AgentChat;
                             }
                         }
                         _ => {}
+                    },
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        match app.dragging_split {
+                            Some(SplitDragTarget::Dashboard) if app.screen == Screen::Dashboard => {
+                                app.dashboard_split_pct = Some(split_pct_from_mouse(mx, app.dashboard_body_area));
+                            }
+                            Some(SplitDragTarget::Detail) if app.screen == Screen::AgentDetail => {
+                                app.detail_split_pct = Some(split_pct_from_mouse(mx, app.detail_body_area));
+                            }
+                            _ => {}
+                        }
                     }
-                }
-
-                // Scroll wheel in chat
-                if let MouseEventKind::ScrollUp = mouse.kind {
-                    match app.focus {
-                        Focus::Chat => app.chat_scroll = app.chat_scroll.saturating_add(3),
-                        Focus::AgentChat => app.agent_chat_scroll = app.agent_chat_scroll.saturating_add(3),
-                        _ => {}
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        app.dragging_split = None;
                     }
-                }
-                if let MouseEventKind::ScrollDown = mouse.kind {
-                    match app.focus {
-                        Focus::Chat => app.chat_scroll = app.chat_scroll.saturating_sub(3),
-                        Focus::AgentChat => app.agent_chat_scroll = app.agent_chat_scroll.saturating_sub(3),
-                        _ => {}
+                    MouseEventKind::ScrollUp => {
+                        if app.screen == Screen::Dashboard && point_in_rect(mx, my, app.chat_area) {
+                            app.chat_scroll = app.chat_scroll.saturating_add(3);
+                        } else if app.screen == Screen::AgentDetail && point_in_rect(mx, my, app.detail_chat_area) {
+                            app.agent_chat_scroll = app.agent_chat_scroll.saturating_add(3);
+                        }
                     }
+                    MouseEventKind::ScrollDown => {
+                        if app.screen == Screen::Dashboard && point_in_rect(mx, my, app.chat_area) {
+                            app.chat_scroll = app.chat_scroll.saturating_sub(3);
+                        } else if app.screen == Screen::AgentDetail && point_in_rect(mx, my, app.detail_chat_area) {
+                            app.agent_chat_scroll = app.agent_chat_scroll.saturating_sub(3);
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -6126,10 +6181,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::INPUT_POLL_MS;
+    use super::{INPUT_POLL_MS, Rect, dashboard_split, split_pct_from_mouse};
+    use ratatui::layout::Constraint;
 
     #[test]
     fn input_poll_interval_is_low_for_responsive_ui() {
         assert!(INPUT_POLL_MS <= 10);
+    }
+
+    #[test]
+    fn split_pct_from_mouse_clamps_to_safe_bounds() {
+        let area = Rect::new(10, 5, 100, 20);
+        assert_eq!(split_pct_from_mouse(10, area), 20);
+        assert_eq!(split_pct_from_mouse(60, area), 50);
+        assert_eq!(split_pct_from_mouse(200, area), 80);
+    }
+
+    #[test]
+    fn dashboard_split_uses_custom_percentage_when_present() {
+        let area = Rect::new(0, 0, 120, 20);
+        let (left, right) = dashboard_split(&area, Some(65));
+        assert_eq!(left, Constraint::Percentage(65));
+        assert_eq!(right, Constraint::Percentage(35));
     }
 }
