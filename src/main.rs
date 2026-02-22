@@ -9,6 +9,8 @@ mod wizard;
 mod db;
 mod theme;
 mod validate;
+mod shell;
+>>>>>>> d3b3cfc (security: add shell escape utility and use it in SSH broadcast fallback)
 
 use clap::Parser;
 use dotenvy;
@@ -467,10 +469,12 @@ impl App {
                                 }
                             }
                             Err(_) => {
-                            // SSH fallback for broadcast
+                            // SSH fallback for broadcast — shell-escape the JSON body to
+                            // prevent injection of user-supplied message content.
                             let ssh_cmd = format!(
-                                "curl -sS --connect-timeout 10 -m 55 http://localhost:{}/v1/chat/completions -H 'Authorization: Bearer {}' -H 'Content-Type: application/json' -d '{}'",
-                                bcast_port, tok, serde_json::to_string(&body).unwrap_or_default().replace("'", "'\''")
+                                "curl -sS --connect-timeout 10 -m 55 http://localhost:{}/v1/chat/completions -H 'Authorization: Bearer {}' -H 'Content-Type: application/json' -d {}",
+                                bcast_port, tok,
+                                shell::escape(&serde_json::to_string(&body).unwrap_or_default())
                             );
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(60),
