@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use crate::validate;
 
 // ── ANSI Color Helpers ──────────────────────────────────────────
 fn c_cyan(s: &str) -> String { format!("\x1b[36m{}\x1b[0m", s) }
@@ -425,8 +426,14 @@ pub async fn print_status() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Send a chat message and wait for response (non-TUI)
 pub async fn send_chat(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+    validate::validate_agent_name(agent)
+        .map_err(|e| format!("Invalid agent name: {}", e))?;
+    let message = validate::sanitize_chat_message(message);
+    if message.is_empty() {
+        return Err("Message must not be empty".into());
+    }
     let pool = crate::db::get_pool();
-    let id = crate::db::send_direct(&pool, "cli", agent, message).await?;
+    let id = crate::db::send_direct(&pool, "cli", agent, &message).await?;
     println!("📨 Sent to @{}: {}", agent, message);
     println!("   Message ID: {} — waiting for response...", id);
 
@@ -454,6 +461,15 @@ pub async fn send_chat(agent: &str, message: &str) -> Result<(), Box<dyn std::er
 pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::process::Command;
     use std::time::Duration;
+
+    validate::validate_ip_address(host)
+        .map_err(|e| format!("Invalid host: {}", e))?;
+    validate::validate_ssh_username(user)
+        .map_err(|e| format!("Invalid SSH user: {}", e))?;
+    if let Some(n) = name {
+        validate::normalize_agent_name(n)
+            .map_err(|e| format!("Invalid agent name: {}", e))?;
+    }
 
     println!("\n🛰️  S.A.M Mission Control — Agent Onboarding");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
