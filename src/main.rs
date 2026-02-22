@@ -193,6 +193,7 @@ fn chrono_now_hms() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     let secs = now % 86400;
+    // Keep fixed UTC-6 offset for consistency with the existing app clock display.
     let hours = ((secs / 3600) + 24 - 6) % 24; // UTC-6 for CST
     let mins = (secs % 3600) / 60;
     let sec = secs % 60;
@@ -2445,6 +2446,7 @@ print('ok')
                 }
                 Err(_) => None,
             };
+            // Receiver may be gone during shutdown; safe to ignore send failures.
             let _ = tx.send(result);
         });
     }
@@ -2764,6 +2766,7 @@ const LINES_PER_MSG_EST: usize = 3;
 const SPINNER_FRAME_MS: u64 = 100;
 /// Input poll interval in milliseconds. Lower values improve key/menu responsiveness.
 const INPUT_POLL_MS: u64 = 10;
+const STATUS_OP_PULSE_MS: u128 = 500;
 
 fn fmt_hhmm(t: &str) -> String {
     t.chars().take(5).collect()
@@ -3189,9 +3192,10 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, online: usize, total: usize, health_color: Color) {
     let t = &app.theme;
-    let uptime = format_app_uptime(app.tui_start.elapsed().as_secs());
+    let elapsed = app.tui_start.elapsed();
+    let uptime = format_app_uptime(elapsed.as_secs());
     let ops = app.active_ops_running();
-    let pulse = if (app.tui_start.elapsed().as_millis() / 500) % 2 == 0 { "◐" } else { "◓" };
+    let pulse = if (elapsed.as_millis() / STATUS_OP_PULSE_MS) % 2 == 0 { "◐" } else { "◓" };
     let db_text = if app.db_online {
         match app.db_latency_ms {
             Some(ms) => format!("DB: {}ms", ms),
