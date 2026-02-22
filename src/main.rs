@@ -300,6 +300,11 @@ struct App {
     theme_name: ThemeName,
     bg_density: BgDensity,
     theme: Theme,
+    // Autocomplete
+    ac_visible: bool,
+    ac_matches: Vec<String>,
+    ac_selected: usize,
+    ac_start_pos: usize,  // cursor position of the '@'
 }
 
 impl App {
@@ -375,7 +380,7 @@ impl App {
             fleet_area: Rect::default(), chat_area: Rect::default(),
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
-            theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd),
+            theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
         }
     }
 
@@ -413,6 +418,62 @@ impl App {
     fn cycle_bg(&mut self) {
         self.bg_density = self.bg_density.next();
         self.theme = Theme::resolve(self.theme_name, self.bg_density);
+    }
+
+    /// Get the active chat input (depending on screen)
+    fn active_chat_input(&self) -> &str {
+        if self.screen == Screen::AgentDetail { &self.agent_chat_input } else { &self.chat_input }
+    }
+
+    fn active_chat_input_mut(&mut self) -> &mut String {
+        if self.screen == Screen::AgentDetail { &mut self.agent_chat_input } else { &mut self.chat_input }
+    }
+
+    /// Update autocomplete state based on current input
+    fn update_autocomplete(&mut self) {
+        let input = self.active_chat_input().to_string();
+        // Find the last '@' that starts a mention
+        if let Some(at_pos) = input.rfind('@') {
+            let after_at = &input[at_pos + 1..];
+            // Only trigger if we're still typing the mention (no space after)
+            if !after_at.contains(' ') {
+                let query = after_at.to_lowercase();
+                let matches: Vec<String> = self.agents.iter()
+                    .map(|a| a.db_name.clone())
+                    .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
+                    .collect();
+                if !matches.is_empty() {
+                    self.ac_visible = true;
+                    self.ac_matches = matches;
+                    self.ac_start_pos = at_pos;
+                    if self.ac_selected >= self.ac_matches.len() {
+                        self.ac_selected = 0;
+                    }
+                    return;
+                }
+            }
+        }
+        self.ac_visible = false;
+        self.ac_matches.clear();
+        self.ac_selected = 0;
+    }
+
+    /// Accept the currently selected autocomplete suggestion
+    fn accept_autocomplete(&mut self) {
+        if !self.ac_visible || self.ac_matches.is_empty() { return; }
+        let name = self.ac_matches[self.ac_selected].clone();
+        let pos = self.ac_start_pos;
+        let replacement = format!("@{} ", name);
+        if self.screen == Screen::AgentDetail {
+            self.agent_chat_input.truncate(pos);
+            self.agent_chat_input.push_str(&replacement);
+        } else {
+            self.chat_input.truncate(pos);
+            self.chat_input.push_str(&replacement);
+        }
+        self.ac_visible = false;
+        self.ac_matches.clear();
+        self.ac_selected = 0;
     }
 
     fn agent_chat_lines(&self) -> &Vec<ChatLine> {
@@ -2196,15 +2257,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => { app.config_text = None; }
                         },
                         Screen::AgentDetail => match app.focus {
-                            Focus::AgentChat => match key.code {
-                                KeyCode::Esc => app.focus = Focus::Fleet,
-                                KeyCode::Tab => app.focus = Focus::Fleet,
-                                KeyCode::Enter => app.send_agent_message().await,
-                                KeyCode::Backspace => { app.agent_chat_input.pop(); }
-                                KeyCode::Char(c) => app.agent_chat_input.push(c),
-                                KeyCode::PageUp => app.agent_chat_scroll = app.agent_chat_scroll.saturating_add(5),
-                                KeyCode::PageDown => app.agent_chat_scroll = app.agent_chat_scroll.saturating_sub(5),
-                                _ => {}
+                            Focus::AgentChat => if app.ac_visible {
+                                match key.code {
+                                    KeyCode::Up => { if app.ac_selected > 0 { app.ac_selected -= 1; } else { app.ac_selected = app.ac_matches.len().saturating_sub(1); } }
+                                    KeyCode::Down => { app.ac_selected = (app.ac_selected + 1) % app.ac_matches.len().max(1); }
+                                    KeyCode::Tab | KeyCode::Enter => app.accept_autocomplete(),
+                                    KeyCode::Esc => { app.ac_visible = false; }
+                                    KeyCode::Backspace => { app.agent_chat_input.pop(); app.update_autocomplete(); }
+                                    KeyCode::Char(c) => { app.agent_chat_input.push(c); app.update_autocomplete(); }
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Esc => app.focus = Focus::Fleet,
+                                    KeyCode::Tab => app.focus = Focus::Fleet,
+                                    KeyCode::Enter => app.send_agent_message().await,
+                                    KeyCode::Backspace => { app.agent_chat_input.pop(); app.update_autocomplete(); }
+                                    KeyCode::Char(c) => { app.agent_chat_input.push(c); app.update_autocomplete(); }
+                                    KeyCode::PageUp => app.agent_chat_scroll = app.agent_chat_scroll.saturating_add(5),
+                                    KeyCode::PageDown => app.agent_chat_scroll = app.agent_chat_scroll.saturating_sub(5),
+                                    _ => {}
+                                }
                             },
                             _ => match key.code {
                                 KeyCode::Esc => { app.screen = Screen::Dashboard; app.focus = Focus::Fleet; }
@@ -2608,14 +2681,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char(ch) => app.command_input.push(ch),
                                 _ => {}
                             },
-                            Focus::Chat => match key.code {
-                                KeyCode::Tab | KeyCode::Esc => app.focus = Focus::Fleet,
-                                KeyCode::Enter => app.send_message().await,
-                                KeyCode::Backspace => { app.chat_input.pop(); }
-                                KeyCode::Char(c) => app.chat_input.push(c),
-                                KeyCode::PageUp => app.chat_scroll = app.chat_scroll.saturating_add(5),
-                                KeyCode::PageDown => app.chat_scroll = app.chat_scroll.saturating_sub(5),
-                                _ => {}
+                            Focus::Chat => if app.ac_visible {
+                                match key.code {
+                                    KeyCode::Up => { if app.ac_selected > 0 { app.ac_selected -= 1; } else { app.ac_selected = app.ac_matches.len().saturating_sub(1); } }
+                                    KeyCode::Down => { app.ac_selected = (app.ac_selected + 1) % app.ac_matches.len().max(1); }
+                                    KeyCode::Tab | KeyCode::Enter => app.accept_autocomplete(),
+                                    KeyCode::Esc => { app.ac_visible = false; }
+                                    KeyCode::Backspace => { app.chat_input.pop(); app.update_autocomplete(); }
+                                    KeyCode::Char(c) => { app.chat_input.push(c); app.update_autocomplete(); }
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Tab | KeyCode::Esc => app.focus = Focus::Fleet,
+                                    KeyCode::Enter => app.send_message().await,
+                                    KeyCode::Backspace => { app.chat_input.pop(); app.update_autocomplete(); }
+                                    KeyCode::Char(c) => { app.chat_input.push(c); app.update_autocomplete(); }
+                                    KeyCode::PageUp => app.chat_scroll = app.chat_scroll.saturating_add(5),
+                                    KeyCode::PageDown => app.chat_scroll = app.chat_scroll.saturating_sub(5),
+                                    _ => {}
+                                }
                             },
                             _ => {}
                         },
