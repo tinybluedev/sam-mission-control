@@ -1,6 +1,11 @@
 #!/bin/bash
 # Collect cron jobs and context usage from all fleet agents
-DB_HOST="10.64.0.2"; DB_PORT="30306"; DB_USER="root"; DB_PASS='Nw1026039$'; DB_NAME="quantum_memory"
+# Configure via environment variables (see .env.example)
+DB_HOST="${DB_HOST:?DB_HOST is not set}"
+DB_PORT="${DB_PORT:-3306}"
+DB_USER="${DB_USER:?DB_USER is not set}"
+DB_PASS="${DB_PASS:?DB_PASS is not set}"
+DB_NAME="${DB_NAME:?DB_NAME is not set}"
 mysql_cmd() { mysql -h "$DB_HOST" -P "$DB_PORT" --skip-ssl -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "$1" 2>/dev/null; }
 
 AGENTS=$(mysql_cmd "SELECT agent_name, tailscale_ip FROM mc_fleet_status WHERE status='online'")
