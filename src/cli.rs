@@ -26,6 +26,17 @@ pub enum Commands {
     },
     /// Run interactive setup wizard
     Setup,
+    /// Deploy workspace files to agents
+    Deploy {
+        /// Agent name or "all"
+        target: String,
+        /// File to push (e.g. SOUL.md, AGENTS.md)
+        #[arg(short, long)]
+        file: String,
+        /// Local source path (default: templates/<file>)
+        #[arg(short, long)]
+        source: Option<String>,
+    },
     /// Onboard a new agent on a remote machine
     Onboard {
         /// Tailscale IP or hostname of the target machine
@@ -533,4 +544,77 @@ fn rand_byte() -> u8 {
     use std::time::SystemTime;
     let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
     ((t.subsec_nanos() ^ (t.as_secs() as u32).wrapping_mul(2654435761)) & 0xFF) as u8
+}
+
+
+/// Deploy workspace file to agent(s)
+pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::process::Command;
+
+    // Resolve source file
+    let src_path = source.map(|s| s.to_string()).unwrap_or_else(|| {
+        format!("templates/{}", file)
+    });
+
+    if !std::path::Path::new(&src_path).exists() {
+        return Err(format!("Source file not found: {}", src_path).into());
+    }
+
+    let content = std::fs::read_to_string(&src_path)?;
+    println!("\n🚀 Deploying {} ({} bytes)", file, content.len());
+
+    // Load fleet from DB
+    let pool = crate::db::get_pool();
+    let agents = crate::db::load_fleet(&pool).await?;
+
+    let targets: Vec<&crate::db::DbAgent> = if target == "all" {
+        agents.iter().collect()
+    } else {
+        agents.iter().filter(|a| a.agent_name == target).collect()
+    };
+
+    if targets.is_empty() {
+        return Err(format!("No agents found matching '{}'", target).into());
+    }
+
+    for agent in &targets {
+        let ip = agent.tailscale_ip.as_deref().unwrap_or("?");
+        print!("  {} → {}... ", agent.agent_name, ip);
+
+        // Determine workspace path
+        let workspace_cmd = "python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('agents',{}).get('defaults',{}).get('workspace',os.path.expanduser('~/.openclaw/workspace')))\"";
+
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5),
+            Command::new("ssh").args([
+                "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                &format!("papasmurf@{}", ip), workspace_cmd
+            ]).output()
+        ).await;
+
+        let workspace = match out {
+            Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => {
+                println!("❌ unreachable");
+                continue;
+            }
+        };
+
+        // SCP the file
+        let dest = format!("papasmurf@{}:{}/{}", ip, workspace, file);
+        let scp_out = tokio::time::timeout(std::time::Duration::from_secs(10),
+            Command::new("scp").args([
+                "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                &src_path, &dest
+            ]).output()
+        ).await;
+
+        match scp_out {
+            Ok(Ok(o)) if o.status.success() => println!("✅"),
+            _ => println!("❌ scp failed"),
+        }
+    }
+
+    pool.disconnect().await?;
+    println!("\n  Done.\n");
+    Ok(())
 }
