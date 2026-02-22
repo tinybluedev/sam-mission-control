@@ -496,7 +496,7 @@ impl App {
 
         if let Some(pool) = &self.db_pool {
             let ids = db::send_broadcast(pool, &self.user(), &message, &agent_names).await.unwrap_or_default();
-            // Fire AI requests to all agents with tokens
+            // Fire streaming AI requests to all agents with tokens
             for (i, agent) in self.agents.iter().enumerate() {
                 if let Some(tok) = &agent.gateway_token {
                     let url = format!("http://{}:{}/v1/chat/completions", agent.host, agent.gateway_port);
@@ -509,10 +509,12 @@ impl App {
                     let bcast_port = agent.gateway_port;
                     tokio::spawn(async move {
                         let client = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_secs(60))
+                            .timeout(std::time::Duration::from_secs(120))
                             .build().unwrap_or_default();
+                        let _ = db::update_chat_status(&pool, msg_id, "connecting").await;
                         let body = serde_json::json!({
                             "model": "openclaw:main",
+                            "stream": true,
                             "messages": [{"role": "user", "content": msg}]
                         });
                         let result = client.post(&url)
@@ -520,41 +522,77 @@ impl App {
                             .header("Content-Type", "application/json")
                             .json(&body)
                             .send().await;
-                        let response = match result {
+                        match result {
                             Ok(resp) => {
-                                match resp.json::<serde_json::Value>().await {
-                                    Ok(j) => j["choices"][0]["message"]["content"]
-                                        .as_str().unwrap_or("(no content)").to_string(),
-                                    Err(e) => format!("Parse error: {}", e),
+                                use reqwest::header::CONTENT_TYPE;
+                                let ct = resp.headers().get(CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                                if ct.contains("text/event-stream") || ct.contains("text/plain") {
+                                    let _ = db::update_chat_status(&pool, msg_id, "thinking").await;
+                                    use futures_util::StreamExt;
+                                    let mut stream = resp.bytes_stream();
+                                    let mut full = String::new();
+                                    let mut last_write = std::time::Instant::now();
+                                    let mut got = false;
+                                    while let Some(chunk) = stream.next().await {
+                                        let chunk = match chunk { Ok(c) => c, Err(_) => break };
+                                        let text = String::from_utf8_lossy(&chunk);
+                                        for line in text.lines() {
+                                            let line = line.trim();
+                                            if line == "data: [DONE]" || !line.starts_with("data: ") { continue; }
+                                            if let Ok(j) = serde_json::from_str::<serde_json::Value>(&line[6..]) {
+                                                if let Some(c) = j["choices"][0]["delta"]["content"].as_str() {
+                                                    full.push_str(c); got = true;
+                                                }
+                                            }
+                                        }
+                                        if got && last_write.elapsed() > std::time::Duration::from_millis(300) {
+                                            let _ = db::update_chat_partial(&pool, msg_id, &full).await;
+                                            last_write = std::time::Instant::now();
+                                        }
+                                    }
+                                    if full.is_empty() { full = "(empty response)".into(); }
+                                    let _ = db::respond_to_chat(&pool, msg_id, &full).await;
+                                } else {
+                                    let _ = db::update_chat_status(&pool, msg_id, "thinking").await;
+                                    match resp.json::<serde_json::Value>().await {
+                                        Ok(j) => {
+                                            let r = j["choices"][0]["message"]["content"]
+                                                .as_str().unwrap_or("(no content)").to_string();
+                                            let _ = db::respond_to_chat(&pool, msg_id, &r).await;
+                                        }
+                                        Err(e) => { let _ = db::respond_to_chat(&pool, msg_id, &format!("Parse error: {}", e)).await; }
+                                    }
                                 }
                             }
                             Err(_) => {
-                            // SSH fallback for broadcast — shell-escape the JSON body to
-                            // prevent injection of user-supplied message content.
-                            let ssh_cmd = format!(
-                                "curl -sS --connect-timeout 10 -m 55 http://localhost:{}/v1/chat/completions -H 'Authorization: Bearer {}' -H 'Content-Type: application/json' -d {}",
-                                bcast_port, tok,
-                                shell::escape(&serde_json::to_string(&body).unwrap_or_default())
-                            );
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(60),
-                                tokio::process::Command::new("ssh")
-                                    .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                                        &format!("{}@{}", bcast_user, bcast_host), &ssh_cmd])
-                                    .output()
-                            ).await {
-                                Ok(Ok(o)) if o.status.success() => {
-                                    let s = String::from_utf8_lossy(&o.stdout);
-                                    serde_json::from_str::<serde_json::Value>(&s).ok()
-                                        .and_then(|j| j["choices"][0]["message"]["content"].as_str().map(|s| s.to_string()))
-                                        .unwrap_or_else(|| "⚠ SSH fallback parse error".into())
-                                }
-                                _ => "⚠ unreachable".into(),
+                                // SSH fallback (non-streaming)
+                                let body_nostream = serde_json::json!({
+                                    "model": "openclaw:main",
+                                    "messages": [{"role": "user", "content": msg}]
+                                });
+                                let ssh_cmd = format!(
+                                    "curl -sS --connect-timeout 10 -m 55 http://localhost:{}/v1/chat/completions -H 'Authorization: Bearer {}' -H 'Content-Type: application/json' -d {}",
+                                    bcast_port, tok,
+                                    shell::escape(&serde_json::to_string(&body_nostream).unwrap_or_default())
+                                );
+                                let response = match tokio::time::timeout(
+                                    std::time::Duration::from_secs(60),
+                                    tokio::process::Command::new("ssh")
+                                        .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                                            &format!("{}@{}", bcast_user, bcast_host), &ssh_cmd])
+                                        .output()
+                                ).await {
+                                    Ok(Ok(o)) if o.status.success() => {
+                                        let s = String::from_utf8_lossy(&o.stdout);
+                                        serde_json::from_str::<serde_json::Value>(&s).ok()
+                                            .and_then(|j| j["choices"][0]["message"]["content"].as_str().map(|s| s.to_string()))
+                                            .unwrap_or_else(|| "⚠ SSH fallback parse error".into())
+                                    }
+                                    _ => "⚠ unreachable".into(),
+                                };
+                                let _ = db::respond_to_chat(&pool, msg_id, &response).await;
                             }
-                        },
-                        };
-                        if msg_id > 0 {
-                            let _ = db::respond_to_chat(&pool, msg_id, &response).await;
                         }
                     });
                 }
@@ -586,17 +624,21 @@ impl App {
             db::send_chat(pool, &self.user(), Some(&target), &message).await.unwrap_or(0)
         } else { 0 };
 
-        // Fire AI request via OpenClaw HTTP API
+        // Fire AI request via OpenClaw HTTP API (streaming)
         if let Some(tok) = token {
             let pool = self.db_pool.clone();
-            let user = self.user();
             tokio::spawn(async move {
                 let url = format!("http://{}:{}/v1/chat/completions", host, port);
                 let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(60))
+                    .timeout(std::time::Duration::from_secs(120))
                     .build().unwrap_or_default();
+
+                // Mark as connecting
+                if let Some(ref p) = pool { let _ = db::update_chat_status(p, msg_id, "connecting").await; }
+
                 let body = serde_json::json!({
                     "model": "openclaw:main",
+                    "stream": true,
                     "messages": [{"role": "user", "content": message}]
                 });
                 let result = client.post(&url)
@@ -604,25 +646,84 @@ impl App {
                     .header("Content-Type", "application/json")
                     .json(&body)
                     .send().await;
-                let response = match result {
+
+                match result {
                     Ok(resp) => {
-                        match resp.json::<serde_json::Value>().await {
-                            Ok(j) => j["choices"][0]["message"]["content"]
-                                .as_str().unwrap_or("(no content)").to_string(),
-                            Err(e) => format!("Parse error: {}", e),
+                        use reqwest::header::CONTENT_TYPE;
+                        let ct = resp.headers().get(CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+
+                        if ct.contains("text/event-stream") || ct.contains("text/plain") {
+                            // SSE streaming response
+                            if let Some(ref p) = pool { let _ = db::update_chat_status(p, msg_id, "thinking").await; }
+
+                            use futures_util::StreamExt;
+                            let mut stream = resp.bytes_stream();
+                            let mut full_response = String::new();
+                            let mut last_db_write = std::time::Instant::now();
+                            let mut got_content = false;
+
+                            while let Some(chunk) = stream.next().await {
+                                let chunk = match chunk {
+                                    Ok(c) => c,
+                                    Err(_) => break,
+                                };
+                                let text = String::from_utf8_lossy(&chunk);
+                                // Parse SSE lines: data: {"choices":[{"delta":{"content":"..."}}]}
+                                for line in text.lines() {
+                                    let line = line.trim();
+                                    if line == "data: [DONE]" { continue; }
+                                    if !line.starts_with("data: ") { continue; }
+                                    let json_str = &line[6..];
+                                    if let Ok(j) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                        if let Some(content) = j["choices"][0]["delta"]["content"].as_str() {
+                                            full_response.push_str(content);
+                                            got_content = true;
+                                        }
+                                    }
+                                }
+
+                                // Write partial response to DB every 300ms
+                                if got_content && last_db_write.elapsed() > std::time::Duration::from_millis(300) {
+                                    if let Some(ref p) = pool {
+                                        let _ = db::update_chat_partial(p, msg_id, &full_response).await;
+                                    }
+                                    last_db_write = std::time::Instant::now();
+                                }
+                            }
+
+                            // Final write
+                            if full_response.is_empty() { full_response = "(empty response)".into(); }
+                            if let Some(ref p) = pool {
+                                let _ = db::respond_to_chat(p, msg_id, &full_response).await;
+                            }
+                        } else {
+                            // Non-streaming JSON response (fallback)
+                            if let Some(ref p) = pool { let _ = db::update_chat_status(p, msg_id, "thinking").await; }
+                            match resp.json::<serde_json::Value>().await {
+                                Ok(j) => {
+                                    let response = j["choices"][0]["message"]["content"]
+                                        .as_str().unwrap_or("(no content)").to_string();
+                                    if let Some(ref p) = pool {
+                                        let _ = db::respond_to_chat(p, msg_id, &response).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    if let Some(ref p) = pool {
+                                        let _ = db::respond_to_chat(p, msg_id, &format!("Parse error: {}", e)).await;
+                                    }
+                                }
+                            }
                         }
                     }
-                    Err(e) => format!("Connection error: {}", e),
-                };
-                // Write response to DB
-                if let Some(pool) = pool {
-                    if msg_id > 0 {
-                        let _ = db::respond_to_chat(&pool, msg_id, &response).await;
+                    Err(e) => {
+                        if let Some(ref p) = pool {
+                            let _ = db::respond_to_chat(p, msg_id, &format!("Connection error: {}", e)).await;
+                        }
                     }
                 }
             });
         } else {
-            // No gateway token — fall back to SSH
             if let Some(pool) = &self.db_pool {
                 if msg_id > 0 {
                     let _ = db::respond_to_chat(pool, msg_id, "(no gateway token configured)").await;
@@ -922,18 +1023,23 @@ fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme, area_width: u1
             }
 
             // Status indicator (right-aligned)
-            let st_icon: String = if msg.response.is_some() {
-                "✓✓".into()
-            } else {
-                match msg.status.as_str() {
-                    "pending" => "⏳".into(),
-                    "thinking" | "processing" => {
-                        let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
-                        c.to_string()
-                    }
-                    "failed" => "✗".into(),
-                    _ => "✓".into(),
+            let st_icon: String = match msg.status.as_str() {
+                "responded" => "✓✓".into(),
+                "streaming" => {
+                    let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
+                    format!("{} streaming", c)
                 }
+                "connecting" => {
+                    let dots = ".".repeat((spinner_frame % 3) + 1);
+                    format!("⚡ connecting{}", dots)
+                }
+                "thinking" | "processing" => {
+                    let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
+                    format!("{} thinking", c)
+                }
+                "pending" => "⏳ sending".into(),
+                "failed" => "✗ failed".into(),
+                _ => if msg.response.is_some() { "✓✓".into() } else { "✓".into() },
             };
             let spad = inner_w.saturating_sub(st_icon.chars().count() + 1);
             lines.push(Line::from(vec![
@@ -970,9 +1076,13 @@ fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme, area_width: u1
                 }
                 if !cur.is_empty() {
                     let prefix = if first { "  ↳ " } else { "    " };
+                    // Add blinking cursor if still streaming
+                    let is_streaming = msg.status == "streaming";
+                    let cursor = if is_streaming { "▌" } else { "" };
                     lines.push(Line::from(vec![
                         Span::styled(prefix.to_string(), Style::default().fg(t.sender_other)),
                         Span::styled(cur, Style::default().fg(t.response)),
+                        Span::styled(cursor.to_string(), Style::default().fg(t.accent)),
                     ]));
                 }
             }
@@ -1014,11 +1124,19 @@ fn build_chat_lines(messages: &[ChatLine], user: &str, t: &Theme, area_width: u1
                 }
             } else {
                 let status_text: String = match msg.status.as_str() {
+                    "streaming" => {
+                        let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
+                        format!("  {} tokens flowing...", c)
+                    }
                     "thinking" => {
                         let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
                         format!("  {} agent is thinking...", c)
                     }
-                    "pending" | "processing" => "  ⏳ processing...".into(),
+                    "connecting" => {
+                        let dots = ".".repeat((spinner_frame % 3) + 1);
+                        format!("  ⚡ connecting{}", dots)
+                    }
+                    "pending" | "processing" => "  ⏳ sending...".into(),
                     "received" => "  📨 received".into(),
                     _ => String::new(),
                 };
@@ -2729,7 +2847,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Poll chat every 3s — spawn so it doesn't block
-        if app.last_chat_poll.elapsed() > Duration::from_secs(3) {
+        let has_pending = app.chat_history.iter().chain(app.agent_chat_history.iter())
+            .any(|m| matches!(m.status.as_str(), "pending" | "connecting" | "thinking" | "streaming" | "processing"));
+        let poll_interval = if has_pending { Duration::from_millis(400) } else { Duration::from_secs(3) };
+        if app.last_chat_poll.elapsed() > poll_interval {
             app.poll_chat().await;
             app.last_chat_poll = Instant::now();
         }
