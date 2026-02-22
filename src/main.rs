@@ -363,6 +363,12 @@ struct App {
     ws_undo_stack: Vec<(Vec<String>, (usize, usize))>,
     ws_discard_confirm: bool,
     ws_crons: Vec<CronEntry>,
+    ws_cron_selected: usize,
+    ws_cron_form_active: bool,
+    ws_cron_form_edit: bool,
+    ws_cron_form_schedule: String,
+    ws_cron_form_description: String,
+    ws_cron_form_focus: usize,
     ws_loading: bool,
     ws_load_rx: Option<mpsc::UnboundedReceiver<(Vec<WorkspaceFile>, Vec<CronEntry>)>>,
     ws_file_rx: Option<mpsc::UnboundedReceiver<String>>,
@@ -505,7 +511,7 @@ impl App {
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: vec![], ws_cursor: (0, 0), ws_undo_stack: vec![], ws_discard_confirm: false,
-            ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
+            ws_crons: vec![], ws_cron_selected: 0, ws_cron_form_active: false, ws_cron_form_edit: false, ws_cron_form_schedule: String::new(), ws_cron_form_description: String::new(), ws_cron_form_focus: 0, ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
             interrupted_ops, diag_task_running: false,
@@ -2331,6 +2337,155 @@ print('ok')
         self.ws_content_scroll = 0;
     }
 
+    fn open_cron_form(&mut self, edit_existing: bool) {
+        self.ws_cron_form_active = true;
+        self.ws_cron_form_edit = edit_existing;
+        self.ws_cron_form_focus = 0;
+        if edit_existing {
+            if let Some(cron) = self.ws_crons.get(self.ws_cron_selected) {
+                self.ws_cron_form_schedule = cron.schedule.clone();
+                self.ws_cron_form_description = cron.description.clone();
+            } else {
+                self.ws_cron_form_schedule.clear();
+                self.ws_cron_form_description.clear();
+            }
+        } else {
+            self.ws_cron_form_schedule.clear();
+            self.ws_cron_form_description.clear();
+        }
+    }
+
+    fn start_cron_operation(&mut self, mode: CronOpMode) {
+        if self.selected >= self.agents.len() { return; }
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let name = agent.name.clone();
+        let mode_name = match mode {
+            CronOpMode::Add => "add",
+            CronOpMode::Edit => "edit",
+            CronOpMode::Delete => "delete",
+        };
+        let cron_id = match mode {
+            CronOpMode::Add => String::new(),
+            CronOpMode::Edit | CronOpMode::Delete => match self.ws_crons.get(self.ws_cron_selected) {
+                Some(c) if !c.id.is_empty() => c.id.clone(),
+                _ => {
+                    self.toast("⚠ Select a cron job with a valid ID first");
+                    return;
+                }
+            },
+        };
+        let schedule = self.ws_cron_form_schedule.trim().to_string();
+        let description = self.ws_cron_form_description.trim().to_string();
+        if !matches!(mode, CronOpMode::Delete) && (schedule.is_empty() || description.is_empty()) {
+            self.toast("⚠ Cron schedule and description are required");
+            return;
+        }
+
+        self.diag_active = true;
+        self.diag_auto_fix = false;
+        self.diag_start = Some(Instant::now());
+        self.diag_title = Some(format!(" ⏰ Cron manager — {} ", name));
+        self.diag_overlay_scroll = 0;
+        self.diag_steps.clear();
+        self.diag_task_running = true;
+
+        let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
+        self.diag_rx = Some(rx);
+
+        let escaped_mode = shell::escape(mode_name);
+        let escaped_id = shell::escape(&cron_id);
+        let escaped_schedule = shell::escape(&schedule);
+        let escaped_desc = shell::escape(&description);
+        tokio::spawn(async move {
+            let action_label = match mode {
+                CronOpMode::Add => "Add cron job",
+                CronOpMode::Edit => "Edit cron job",
+                CronOpMode::Delete => "Delete cron job",
+            };
+            let _ = tx.send(DiagStep { label: action_label.into(), status: DiagStatus::Running, detail: String::new() });
+            let cmd = format!(
+                "CRON_MODE={} CRON_ID={} CRON_SCHEDULE={} CRON_DESC={} python3 - <<'PY'\n\
+import json, os, time\n\
+path = os.path.expanduser('~/.openclaw/cron/jobs.json')\n\
+os.makedirs(os.path.dirname(path), exist_ok=True)\n\
+try:\n\
+    with open(path, 'r', encoding='utf-8') as f:\n\
+        data = json.load(f)\n\
+except Exception:\n\
+    data = {{}}\n\
+jobs = data.get('jobs', [])\n\
+if not isinstance(jobs, list):\n\
+    jobs = []\n\
+mode = os.environ.get('CRON_MODE', 'add')\n\
+cid = os.environ.get('CRON_ID', '')\n\
+sched = os.environ.get('CRON_SCHEDULE', '').strip()\n\
+desc = os.environ.get('CRON_DESC', '').strip()\n\
+if mode == 'delete':\n\
+    jobs = [j for j in jobs if str(j.get('id', '')) != cid]\n\
+else:\n\
+    if not sched:\n\
+        raise SystemExit('missing schedule')\n\
+    if not desc:\n\
+        raise SystemExit('missing description')\n\
+    if not cid:\n\
+        cid = f'sam-{{int(time.time() * 1000)}}'\n\
+    current = None\n\
+    for j in jobs:\n\
+        if str(j.get('id', '')) == cid:\n\
+            current = j\n\
+            break\n\
+    if current is None:\n\
+        current = {{'id': cid, 'enabled': True, 'sessionTarget': 'main'}}\n\
+        jobs.append(current)\n\
+    current['id'] = cid\n\
+    current['name'] = desc\n\
+    current['description'] = desc\n\
+    current['prompt'] = desc\n\
+    current['enabled'] = bool(current.get('enabled', True))\n\
+    current['sessionTarget'] = current.get('sessionTarget') or 'main'\n\
+    sched_obj = current.get('schedule')\n\
+    if not isinstance(sched_obj, dict):\n\
+        sched_obj = {{}}\n\
+    sched_obj['kind'] = 'cron'\n\
+    sched_obj['cron'] = sched\n\
+    current['schedule'] = sched_obj\n\
+data['jobs'] = jobs\n\
+with open(path, 'w', encoding='utf-8') as f:\n\
+    json.dump(data, f, indent=2)\n\
+print('ok')\n\
+PY",
+                escaped_mode, escaped_id, escaped_schedule, escaped_desc
+            );
+            let output = tokio::time::timeout(
+                Duration::from_secs(8),
+                Command::new("ssh")
+                    .args([
+                        "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), &cmd,
+                    ])
+                    .output(),
+            ).await;
+            match output {
+                Ok(Ok(o)) if o.status.success() => {
+                    let _ = tx.send(DiagStep { label: action_label.into(), status: DiagStatus::Pass, detail: "saved".into() });
+                    let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Cron update complete [reload-workspace]".into() });
+                }
+                Ok(Ok(o)) => {
+                    let err = String::from_utf8_lossy(&o.stderr).trim().chars().take(120).collect::<String>();
+                    let detail = if err.is_empty() { "remote command failed".to_string() } else { err };
+                    let _ = tx.send(DiagStep { label: action_label.into(), status: DiagStatus::Fail, detail });
+                    let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cron update failed".into() });
+                }
+                _ => {
+                    let _ = tx.send(DiagStep { label: action_label.into(), status: DiagStatus::Fail, detail: "timeout or SSH error".into() });
+                    let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cron update failed".into() });
+                }
+            }
+        });
+    }
+
     /// Push current edit state onto undo stack (single-level: clears before pushing)
     fn ws_push_undo(&mut self) {
         self.ws_undo_stack.clear();
@@ -2607,6 +2762,13 @@ struct CronEntry {
     schedule: String,
     description: String,
     enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CronOpMode {
+    Add,
+    Edit,
+    Delete,
 }
 
 /// OpenClaw service/plugin entry
@@ -3980,7 +4142,7 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
         items.push(Line::from(""));
         items.push(Line::from(Span::styled("  ⏰ Cron Jobs", Style::default().fg(t.header_title).bold())));
         items.push(Line::from(""));
-        for cron in &app.ws_crons {
+        for (idx, cron) in app.ws_crons.iter().enumerate() {
             let icon = if cron.enabled { "●" } else { "○" };
             let color = if cron.enabled { t.status_online } else { t.text_dim };
             let desc: String = if cron.description.len() > 22 {
@@ -3988,10 +4150,15 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 cron.description.clone()
             };
+            let row_style = if idx == app.ws_cron_selected {
+                Style::default().fg(Color::Black).bg(t.accent).bold()
+            } else {
+                Style::default().fg(t.text)
+            };
             items.push(Line::from(vec![
                 Span::styled(format!("   {} ", icon), Style::default().fg(color)),
                 Span::styled(format!("{:<8}", cron.schedule), Style::default().fg(t.text_dim)),
-                Span::styled(desc, Style::default().fg(t.text)),
+                Span::styled(desc, row_style),
             ]));
         }
     }
@@ -4005,7 +4172,8 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
     // Keybind hints
     items.push(Line::from(""));
     items.push(Line::from(Span::styled("  ↑↓ select  Enter view", Style::default().fg(t.text_dim))));
-    items.push(Line::from(Span::styled("  e edit  Tab→chat", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  e edit file  [/ ] cron", Style::default().fg(t.text_dim))));
+    items.push(Line::from(Span::styled("  n add cron  E edit  x delete", Style::default().fg(t.text_dim))));
 
     let file_panel = Paragraph::new(items)
         .block(Block::default()
@@ -4016,7 +4184,31 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(file_panel, split[0]);
 
     // Right: file content viewer / editor
-    let content_text = if app.ws_editing {
+    let content_text = if app.ws_cron_form_active {
+        vec![
+            Line::from(Span::styled(
+                if app.ws_cron_form_edit { "Editing cron job" } else { "Create cron job" },
+                Style::default().fg(t.accent).bold(),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Schedule: ", Style::default().fg(t.text_dim)),
+                Span::styled(
+                    app.ws_cron_form_schedule.clone(),
+                    if app.ws_cron_form_focus == 0 { Style::default().fg(Color::Black).bg(t.status_busy) } else { Style::default().fg(t.text) },
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Description: ", Style::default().fg(t.text_dim)),
+                Span::styled(
+                    app.ws_cron_form_description.clone(),
+                    if app.ws_cron_form_focus == 1 { Style::default().fg(Color::Black).bg(t.status_busy) } else { Style::default().fg(t.text) },
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Tab switch field  Enter save  Esc cancel", Style::default().fg(t.text_dim))),
+        ]
+    } else if app.ws_editing {
         let (cur_line, cur_col) = app.ws_cursor;
         app.ws_edit_buffer.iter().enumerate().map(|(i, line)| {
             let gutter = Span::styled(format!("{:>4} │ ", i + 1), Style::default().fg(t.text_dim));
@@ -4632,7 +4824,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
             Focus::Workspace if app.ws_editing => vec![("^S","save"),("^Z","undo"),("↑↓←→","cursor"),("Esc","discard?")],
-            Focus::Workspace => vec![("⏎","view"),("e","edit"),("r","reload"),("Esc","info"),("1-5","tabs")],
+            Focus::Workspace if app.ws_cron_form_active => vec![("Tab","field"),("⏎","save"),("Esc","cancel")],
+            Focus::Workspace => vec![("⏎","view"),("e","edit"),("n","add cron"),("E/x","edit/del"),("r","reload"),("Esc","info"),("1-5","tabs")],
             Focus::Services => vec![("␣","toggle"),("r","reload"),("Esc","info"),("1-5","tabs")],
             _ => vec![("⏎","detail"),("d","check"),("D","fix"),("U","update"),("w","files"),("t","tasks"),("5","svc"),("Tab","chat"),("Esc","back")],
         },
@@ -5163,7 +5356,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('q') => app.should_quit = true,
                                 _ => {}
                             },
-                            Focus::Workspace => if app.ws_editing {
+                            Focus::Workspace => if app.ws_cron_form_active {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        app.ws_cron_form_active = false;
+                                        app.ws_cron_form_schedule.clear();
+                                        app.ws_cron_form_description.clear();
+                                        app.ws_cron_form_focus = 0;
+                                    }
+                                    KeyCode::Tab => {
+                                        app.ws_cron_form_focus = (app.ws_cron_form_focus + 1) % 2;
+                                    }
+                                    KeyCode::Enter => {
+                                        let mode = if app.ws_cron_form_edit { CronOpMode::Edit } else { CronOpMode::Add };
+                                        app.ws_cron_form_active = false;
+                                        app.start_cron_operation(mode);
+                                    }
+                                    KeyCode::Backspace => {
+                                        if app.ws_cron_form_focus == 0 {
+                                            app.ws_cron_form_schedule.pop();
+                                        } else {
+                                            app.ws_cron_form_description.pop();
+                                        }
+                                    }
+                                    KeyCode::Char(c) => {
+                                        if app.ws_cron_form_focus == 0 {
+                                            app.ws_cron_form_schedule.push(c);
+                                        } else {
+                                            app.ws_cron_form_description.push(c);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else if app.ws_editing {
                                 // Any key except Esc resets discard confirm prompt
                                 if !matches!(key.code, KeyCode::Esc) { app.ws_discard_confirm = false; }
                                 match key.code {
@@ -5305,6 +5530,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('5') => { app.focus = Focus::Services; app.start_services_load(); }
                                 KeyCode::Up => { if app.ws_selected > 0 { app.ws_selected -= 1; } }
                                 KeyCode::Down => { if app.ws_selected < app.ws_files.len().saturating_sub(1) { app.ws_selected += 1; } }
+                                KeyCode::Char('[') => { app.ws_cron_selected = app.ws_cron_selected.saturating_sub(1); }
+                                KeyCode::Char(']') => { if app.ws_cron_selected < app.ws_crons.len().saturating_sub(1) { app.ws_cron_selected += 1; } }
                                 KeyCode::Enter => app.start_file_load(),
                                 KeyCode::Char('e') => {
                                     if let Some(ref c) = app.ws_content {
@@ -5318,6 +5545,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         app.start_file_load();
                                     }
                                 }
+                                KeyCode::Char('n') => app.open_cron_form(false),
+                                KeyCode::Char('E') => app.open_cron_form(true),
+                                KeyCode::Char('x') => app.start_cron_operation(CronOpMode::Delete),
                                 KeyCode::Char('r') => app.start_workspace_load(),
                                 KeyCode::PageUp => app.ws_content_scroll = app.ws_content_scroll.saturating_add(5),
                                 KeyCode::PageDown => app.ws_content_scroll = app.ws_content_scroll.saturating_sub(5),
@@ -5921,15 +6151,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Receive diagnostic steps (non-blocking)
         if app.diag_active {
+            let mut should_reload_workspace = false;
             if let Some(ref mut rx) = app.diag_rx {
-                while let Ok(step) = rx.try_recv() {
+                while let Ok(mut step) = rx.try_recv() {
+                    let reload_workspace = step.label == "DONE" && step.detail.contains("[reload-workspace]");
+                    if reload_workspace {
+                        step.detail = step.detail.replace(" [reload-workspace]", "");
+                    }
                     let is_done = step.label == "DONE";
                     app.diag_steps.push(step);
                     if is_done {
                         // Mark task as no longer running (overlay stays open for user to read)
                         app.diag_task_running = false;
                     }
+                    if reload_workspace {
+                        should_reload_workspace = true;
+                    }
                 }
+            }
+            if should_reload_workspace {
+                app.start_workspace_load();
             }
         }
 
@@ -5998,6 +6239,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok((files, crons)) = rx.try_recv() {
                 app.ws_files = files;
                 app.ws_crons = crons;
+                if app.ws_cron_selected >= app.ws_crons.len() {
+                    app.ws_cron_selected = app.ws_crons.len().saturating_sub(1);
+                }
                 app.ws_loading = false;
                 let found = app.ws_files.iter().filter(|f| f.exists).count();
                 app.toast(&format!("✓ Loaded workspace — {}/{} files found", found, app.ws_files.len()));
@@ -6105,11 +6349,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let wait_start = std::time::Instant::now();
                 while app.diag_task_running && wait_start.elapsed() < Duration::from_secs(3) {
                     tokio::time::sleep(Duration::from_millis(250)).await;
+                    let mut should_reload_workspace = false;
                     if let Some(ref mut rx) = app.diag_rx {
-                        while let Ok(step) = rx.try_recv() {
+                        while let Ok(mut step) = rx.try_recv() {
+                            if step.label == "DONE" && step.detail.contains("[reload-workspace]") {
+                                step.detail = step.detail.replace(" [reload-workspace]", "");
+                                should_reload_workspace = true;
+                            }
                             if step.label == "DONE" { app.diag_task_running = false; }
                             app.diag_steps.push(step);
                         }
+                    }
+                    if should_reload_workspace {
+                        app.start_workspace_load();
                     }
                 }
             }
