@@ -34,7 +34,10 @@ use std::env;
 /// Build a MySQL connection URL from individual components, percent-encoding
 /// special characters (`$` → `%24`, `@` → `%40`, `#` → `%23`) in the password.
 pub fn build_db_url(host: &str, port: &str, user: &str, pass: &str, db: &str) -> String {
-    let encoded_pass = pass.replace("$", "%24").replace("@", "%40").replace("#", "%23");
+    let encoded_pass = pass
+        .replace("$", "%24")
+        .replace("@", "%40")
+        .replace("#", "%23");
     format!("mysql://{}:{}@{}:{}/{}", user, encoded_pass, host, port, db)
 }
 
@@ -45,15 +48,14 @@ pub fn build_db_url(host: &str, port: &str, user: &str, pass: &str, db: &str) ->
 /// 2. `SAM_DB_HOST` / `SAM_DB_PORT` / `SAM_DB_USER` / `SAM_DB_PASS` / `SAM_DB_NAME`
 /// 3. Defaults: `127.0.0.1:3306`, user `root`, empty password, database `sam_fleet`
 pub fn get_pool() -> Pool {
-    let url = env::var("SAM_DB_URL")
-        .unwrap_or_else(|_| {
-            let host = env::var("SAM_DB_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-            let port = env::var("SAM_DB_PORT").unwrap_or_else(|_| "3306".into());
-            let user = env::var("SAM_DB_USER").unwrap_or_else(|_| "root".into());
-            let pass = env::var("SAM_DB_PASS").unwrap_or_else(|_| String::new());
-            let db = env::var("SAM_DB_NAME").unwrap_or_else(|_| "sam_fleet".into());
-            build_db_url(&host, &port, &user, &pass, &db)
-        });
+    let url = env::var("SAM_DB_URL").unwrap_or_else(|_| {
+        let host = env::var("SAM_DB_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        let port = env::var("SAM_DB_PORT").unwrap_or_else(|_| "3306".into());
+        let user = env::var("SAM_DB_USER").unwrap_or_else(|_| "root".into());
+        let pass = env::var("SAM_DB_PASS").unwrap_or_else(|_| String::new());
+        let db = env::var("SAM_DB_NAME").unwrap_or_else(|_| "sam_fleet".into());
+        build_db_url(&host, &port, &user, &pass, &db)
+    });
     Pool::new(url.as_str())
 }
 
@@ -88,8 +90,9 @@ pub async fn run_migrations(pool: &Pool) -> Result<(), mysql_async::Error> {
         (),
     ).await;
     // Ensure mc_operations table exists
-    let _ = conn.exec_drop(
-        r"CREATE TABLE IF NOT EXISTS mc_operations (
+    let _ = conn
+        .exec_drop(
+            r"CREATE TABLE IF NOT EXISTS mc_operations (
             id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
             agent VARCHAR(64) NOT NULL,
             op_type VARCHAR(32) NOT NULL,
@@ -98,8 +101,21 @@ pub async fn run_migrations(pool: &Pool) -> Result<(), mysql_async::Error> {
             started_at DATETIME NOT NULL DEFAULT NOW(),
             completed_at DATETIME
         )",
-        (),
-    ).await;
+            (),
+        )
+        .await;
+    let _ = conn
+        .exec_drop(
+            "ALTER TABLE mc_chat ADD COLUMN IF NOT EXISTS thread_id VARCHAR(36) DEFAULT NULL",
+            (),
+        )
+        .await;
+    let _ = conn
+        .exec_drop(
+            "ALTER TABLE mc_chat ADD COLUMN IF NOT EXISTS parent_id BIGINT DEFAULT NULL",
+            (),
+        )
+        .await;
     Ok(())
 }
 
@@ -108,12 +124,16 @@ pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error>
     let rows: Vec<mysql_async::Row> = conn.query(
         "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token, ssh_user FROM mc_fleet_status ORDER BY agent_name",
     ).await?;
-    let agents = rows.into_iter().map(|r| {
-        DbAgent {
+    let agents = rows
+        .into_iter()
+        .map(|r| DbAgent {
             agent_name: r.get::<Option<String>, _>(0).flatten().unwrap_or_default(),
             hostname: r.get::<Option<String>, _>(1).flatten(),
             tailscale_ip: r.get::<Option<String>, _>(2).flatten(),
-            status: r.get::<Option<String>, _>(3).flatten().unwrap_or_else(|| "unknown".into()),
+            status: r
+                .get::<Option<String>, _>(3)
+                .flatten()
+                .unwrap_or_else(|| "unknown".into()),
             oc_version: r.get::<Option<String>, _>(4).flatten(),
             os_info: r.get::<Option<String>, _>(5).flatten(),
             kernel: r.get::<Option<String>, _>(6).flatten(),
@@ -124,15 +144,19 @@ pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error>
             gateway_port: r.get::<Option<i32>, _>(11).flatten().unwrap_or(18789),
             gateway_token: r.get::<Option<String>, _>(12).flatten(),
             ssh_user: r.get::<Option<String>, _>(13).flatten(),
-        }
-    }).collect();
+        })
+        .collect();
     Ok(agents)
 }
 
 /// Update an agent's status fields. Delegates to [`update_agent_status_full`] with `latency_ms = None`.
 pub async fn update_agent_status(
-    pool: &Pool, agent_name: &str, status: &str,
-    os_info: Option<&str>, kernel: Option<&str>, oc_version: Option<&str>,
+    pool: &Pool,
+    agent_name: &str,
+    status: &str,
+    os_info: Option<&str>,
+    kernel: Option<&str>,
+    oc_version: Option<&str>,
 ) -> Result<(), mysql_async::Error> {
     update_agent_status_full(pool, agent_name, status, os_info, kernel, oc_version, None).await
 }
@@ -140,8 +164,12 @@ pub async fn update_agent_status(
 /// Update an agent's status, OS info, kernel, OpenClaw version, and optionally latency.
 /// Only non-`None` values overwrite existing DB data (`COALESCE` semantics).
 pub async fn update_agent_status_full(
-    pool: &Pool, agent_name: &str, status: &str,
-    os_info: Option<&str>, kernel: Option<&str>, oc_version: Option<&str>,
+    pool: &Pool,
+    agent_name: &str,
+    status: &str,
+    os_info: Option<&str>,
+    kernel: Option<&str>,
+    oc_version: Option<&str>,
     latency_ms: Option<u32>,
 ) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
@@ -163,10 +191,26 @@ pub struct ChatMessage {
     pub kind: String,
     pub created_at: String,
     pub responded_at: Option<String>,
+    pub thread_id: Option<String>,
+    pub parent_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadSummary {
+    pub thread_id: String,
+    pub target: Option<String>,
+    pub title: String,
+    pub preview: String,
+    pub last_at: String,
 }
 
 /// Send a direct message to a specific agent
-pub async fn send_direct(pool: &Pool, sender: &str, target: &str, message: &str) -> Result<i64, mysql_async::Error> {
+pub async fn send_direct(
+    pool: &Pool,
+    sender: &str,
+    target: &str,
+    message: &str,
+) -> Result<i64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     conn.exec_drop(
         "INSERT INTO mc_chat (sender, target, message, status, kind) VALUES (?, ?, ?, 'pending', 'direct')",
@@ -177,7 +221,12 @@ pub async fn send_direct(pool: &Pool, sender: &str, target: &str, message: &str)
 }
 
 /// Send a global broadcast (one row per agent)
-pub async fn send_broadcast(pool: &Pool, sender: &str, message: &str, agents: &[String]) -> Result<Vec<i64>, mysql_async::Error> {
+pub async fn send_broadcast(
+    pool: &Pool,
+    sender: &str,
+    message: &str,
+    agents: &[String],
+) -> Result<Vec<i64>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let mut ids = vec![];
     for agent in agents {
@@ -192,99 +241,182 @@ pub async fn send_broadcast(pool: &Pool, sender: &str, message: &str, agents: &[
 }
 
 /// Load global chat (broadcasts only) for dashboard
-pub async fn load_global_chat(pool: &Pool, limit: u32) -> Result<Vec<ChatMessage>, mysql_async::Error> {
+pub async fn load_global_chat(
+    pool: &Pool,
+    limit: u32,
+) -> Result<Vec<ChatMessage>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let messages: Vec<ChatMessage> = conn.exec_map(
-        "SELECT id, sender, target, message, response, status, kind, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s') FROM mc_chat WHERE kind='global' ORDER BY id DESC LIMIT ?",
+        "SELECT id, sender, target, message, response, status, kind, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s'), thread_id, parent_id FROM mc_chat WHERE kind='global' ORDER BY id DESC LIMIT ?",
         (limit,),
-        |(id, sender, target, message, response, status, kind, created_at, responded_at)| {
-            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at }
+        |(id, sender, target, message, response, status, kind, created_at, responded_at, thread_id, parent_id)| {
+            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at, thread_id, parent_id }
         },
     ).await?;
     Ok(messages.into_iter().rev().collect())
 }
 
 /// Load direct messages for a specific agent
-pub async fn load_agent_chat(pool: &Pool, agent: &str, limit: u32) -> Result<Vec<ChatMessage>, mysql_async::Error> {
+pub async fn load_agent_chat(
+    pool: &Pool,
+    agent: &str,
+    limit: u32,
+) -> Result<Vec<ChatMessage>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let messages: Vec<ChatMessage> = conn.exec_map(
-        "SELECT id, sender, target, message, response, status, kind, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s') FROM mc_chat WHERE kind='direct' AND target=? ORDER BY id DESC LIMIT ?",
+        "SELECT id, sender, target, message, response, status, kind, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s'), thread_id, parent_id FROM mc_chat WHERE kind='direct' AND target=? ORDER BY id DESC LIMIT ?",
         (agent, limit),
-        |(id, sender, target, message, response, status, kind, created_at, responded_at)| {
-            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at }
+        |(id, sender, target, message, response, status, kind, created_at, responded_at, thread_id, parent_id)| {
+            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at, thread_id, parent_id }
         },
     ).await?;
     Ok(messages.into_iter().rev().collect())
 }
 
 /// Legacy: load all chat (for backward compat)
-pub async fn load_chat_history(pool: &Pool, limit: u32) -> Result<Vec<ChatMessage>, mysql_async::Error> {
+pub async fn load_chat_history(
+    pool: &Pool,
+    limit: u32,
+) -> Result<Vec<ChatMessage>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let messages: Vec<ChatMessage> = conn.exec_map(
-        "SELECT id, sender, target, message, response, status, COALESCE(kind,'global'), DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s') FROM mc_chat ORDER BY id DESC LIMIT ?",
+        "SELECT id, sender, target, message, response, status, COALESCE(kind,'global'), DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s'), thread_id, parent_id FROM mc_chat ORDER BY id DESC LIMIT ?",
         (limit,),
-        |(id, sender, target, message, response, status, kind, created_at, responded_at)| {
-            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at }
+        |(id, sender, target, message, response, status, kind, created_at, responded_at, thread_id, parent_id)| {
+            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at, thread_id, parent_id }
         },
     ).await?;
     Ok(messages.into_iter().rev().collect())
 }
 
 /// Insert a chat message into `mc_chat` and return its row ID.
-pub async fn send_chat(pool: &Pool, sender: &str, target: Option<&str>, message: &str) -> Result<i64, mysql_async::Error> {
+pub async fn send_chat(
+    pool: &Pool,
+    sender: &str,
+    target: Option<&str>,
+    message: &str,
+) -> Result<i64, mysql_async::Error> {
+    send_chat_threaded(pool, sender, target, message, None, None).await
+}
+
+/// Insert a chat message into `mc_chat` with optional thread metadata and return its row ID.
+pub async fn send_chat_threaded(
+    pool: &Pool,
+    sender: &str,
+    target: Option<&str>,
+    message: &str,
+    thread_id: Option<&str>,
+    parent_id: Option<i64>,
+) -> Result<i64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let kind = if target.is_some() { "direct" } else { "global" };
     conn.exec_drop(
-        "INSERT INTO mc_chat (sender, target, message, status, kind) VALUES (?, ?, ?, 'pending', ?)",
-        (sender, target, message, kind),
+        "INSERT INTO mc_chat (sender, target, message, status, kind, thread_id, parent_id) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+        (sender, target, message, kind, thread_id, parent_id),
     ).await?;
     let id: Option<i64> = conn.query_first("SELECT LAST_INSERT_ID()").await?;
     Ok(id.unwrap_or(0))
 }
 
 /// Retrieve all pending chat messages addressed to `agent_name`.
-pub async fn get_pending_for_agent(pool: &Pool, agent_name: &str) -> Result<Vec<ChatMessage>, mysql_async::Error> {
+pub async fn get_pending_for_agent(
+    pool: &Pool,
+    agent_name: &str,
+) -> Result<Vec<ChatMessage>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let messages: Vec<ChatMessage> = conn.exec_map(
-        "SELECT id, sender, target, message, response, status, kind, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s') FROM mc_chat WHERE target=? AND status='pending' ORDER BY id",
+        "SELECT id, sender, target, message, response, status, kind, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s'), thread_id, parent_id FROM mc_chat WHERE target=? AND status='pending' ORDER BY id",
         (agent_name,),
-        |(id, sender, target, message, response, status, kind, created_at, responded_at)| {
-            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at }
+        |(id, sender, target, message, response, status, kind, created_at, responded_at, thread_id, parent_id)| {
+            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at, thread_id, parent_id }
         },
     ).await?;
     Ok(messages)
 }
 
+/// Load a full direct-message thread by `thread_id`, oldest-first.
+pub async fn load_thread(
+    pool: &Pool,
+    thread_id: &str,
+    limit: u32,
+) -> Result<Vec<ChatMessage>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let messages: Vec<ChatMessage> = conn.exec_map(
+        "SELECT id, sender, target, message, response, status, kind, DATE_FORMAT(created_at, '%H:%i:%s'), DATE_FORMAT(responded_at, '%H:%i:%s'), thread_id, parent_id FROM mc_chat WHERE thread_id=? ORDER BY id DESC LIMIT ?",
+        (thread_id, limit),
+        |(id, sender, target, message, response, status, kind, created_at, responded_at, thread_id, parent_id)| {
+            ChatMessage { id, sender, target, message, response, status, kind, created_at, responded_at, thread_id, parent_id }
+        },
+    ).await?;
+    Ok(messages.into_iter().rev().collect())
+}
+
+/// List recent direct-message thread roots for an agent (active within 24h).
+pub async fn list_threads(
+    pool: &Pool,
+    agent: &str,
+    limit: u32,
+) -> Result<Vec<ThreadSummary>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let threads: Vec<ThreadSummary> = conn.exec_map(
+        "SELECT thread_id, target, LEFT(message, 40) AS title, LEFT(message, 80) AS preview, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS last_at \
+         FROM mc_chat \
+         WHERE kind='direct' AND target=? AND parent_id IS NULL AND thread_id IS NOT NULL \
+           AND created_at >= (NOW() - INTERVAL 24 HOUR) \
+         ORDER BY created_at DESC LIMIT ?",
+        (agent, limit),
+        |(thread_id, target, title, preview, last_at)| ThreadSummary {
+            thread_id,
+            target,
+            title,
+            preview,
+            last_at,
+        },
+    ).await?;
+    Ok(threads)
+}
+
 /// Mark a chat message as responded, storing the agent's reply and timestamp.
-pub async fn respond_to_chat(pool: &Pool, msg_id: i64, response: &str) -> Result<(), mysql_async::Error> {
+pub async fn respond_to_chat(
+    pool: &Pool,
+    msg_id: i64,
+    response: &str,
+) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     conn.exec_drop(
         "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW(3) WHERE id=?",
         (response, msg_id),
-    ).await?;
+    )
+    .await?;
     Ok(())
 }
 
 /// Update just the status of a chat message (e.g. pending → thinking → streaming)
-pub async fn update_chat_status(pool: &Pool, msg_id: i64, status: &str) -> Result<(), mysql_async::Error> {
+pub async fn update_chat_status(
+    pool: &Pool,
+    msg_id: i64,
+    status: &str,
+) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
-    conn.exec_drop(
-        "UPDATE mc_chat SET status=? WHERE id=?",
-        (status, msg_id),
-    ).await?;
+    conn.exec_drop("UPDATE mc_chat SET status=? WHERE id=?", (status, msg_id))
+        .await?;
     Ok(())
 }
 
 /// Update partial response (streaming) without marking as complete
-pub async fn update_chat_partial(pool: &Pool, msg_id: i64, partial: &str) -> Result<(), mysql_async::Error> {
+pub async fn update_chat_partial(
+    pool: &Pool,
+    msg_id: i64,
+    partial: &str,
+) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     conn.exec_drop(
         "UPDATE mc_chat SET response=?, status='streaming' WHERE id=?",
         (partial, msg_id),
-    ).await?;
+    )
+    .await?;
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -427,7 +559,8 @@ mod tests {
     /// `complete_operation` static query must not embed user-supplied values.
     #[test]
     fn complete_operation_query_uses_placeholders() {
-        let static_query = "UPDATE mc_operations SET status=?, completed_at=NOW(), output=? WHERE id=?";
+        let static_query =
+            "UPDATE mc_operations SET status=?, completed_at=NOW(), output=? WHERE id=?";
         assert_eq!(static_query.matches('?').count(), 3);
     }
 
@@ -477,7 +610,13 @@ pub async fn load_tasks(pool: &Pool, limit: u32) -> Result<Vec<Task>, mysql_asyn
 
 /// Insert a new task into `mc_task_routing`. Status is set to `'assigned'` when
 /// `assigned_agent` is provided, otherwise `'queued'`. Returns the new task ID.
-pub async fn create_task(pool: &Pool, description: &str, priority: i32, created_by: &str, assigned_agent: Option<&str>) -> Result<i64, mysql_async::Error> {
+pub async fn create_task(
+    pool: &Pool,
+    description: &str,
+    priority: i32,
+    created_by: &str,
+    assigned_agent: Option<&str>,
+) -> Result<i64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     conn.exec_drop(
         "INSERT INTO mc_task_routing (task_description, priority, created_by, assigned_agent, status) VALUES (?, ?, ?, ?, IF(? IS NOT NULL, 'assigned', 'queued'))",
@@ -489,7 +628,11 @@ pub async fn create_task(pool: &Pool, description: &str, priority: i32, created_
 
 /// Update the status of a task. Sets `completed_at` for terminal states and
 /// `assigned_at` for active transitions.
-pub async fn update_task_status(pool: &Pool, task_id: i32, status: &str) -> Result<(), mysql_async::Error> {
+pub async fn update_task_status(
+    pool: &Pool,
+    task_id: i32,
+    status: &str,
+) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let extra = match status {
         "completed" | "failed" => ", completed_at=NOW()",
@@ -515,27 +658,36 @@ pub struct AgentCron {
 }
 
 /// Load all cron job definitions for `agent` from `mc_agent_crons`.
-pub async fn load_agent_crons(pool: &mysql_async::Pool, agent: &str) -> Result<Vec<AgentCron>, mysql_async::Error> {
+pub async fn load_agent_crons(
+    pool: &mysql_async::Pool,
+    agent: &str,
+) -> Result<Vec<AgentCron>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
     let rows: Vec<mysql_async::Row> = conn.exec(
         "SELECT agent_name, cron_id, name, schedule_kind, schedule_value, enabled, session_target, description FROM mc_agent_crons WHERE agent_name = ? ORDER BY enabled DESC, name",
         (agent,)
     ).await?;
-    Ok(rows.into_iter().map(|r| AgentCron {
-        agent_name: r.get::<Option<String>, _>(0).flatten().unwrap_or_default(),
-        cron_id: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
-        name: r.get::<Option<String>, _>(2).flatten().unwrap_or_default(),
-        schedule_kind: r.get::<Option<String>, _>(3).flatten().unwrap_or_default(),
-        schedule_value: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
-        enabled: r.get::<Option<i32>, _>(5).flatten().unwrap_or(0) != 0,
-        session_target: r.get::<Option<String>, _>(6).flatten().unwrap_or_default(),
-        description: r.get::<Option<String>, _>(7).flatten().unwrap_or_default(),
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| AgentCron {
+            agent_name: r.get::<Option<String>, _>(0).flatten().unwrap_or_default(),
+            cron_id: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
+            name: r.get::<Option<String>, _>(2).flatten().unwrap_or_default(),
+            schedule_kind: r.get::<Option<String>, _>(3).flatten().unwrap_or_default(),
+            schedule_value: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
+            enabled: r.get::<Option<i32>, _>(5).flatten().unwrap_or(0) != 0,
+            session_target: r.get::<Option<String>, _>(6).flatten().unwrap_or_default(),
+            description: r.get::<Option<String>, _>(7).flatten().unwrap_or_default(),
+        })
+        .collect())
 }
 
 /// Insert or update a cron job definition in `mc_agent_crons` (upsert on `agent_name, cron_id`).
-pub async fn upsert_agent_cron(pool: &mysql_async::Pool, c: &AgentCron) -> Result<(), mysql_async::Error> {
+pub async fn upsert_agent_cron(
+    pool: &mysql_async::Pool,
+    c: &AgentCron,
+) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
     conn.exec_drop(
@@ -556,7 +708,10 @@ pub struct AgentContext {
 }
 
 /// Persist a context snapshot for an agent into `mc_agent_context`.
-pub async fn save_agent_context(pool: &mysql_async::Pool, ctx: &AgentContext) -> Result<(), mysql_async::Error> {
+pub async fn save_agent_context(
+    pool: &mysql_async::Pool,
+    ctx: &AgentContext,
+) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
     conn.exec_drop(
@@ -567,7 +722,10 @@ pub async fn save_agent_context(pool: &mysql_async::Pool, ctx: &AgentContext) ->
 }
 
 /// Load the most recent context snapshot for `agent`, or `None` if no record exists.
-pub async fn load_latest_context(pool: &mysql_async::Pool, agent: &str) -> Result<Option<AgentContext>, mysql_async::Error> {
+pub async fn load_latest_context(
+    pool: &mysql_async::Pool,
+    agent: &str,
+) -> Result<Option<AgentContext>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
     let rows: Vec<mysql_async::Row> = conn.exec(
@@ -595,7 +753,6 @@ pub struct Operation {
     pub completed_at: Option<String>,
     pub output: Option<String>,
 }
-
 
 /// A row from mc_operations, used by `sam log`
 pub struct OperationRecord {
@@ -626,13 +783,27 @@ pub async fn get_operations(
             (tail,),
         ).await?
     };
-    Ok(rows.into_iter().map(|(id, agent_name, op_type, status, detail, created_at)| {
-        OperationRecord { id, agent_name, op_type, status, detail, created_at }
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, agent_name, op_type, status, detail, created_at)| OperationRecord {
+                id,
+                agent_name,
+                op_type,
+                status,
+                detail,
+                created_at,
+            },
+        )
+        .collect())
 }
 
 /// Record the start of an operation in `mc_operations`. Returns the new record ID.
-pub async fn create_operation(pool: &Pool, agent: &str, op_type: &str) -> Result<i64, mysql_async::Error> {
+pub async fn create_operation(
+    pool: &Pool,
+    agent: &str,
+    op_type: &str,
+) -> Result<i64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     conn.exec_drop(
         "INSERT INTO mc_operations (agent, op_type, status, started_at) VALUES (?, ?, 'running', NOW())",
@@ -643,12 +814,18 @@ pub async fn create_operation(pool: &Pool, agent: &str, op_type: &str) -> Result
 }
 
 /// Update an operation's final status, completion time, and optional output.
-pub async fn complete_operation(pool: &Pool, id: i64, status: &str, output: Option<&str>) -> Result<(), mysql_async::Error> {
+pub async fn complete_operation(
+    pool: &Pool,
+    id: i64,
+    status: &str,
+    output: Option<&str>,
+) -> Result<(), mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     conn.exec_drop(
         "UPDATE mc_operations SET status=?, completed_at=NOW(), output=? WHERE id=?",
         (status, output, id),
-    ).await?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -664,20 +841,25 @@ pub async fn mark_stale_operations_interrupted(pool: &Pool) -> Result<u64, mysql
 }
 
 /// Load all operations with `status='interrupted'`, most recent first (up to 20).
-pub async fn load_interrupted_operations(pool: &Pool) -> Result<Vec<Operation>, mysql_async::Error> {
+pub async fn load_interrupted_operations(
+    pool: &Pool,
+) -> Result<Vec<Operation>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let rows: Vec<mysql_async::Row> = conn.query(
         "SELECT id, agent, op_type, status, DATE_FORMAT(started_at, '%H:%i'), DATE_FORMAT(completed_at, '%H:%i'), output FROM mc_operations WHERE status='interrupted' ORDER BY id DESC LIMIT 20"
     ).await?;
-    Ok(rows.into_iter().map(|r| Operation {
-        id: r.get::<Option<i64>, _>(0).flatten().unwrap_or(0),
-        agent: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
-        op_type: r.get::<Option<String>, _>(2).flatten().unwrap_or_default(),
-        status: r.get::<Option<String>, _>(3).flatten().unwrap_or_default(),
-        started_at: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
-        completed_at: r.get::<Option<String>, _>(5).flatten(),
-        output: r.get::<Option<String>, _>(6).flatten(),
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| Operation {
+            id: r.get::<Option<i64>, _>(0).flatten().unwrap_or(0),
+            agent: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
+            op_type: r.get::<Option<String>, _>(2).flatten().unwrap_or_default(),
+            status: r.get::<Option<String>, _>(3).flatten().unwrap_or_default(),
+            started_at: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
+            completed_at: r.get::<Option<String>, _>(5).flatten(),
+            output: r.get::<Option<String>, _>(6).flatten(),
+        })
+        .collect())
 }
 
 // ── Spawned Agents ─────────────────────────────────
@@ -695,7 +877,12 @@ pub struct SpawnedAgent {
 
 /// Queue a sub-agent spawn request in `mc_spawned_agents` with status `'queued'`.
 /// Returns the new record ID.
-pub async fn spawn_agent(pool: &mysql_async::Pool, agent: &str, agent_id: &str, prompt: &str) -> Result<i64, mysql_async::Error> {
+pub async fn spawn_agent(
+    pool: &mysql_async::Pool,
+    agent: &str,
+    agent_id: &str,
+    prompt: &str,
+) -> Result<i64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
     conn.exec_drop(
@@ -706,21 +893,32 @@ pub async fn spawn_agent(pool: &mysql_async::Pool, agent: &str, agent_id: &str, 
 }
 
 /// Load the 50 most recent spawned-agent records, newest first.
-pub async fn load_spawned_agents(pool: &mysql_async::Pool) -> Result<Vec<SpawnedAgent>, mysql_async::Error> {
+pub async fn load_spawned_agents(
+    pool: &mysql_async::Pool,
+) -> Result<Vec<SpawnedAgent>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     use mysql_async::prelude::*;
     let rows: Vec<mysql_async::Row> = conn.exec(
         "SELECT id, agent_name, agent_id, session_key, prompt, status, response, created_at FROM mc_spawned_agents ORDER BY created_at DESC LIMIT 50",
         ()
     ).await?;
-    Ok(rows.into_iter().map(|r| SpawnedAgent {
-        id: r.get::<Option<i64>, _>(0).flatten().unwrap_or(0),
-        agent_name: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
-        agent_id: r.get::<Option<String>, _>(2).flatten().unwrap_or("main".into()),
-        session_key: r.get::<Option<String>, _>(3).flatten(),
-        prompt: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
-        status: r.get::<Option<String>, _>(5).flatten().unwrap_or("unknown".into()),
-        response: r.get::<Option<String>, _>(6).flatten(),
-        created_at: r.get::<Option<String>, _>(7).flatten().unwrap_or_default(),
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| SpawnedAgent {
+            id: r.get::<Option<i64>, _>(0).flatten().unwrap_or(0),
+            agent_name: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
+            agent_id: r
+                .get::<Option<String>, _>(2)
+                .flatten()
+                .unwrap_or("main".into()),
+            session_key: r.get::<Option<String>, _>(3).flatten(),
+            prompt: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
+            status: r
+                .get::<Option<String>, _>(5)
+                .flatten()
+                .unwrap_or("unknown".into()),
+            response: r.get::<Option<String>, _>(6).flatten(),
+            created_at: r.get::<Option<String>, _>(7).flatten().unwrap_or_default(),
+        })
+        .collect())
 }
