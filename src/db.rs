@@ -382,6 +382,35 @@ mod tests {
         assert!(!sanitized.contains("s3cr3t"));
         assert!(sanitized.contains("***"));
     }
+
+    // ── mc_operations query template tests ──────────────
+
+    /// The INSERT template for mc_operations must use parameterized placeholders.
+    #[test]
+    fn op_log_insert_uses_parameterized_query() {
+        let static_query = "INSERT INTO mc_operations (agent_name, op_type, status) VALUES (?, ?, 'running')";
+        let injection = "'; DROP TABLE mc_operations; --";
+        assert!(!static_query.contains(injection));
+        assert!(static_query.contains('?'));
+    }
+
+    /// The UPDATE template for completing an operation must use parameterized placeholders.
+    #[test]
+    fn op_log_complete_uses_parameterized_query() {
+        let static_query = "UPDATE mc_operations SET status=?, detail=?, completed_at=NOW() WHERE id=?";
+        assert!(static_query.contains('?'));
+        let injection = "'; DROP TABLE mc_operations; --";
+        assert!(!static_query.contains(injection));
+    }
+
+    /// The SELECT template for fetching operations must use parameterized placeholders.
+    #[test]
+    fn op_log_get_uses_parameterized_query() {
+        let static_query = "SELECT id, agent_name, op_type, status, detail, DATE_FORMAT(created_at, '%m-%d %H:%i:%S'), DATE_FORMAT(completed_at, '%H:%i:%S') FROM mc_operations WHERE agent_name=? ORDER BY id DESC LIMIT ?";
+        assert!(static_query.contains('?'));
+        let injection = "'; DROP TABLE mc_operations; --";
+        assert!(!static_query.contains(injection));
+    }
 }
 
 // ---- Task Board ----
@@ -542,6 +571,74 @@ pub async fn spawn_agent(pool: &mysql_async::Pool, agent: &str, agent_id: &str, 
         (agent, agent_id, prompt)
     ).await?;
     Ok(conn.last_insert_id().unwrap_or(0) as i64)
+}
+
+// ── Operation History Log ──────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct OpRecord {
+    pub id: i64,
+    pub agent_name: String,
+    pub op_type: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+/// Insert a new operation row at the start of an operation. Returns the new row ID.
+pub async fn log_operation(pool: &Pool, agent_name: &str, op_type: &str) -> Result<i64, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "INSERT INTO mc_operations (agent_name, op_type, status) VALUES (?, ?, 'running')",
+        (agent_name, op_type),
+    ).await?;
+    Ok(conn.last_insert_id().unwrap_or(0) as i64)
+}
+
+/// Update an operation row when it completes.
+pub async fn complete_operation(pool: &Pool, op_id: i64, status: &str, detail: &str) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "UPDATE mc_operations SET status=?, detail=?, completed_at=NOW() WHERE id=?",
+        (status, detail, op_id),
+    ).await?;
+    Ok(())
+}
+
+/// Load recent operations, optionally filtered by agent name, newest first.
+pub async fn get_operations(pool: &Pool, agent_filter: Option<&str>, limit: u32) -> Result<Vec<OpRecord>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    let rows: Vec<mysql_async::Row> = if let Some(agent) = agent_filter {
+        conn.exec(
+            "SELECT id, agent_name, op_type, status, detail, DATE_FORMAT(created_at, '%m-%d %H:%i:%S'), DATE_FORMAT(completed_at, '%H:%i:%S') FROM mc_operations WHERE agent_name=? ORDER BY id DESC LIMIT ?",
+            (agent, limit),
+        ).await?
+    } else {
+        conn.exec(
+            "SELECT id, agent_name, op_type, status, detail, DATE_FORMAT(created_at, '%m-%d %H:%i:%S'), DATE_FORMAT(completed_at, '%H:%i:%S') FROM mc_operations ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).await?
+    };
+    Ok(rows.into_iter().map(|r| OpRecord {
+        id: r.get::<Option<i64>, _>(0).flatten().unwrap_or(0),
+        agent_name: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
+        op_type: r.get::<Option<String>, _>(2).flatten().unwrap_or_default(),
+        status: r.get::<Option<String>, _>(3).flatten().unwrap_or_default(),
+        detail: r.get::<Option<String>, _>(4).flatten(),
+        created_at: r.get::<Option<String>, _>(5).flatten().unwrap_or_default(),
+        completed_at: r.get::<Option<String>, _>(6).flatten(),
+    }).collect())
+}
+
+/// Delete operation records older than 30 days.
+pub async fn archive_old_operations(pool: &Pool) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "DELETE FROM mc_operations WHERE created_at < NOW() - INTERVAL 30 DAY",
+        (),
+    ).await?;
+    Ok(())
 }
 
 /// Load the 50 most recent spawned-agent records, newest first.

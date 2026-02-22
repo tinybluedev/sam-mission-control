@@ -120,7 +120,7 @@ struct ChatLine {
 enum Focus { Fleet, Chat, AgentChat, Command, Workspace, Services }
 
 #[derive(PartialEq)]
-enum Screen { Dashboard, AgentDetail, TaskBoard, SpawnManager, VpnStatus, Alerts, Help }
+enum Screen { Dashboard, AgentDetail, TaskBoard, SpawnManager, VpnStatus, Alerts, Help, OperationLog }
 
 #[derive(PartialEq, Clone, Copy)]
 enum SortMode { Name, Status, Location, Version, Latency }
@@ -344,6 +344,12 @@ struct App {
     latest_oc_version: String,
     // Routing
     routed_msg_ids: std::collections::HashSet<i64>,
+    // Operation Log
+    op_log: Vec<db::OpRecord>,
+    op_log_selected: usize,
+    op_log_scroll: u16,
+    op_log_detail_scroll: u16,
+    op_log_rx: Option<mpsc::UnboundedReceiver<Vec<db::OpRecord>>>,
     // Background chat poll
     chat_poll_rx: Option<mpsc::UnboundedReceiver<ChatPollResult>>,
     chat_polling: bool,
@@ -437,6 +443,7 @@ impl App {
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
             ac_visible: false, ac_matches: vec![], ac_selected: 0, ac_start_pos: 0,
             latest_oc_version: String::new(),
+            op_log: vec![], op_log_selected: 0, op_log_scroll: 0, op_log_detail_scroll: 0, op_log_rx: None,
         }
     }
 
@@ -1142,6 +1149,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let name = agent.db_name.clone();
         let is_mac = agent.os.to_lowercase().contains("mac");
         let self_ip = self.self_ip.clone();
+        let op_pool = self.db_pool.clone();
 
         self.diag_active = true;
         self.diag_auto_fix = false;
@@ -1153,6 +1161,11 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         self.diag_rx = Some(rx);
 
         tokio::spawn(async move {
+            // Log operation start
+            let op_id = if let Some(ref pool) = op_pool {
+                db::log_operation(pool, &name, "oc_update").await.unwrap_or(0)
+            } else { 0 };
+
             let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
             // Step 1: current version
@@ -1231,6 +1244,15 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Fixed, detail: restart_msg.trim().to_string() });
 
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
+
+            // Log operation completion
+            if op_id > 0 {
+                if let Some(ref pool) = op_pool {
+                    let op_status = if install_ok { "pass" } else { "fail" };
+                    let op_detail = format!("new_version={} gateway={}", new_v.trim(), restart_msg.trim());
+                    let _ = db::complete_operation(pool, op_id, op_status, &op_detail).await;
+                }
+            }
         });
     }
 
@@ -1242,6 +1264,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         let name = agent.db_name.clone();
         let location = agent.location.clone();
         let gw_port = agent.gateway_port;
+        let op_pool = self.db_pool.clone();
         self.diag_active = true;
         self.diag_auto_fix = fix;
         self.diag_title = None;
@@ -1252,6 +1275,11 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
         self.diag_rx = Some(rx);
 
         tokio::spawn(async move {
+            // Log operation start
+            let op_id = if let Some(ref pool) = op_pool {
+                let op_type = if fix { "fix" } else { "diagnostics" };
+                db::log_operation(pool, &name, op_type).await.unwrap_or(0)
+            } else { 0 };
             let is_mac_check = Command::new("ssh").args([
                 "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                 &format!("{}@{}", user, host), "uname -s"
@@ -1593,6 +1621,11 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
 
             if !ssh_ok {
                 let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Cannot proceed without SSH — see details above".into() });
+                if op_id > 0 {
+                    if let Some(ref pool) = op_pool {
+                        let _ = db::complete_operation(pool, op_id, "fail", "SSH unreachable").await;
+                    }
+                }
                 return;
             }
 
@@ -1761,8 +1794,14 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             }
 
             // Done
-            let passes = 7; // we'll count from received steps
             let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "diagnostic complete".into() });
+
+            // Log operation completion
+            if op_id > 0 {
+                if let Some(ref pool) = op_pool {
+                    let _ = db::complete_operation(pool, op_id, "pass", "diagnostic complete").await;
+                }
+            }
         });
     }
 
@@ -3853,6 +3892,139 @@ fn render_spawn_manager(frame: &mut Frame, app: &App) {
     frame.render_widget(footer, outer[2]);
 }
 
+fn render_operation_log(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let outer = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
+        .split(frame.area());
+
+    let bg_block = Block::default().style(Style::default().bg(app.bg_density.bg()));
+    frame.render_widget(bg_block, frame.area());
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("📋 OPERATION LOG", Style::default().fg(t.header_title).bold()),
+        Span::raw("    "),
+        Span::styled(format!("{} entries", app.op_log.len()), Style::default().fg(t.text_dim)),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(header, outer[0]);
+
+    // Split body: left = list, right = detail
+    let body_chunks = Layout::default().direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(outer[1]);
+
+    // ── Left: operation list ──
+    let list_lines: Vec<Line> = if app.op_log.is_empty() {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("  No operations recorded yet.", Style::default().fg(t.text_dim))),
+            Line::from(""),
+            Line::from(Span::styled("  Operations are logged when you run", Style::default().fg(t.text_dim))),
+            Line::from(Span::styled("  'U' (update) or 'd'/'D' (diagnostics).", Style::default().fg(t.text_dim))),
+        ]
+    } else {
+        app.op_log.iter().enumerate().map(|(i, op)| {
+            let selected = i == app.op_log_selected;
+            let (status_icon, status_color) = match op.status.as_str() {
+                "pass" | "fixed" => ("✓", t.status_online),
+                "fail"           => ("✗", t.status_offline),
+                "running"        => ("⟳", t.status_busy),
+                _                => ("?", t.text_dim),
+            };
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(t.accent).bold()
+            } else {
+                Style::default()
+            };
+            let icon_style = if selected {
+                Style::default().fg(Color::Black).bg(t.accent).bold()
+            } else {
+                Style::default().fg(status_color)
+            };
+            Line::from(vec![
+                Span::styled(format!(" {} ", status_icon), icon_style),
+                Span::styled(format!("{:<8} ", op.op_type.chars().take(8).collect::<String>()), style),
+                Span::styled(format!("{:<13}", op.agent_name.chars().take(13).collect::<String>()), style),
+                Span::styled(format!(" {}", &op.created_at), Style::default().fg(if selected { Color::Black } else { t.text_dim }).bg(if selected { t.accent } else { app.bg_density.bg() })),
+            ])
+        }).collect()
+    };
+
+    let list = Paragraph::new(list_lines)
+        .scroll((app.op_log_scroll, 0))
+        .block(Block::default().title(Span::styled(" ◆── Operations ──◆ ", Style::default().fg(t.border_active).bold()))
+            .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(t.border_active))
+            .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(list, body_chunks[0]);
+
+    // ── Right: detail view ──
+    let detail_lines: Vec<Line> = if let Some(op) = app.op_log.get(app.op_log_selected) {
+        let mut lines: Vec<Line> = vec![
+            Line::from(vec![
+                Span::styled("  Agent:   ", Style::default().fg(t.text_dim)),
+                Span::styled(op.agent_name.clone(), Style::default().fg(t.accent).bold()),
+            ]),
+            Line::from(vec![
+                Span::styled("  Type:    ", Style::default().fg(t.text_dim)),
+                Span::styled(op.op_type.clone(), Style::default().fg(t.accent2)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Status:  ", Style::default().fg(t.text_dim)),
+                Span::styled(op.status.clone(), Style::default().fg(match op.status.as_str() {
+                    "pass" | "fixed" => t.status_online,
+                    "fail"           => t.status_offline,
+                    "running"        => t.status_busy,
+                    _                => t.text_dim,
+                })),
+            ]),
+            Line::from(vec![
+                Span::styled("  Started: ", Style::default().fg(t.text_dim)),
+                Span::styled(op.created_at.clone(), Style::default().fg(t.text)),
+            ]),
+        ];
+        if let Some(ref ct) = op.completed_at {
+            lines.push(Line::from(vec![
+                Span::styled("  Ended:   ", Style::default().fg(t.text_dim)),
+                Span::styled(ct.clone(), Style::default().fg(t.text)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        if let Some(ref detail) = op.detail {
+            lines.push(Line::from(Span::styled("  Output:", Style::default().fg(t.text_dim))));
+            lines.push(Line::from(Span::styled("  ──────────────────────────────────", Style::default().fg(t.border))));
+            for l in detail.lines() {
+                lines.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(t.text))));
+            }
+        } else {
+            lines.push(Line::from(Span::styled("  (no detail available)", Style::default().fg(t.text_dim))));
+        }
+        lines
+    } else {
+        vec![Line::from(""), Line::from(Span::styled("  No entry selected.", Style::default().fg(t.text_dim)))]
+    };
+
+    let detail = Paragraph::new(detail_lines)
+        .scroll((app.op_log_detail_scroll, 0))
+        .block(Block::default().title(Span::styled(" ◆── Detail ──◆ ", Style::default().fg(t.border_active).bold()))
+            .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(t.border_active))
+            .style(Style::default().bg(app.bg_density.bg()))
+            .padding(Padding::new(1, 1, 0, 0)));
+    frame.render_widget(detail, body_chunks[1]);
+
+    // ── Footer ──
+    let footer_msg = format!("Esc/q=back │ ↑↓=navigate │ PgUp/Dn=scroll detail │ r=refresh │ b=bg ({}) │ c=theme ({})",
+        app.bg_density.label(), app.theme_name.label());
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(footer_msg, Style::default().fg(t.text_dim)),
+    ])).block(Block::default().borders(Borders::ALL).border_type(t.border_type)
+        .border_style(Style::default().fg(t.border)).style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(footer, outer[2]);
+}
+
 fn render_help(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let theme_label = app.theme_name.label();
@@ -3979,6 +4151,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
         Screen::Help => "Help".to_string(),
         Screen::SpawnManager => "Dashboard › Spawn Manager".to_string(),
+        Screen::OperationLog => "Dashboard › Operation Log".to_string(),
         _ => "Dashboard".to_string(),
     };
 
@@ -3988,7 +4161,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Dashboard => match app.focus {
             Focus::Chat => vec![("Tab","fleet"),("⏎","send"),("@","target"),("Esc","back")],
             Focus::Command => vec![("⏎","run"),("Esc","cancel")],
-            _ => vec![("⏎","open"),("d","check"),("D","fix"),("U","update"),("u","update all"),("t","tasks"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
+            _ => vec![("⏎","open"),("d","check"),("D","fix"),("U","update"),("u","update all"),("t","tasks"),("L","log"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
         },
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
@@ -4004,6 +4177,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         },
         Screen::Help => vec![("Esc","back"),("q","quit")],
         Screen::SpawnManager => vec![("Esc","back"),("q","quit")],
+        Screen::OperationLog => vec![("↑↓","navigate"),("PgUp/Dn","scroll detail"),("r","refresh"),("Esc","back")],
         _ => vec![("Esc","back")],
     };
 
@@ -4091,6 +4265,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("sam v{}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Some(cli::Commands::Log { agent, tail }) => {
+            return cli::run_log(agent.as_deref(), tail).await.map_err(|e| e.into());
+        }
         None => {} // Launch TUI
     }
 
@@ -4160,6 +4337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Screen::Alerts => render_alerts(f, &app),
                 Screen::Help => render_help(f, &app),
                 Screen::SpawnManager => render_spawn_manager(f, &app),
+                Screen::OperationLog => render_operation_log(f, &app),
             }
             // Diagnostic overlay (renders on top of everything)
             if app.diag_active {
@@ -4648,6 +4826,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Char('c') => app.cycle_theme(),
                             _ => {}
                         },
+                        Screen::OperationLog => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => { app.screen = Screen::Dashboard; }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if app.op_log_selected > 0 { app.op_log_selected -= 1; app.op_log_detail_scroll = 0; }
+                                app.op_log_scroll = (app.op_log_selected.saturating_sub(5)) as u16;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.op_log_selected < app.op_log.len().saturating_sub(1) { app.op_log_selected += 1; app.op_log_detail_scroll = 0; }
+                                app.op_log_scroll = (app.op_log_selected.saturating_sub(5)) as u16;
+                            }
+                            KeyCode::PageUp => { app.op_log_detail_scroll = app.op_log_detail_scroll.saturating_sub(5); }
+                            KeyCode::PageDown => { app.op_log_detail_scroll = app.op_log_detail_scroll.saturating_add(5); }
+                            KeyCode::Char('r') => {
+                                if let Some(pool) = &app.db_pool {
+                                    let pool = pool.clone();
+                                    let (tx, rx) = mpsc::unbounded_channel();
+                                    app.op_log_rx = Some(rx);
+                                    tokio::spawn(async move {
+                                        let ops = db::get_operations(&pool, None, 100).await.unwrap_or_default();
+                                        let _ = tx.send(ops);
+                                    });
+                                }
+                            }
+                            KeyCode::Char('b') => app.cycle_bg(),
+                            KeyCode::Char('c') => app.cycle_theme(),
+                            _ => {}
+                        },
                         Screen::TaskBoard => {
                             if app.task_input_active {
                                 match key.code {
@@ -4952,6 +5157,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.screen = Screen::VpnStatus;
                                 }
                                 KeyCode::Char('x') => app.screen = Screen::SpawnManager,
+                                KeyCode::Char('L') => {
+                                    app.screen = Screen::OperationLog;
+                                    app.op_log_selected = 0;
+                                    app.op_log_scroll = 0;
+                                    app.op_log_detail_scroll = 0;
+                                    if let Some(pool) = &app.db_pool {
+                                        let pool = pool.clone();
+                                        let (tx, rx) = mpsc::unbounded_channel();
+                                        app.op_log_rx = Some(rx);
+                                        tokio::spawn(async move {
+                                            let ops = db::get_operations(&pool, None, 100).await.unwrap_or_default();
+                                            let _ = tx.send(ops);
+                                        });
+                                    }
+                                }
                                 KeyCode::Char('t') => {
                                     app.task_filter_agent = None;
                                     app.screen = Screen::TaskBoard;
@@ -5161,6 +5381,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref mut rx) = app.chat_poll_rx {
             while let Ok(result) = rx.try_recv() {
                 poll_results.push(result);
+            }
+        }
+
+        // Receive operation log results (non-blocking)
+        if let Some(ref mut rx) = app.op_log_rx {
+            if let Ok(ops) = rx.try_recv() {
+                app.op_log = ops;
+                app.op_log_rx = None;
             }
         }
         for result in poll_results {
