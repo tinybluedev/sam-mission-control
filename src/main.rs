@@ -123,6 +123,34 @@ enum Focus { Fleet, Chat, AgentChat, Command, Workspace, Services }
 enum Screen { Dashboard, AgentDetail, TaskBoard, SpawnManager, VpnStatus, Alerts, Help }
 
 #[derive(PartialEq, Clone, Copy)]
+enum GroupFilter { All, Home, SM, VPS, Mobile, Outdated, Offline }
+
+impl GroupFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Home,
+            Self::Home => Self::SM,
+            Self::SM => Self::VPS,
+            Self::VPS => Self::Mobile,
+            Self::Mobile => Self::Outdated,
+            Self::Outdated => Self::Offline,
+            Self::Offline => Self::All,
+        }
+    }
+    fn label(&self) -> &str {
+        match self {
+            Self::All => "All",
+            Self::Home => "Home",
+            Self::SM => "SM",
+            Self::VPS => "VPS",
+            Self::Mobile => "Mobile",
+            Self::Outdated => "Outdated",
+            Self::Offline => "Offline",
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy)]
 enum SortMode { Name, Status, Location, Version, Latency }
 
 impl SortMode {
@@ -285,6 +313,7 @@ struct App {
     // UI state
     spinner_frame: usize,
     sort_mode: SortMode,
+    group_filter: GroupFilter,
     // Layout hit zones (updated each frame)
     fleet_area: Rect,
     chat_area: Rect,
@@ -456,7 +485,7 @@ impl App {
             filter_active: false, filter_text: String::new(),
             alerts: vec![], alert_flash: None, alerts_scroll: 0, gateway_confirm_at: None,
             multi_selected: HashSet::new(),
-            spinner_frame: 0, sort_mode: SortMode::Name,
+            spinner_frame: 0, sort_mode: SortMode::Name, group_filter: GroupFilter::All,
             fleet_area: Rect::default(), chat_area: Rect::default(),
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
@@ -472,12 +501,22 @@ impl App {
     }
 
     fn next(&mut self) {
-        if self.agents.is_empty() { return; }
-        self.selected = (self.selected + 1) % self.agents.len();
+        let indices = self.filtered_agent_indices();
+        if indices.is_empty() { return; }
+        let pos = indices.iter().position(|&i| i == self.selected);
+        self.selected = match pos {
+            Some(p) if p + 1 < indices.len() => indices[p + 1],
+            _ => indices[0],
+        };
     }
     fn previous(&mut self) {
-        if self.agents.is_empty() { return; }
-        self.selected = self.selected.checked_sub(1).unwrap_or(self.agents.len() - 1);
+        let indices = self.filtered_agent_indices();
+        if indices.is_empty() { return; }
+        let pos = indices.iter().position(|&i| i == self.selected);
+        self.selected = match pos {
+            Some(0) | None => indices[indices.len() - 1],
+            Some(p) => indices[p - 1],
+        };
     }
 
     fn toast(&mut self, msg: &str) {
@@ -550,6 +589,11 @@ impl App {
         });
     }
 
+    fn cycle_group(&mut self) {
+        self.group_filter = self.group_filter.next();
+        self.selected = 0;
+    }
+
     fn cycle_bg(&mut self) {
         self.bg_density = self.bg_density.next();
         self.theme = Theme::resolve(self.theme_name, self.bg_density);
@@ -558,6 +602,25 @@ impl App {
     /// Get the active chat input (depending on screen)
     fn active_chat_input(&self) -> &str {
         if self.screen == Screen::AgentDetail { &self.agent_chat_input } else { &self.chat_input }
+    }
+
+    /// Returns indices into self.agents that match the current group_filter
+    fn filtered_agent_indices(&self) -> Vec<usize> {
+        self.agents.iter().enumerate().filter_map(|(i, a)| {
+            let keep = match self.group_filter {
+                GroupFilter::All => true,
+                GroupFilter::Home => a.location == "Home",
+                GroupFilter::SM => a.location == "SM",
+                GroupFilter::VPS => a.location == "VPS",
+                GroupFilter::Mobile => a.location == "Mobile",
+                GroupFilter::Outdated => !a.oc_version.is_empty()
+                    && a.oc_version != "?"
+                    && !self.latest_oc_version.is_empty()
+                    && !a.oc_version.contains(&self.latest_oc_version),
+                GroupFilter::Offline => a.status == AgentStatus::Offline,
+            };
+            if keep { Some(i) } else { None }
+        }).collect()
     }
 
     fn active_chat_input_mut(&mut self) -> &mut String {
@@ -3089,9 +3152,12 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     let hcells = hcells_vec.iter().map(|h| Cell::from(*h).style(Style::default().fg(t.text_bold).bold()));
     let hrow = Row::new(hcells).height(1).bottom_margin(1);
 
-    let rows: Vec<Row> = app.agents.iter().enumerate().map(|(i, a)| {
+    let rows: Vec<Row> = {
+        let filtered_indices = app.filtered_agent_indices();
+        filtered_indices.into_iter().enumerate().map(|(row_idx, i)| {
+        let a = &app.agents[i];
         let sel = i == app.selected && active;
-        let bg = if sel { t.selected_bg } else if i % 2 == 1 { ratatui::style::Color::Rgb(20, 22, 28) } else { app.bg_density.bg() };
+        let bg = if sel { t.selected_bg } else if row_idx % 2 == 1 { ratatui::style::Color::Rgb(20, 22, 28) } else { app.bg_density.bg() };
         let loc_color = match a.location.as_str() {
             "Home" => t.loc_home, "SM" => t.loc_sm, "VPS" => t.loc_vps, "Mobile" => t.loc_mobile, _ => t.text,
         };
@@ -3158,7 +3224,8 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
         };
         cells.push(Cell::from(a.oc_version.clone()).style(Style::default().fg(ver_color)));
         Row::new(cells).style(Style::default().bg(bg)).height(1)
-    }).collect();
+        }).collect()
+    };
 
     app.fleet_row_start_y = area.y + 1; // +1 for border, +1 for header handled in click calc
 
@@ -3179,6 +3246,8 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
         } else {
             format!(" ◆── Fleet 🔍 {} ──◆ ", app.filter_text)
         }
+    } else if app.group_filter != GroupFilter::All {
+        format!(" ◆── Fleet [{}] ──◆ ", app.group_filter.label())
     } else {
         format!(" ◆── Fleet [{}{}] ──◆ ", app.sort_mode.label(), app.sort_mode.arrow())
     };
@@ -4476,7 +4545,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Dashboard => match app.focus {
             Focus::Chat => vec![("Tab","fleet"),("⏎","send"),("@","target"),("Esc","back")],
             Focus::Command => vec![("⏎","run"),("Esc","cancel")],
-            _ => vec![("⏎","open"),("d","check"),("D","fix"),("U","update"),("u","update all"),("t","tasks"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
+            _ => vec![("⏎","open"),("d","check"),("D","fix"),("U","update"),("u","update all"),("g","group"),("t","tasks"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
         },
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
@@ -5302,6 +5371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('b') => app.cycle_bg(),
                                 KeyCode::Char('c') => app.cycle_theme(),
                                 KeyCode::Char('s') => { app.cycle_sort(); app.toast(&format!("Sort: {}{}", app.sort_mode.label(), app.sort_mode.arrow())); }
+                                KeyCode::Char('g') => { app.cycle_group(); app.toast(&format!("Group: {}", app.group_filter.label())); }
                                 KeyCode::Char('a') => { app.wizard.open(); }
                                 KeyCode::Char('A') => {
                                     // Select all
@@ -5356,8 +5426,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('u') => {
                                     // Bulk update OC on outdated agents (or selected)
                                     let latest = app.latest_oc_version.clone();
+                                    let filtered_indices = app.filtered_agent_indices();
                                     let targets: Vec<(String, String, String, bool, String)> = if app.multi_selected.is_empty() {
-                                        app.agents.iter()
+                                        filtered_indices.iter()
+                                            .map(|&i| &app.agents[i])
                                             .filter(|a| a.status == AgentStatus::Online)
                                             .filter(|a| latest.is_empty() || !a.oc_version.contains(&latest))
                                             .map(|a| (a.db_name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac"), a.oc_version.clone()))
