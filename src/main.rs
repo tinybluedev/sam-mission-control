@@ -608,12 +608,36 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
     render_footer(frame, app, outer[2]);
 }
 
+fn mini_bar(pct: Option<f32>, width: usize) -> String {
+    match pct {
+        Some(p) => {
+            let clamped = p.clamp(0.0, 100.0);
+            let filled = ((clamped / 100.0) * width as f32).round() as usize;
+            let bar: String = "█".repeat(filled) + &"░".repeat(width.saturating_sub(filled));
+            format!("{:>3.0}%{}", clamped, bar)
+        }
+        None => format!("{:>4}{}", "—", "░".repeat(width)),
+    }
+}
+
+fn mini_bar_color(pct: Option<f32>, t: &Theme, warn: f32, crit: f32) -> Color {
+    match pct {
+        Some(p) if p >= crit => t.status_offline,
+        Some(p) if p >= warn => t.status_busy,
+        Some(_) => t.status_online,
+        None => t.text_dim,
+    }
+}
+
 fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool) {
     let t = &app.theme;
     let fb = if active { t.border_active } else { t.border };
 
     let show_latency = area.width > 70;
-    let hcells_vec: Vec<&str> = if show_latency {
+    let show_resources = area.width > 110;
+    let hcells_vec: Vec<&str> = if show_resources {
+        vec!["  ", "Agent", "Location", "Status", "Ping", "CPU", "RAM", "Disk", "Version"]
+    } else if show_latency {
         vec!["  ", "Agent", "Location", "Status", "Ping", "Version"]
     } else {
         vec!["  ", "Agent", "Location", "Status", "Version"]
@@ -652,6 +676,11 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
         if show_latency {
             cells.push(Cell::from(lat_str).style(Style::default().fg(lat_color)));
         }
+        if show_resources {
+            cells.push(Cell::from(mini_bar(a.cpu_pct, 4)).style(Style::default().fg(mini_bar_color(a.cpu_pct, t, 70.0, 90.0))));
+            cells.push(Cell::from(mini_bar(a.ram_pct, 4)).style(Style::default().fg(mini_bar_color(a.ram_pct, t, 70.0, 85.0))));
+            cells.push(Cell::from(mini_bar(a.disk_pct, 4)).style(Style::default().fg(mini_bar_color(a.disk_pct, t, 80.0, 90.0))));
+        }
         cells.push(Cell::from(a.oc_version.clone()).style(Style::default().fg(t.version)));
         Row::new(cells).style(Style::default().bg(bg)).height(1)
     }).collect();
@@ -659,7 +688,9 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     app.fleet_row_start_y = area.y + 1; // +1 for border, +1 for header handled in click calc
 
     let show_version = area.width > 55;
-    let widths = if show_latency && show_version {
+    let widths = if show_resources && show_version {
+        vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Length(12), Constraint::Length(7), Constraint::Length(8), Constraint::Length(8), Constraint::Length(8), Constraint::Min(12)]
+    } else if show_latency && show_version {
         vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Length(12), Constraint::Length(7), Constraint::Min(12)]
     } else if show_latency {
         vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Min(12), Constraint::Length(7), Constraint::Length(0)]
