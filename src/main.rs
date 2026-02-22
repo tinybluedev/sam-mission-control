@@ -369,6 +369,7 @@ struct App {
     // Filter
     filter_active: bool,
     filter_text: String,
+    filter_matches: usize,
     // Config viewer
     config_text: Option<String>,
     config_scroll: u16,
@@ -492,7 +493,7 @@ impl App {
             last_task_poll: Instant::now(),
             spawned_agents: vec![], show_splash: true, splash_start: Instant::now(),
             config_text: None, config_scroll: 0, help_scroll: 0,
-            filter_active: false, filter_text: String::new(),
+            filter_active: false, filter_text: String::new(), filter_matches: 0,
             alerts: vec![], alert_flash: None, alerts_scroll: 0, gateway_confirm_at: None,
             multi_selected: HashSet::new(),
             spinner_frame: 0, sort_mode: SortMode::Name, group_filter: GroupFilter::All,
@@ -616,10 +617,11 @@ impl App {
         if self.screen == Screen::AgentDetail { &self.agent_chat_input } else { &self.chat_input }
     }
 
-    /// Returns indices into self.agents that match the current group_filter
+    /// Returns indices into self.agents that match the current group_filter and filter_text
     fn filtered_agent_indices(&self) -> Vec<usize> {
         self.agents.iter().enumerate().filter_map(|(i, a)| {
-            let keep = match self.group_filter {
+            // Group filter
+            let group_ok = match self.group_filter {
                 GroupFilter::All => true,
                 GroupFilter::Home => a.location == "Home",
                 GroupFilter::SM => a.location == "SM",
@@ -631,7 +633,36 @@ impl App {
                     && !a.oc_version.contains(&self.latest_oc_version),
                 GroupFilter::Offline => a.status == AgentStatus::Offline,
             };
-            if keep { Some(i) } else { None }
+            if !group_ok { return None; }
+
+            // Text filter
+            if !self.filter_text.is_empty() {
+                if let Some(mode) = self.filter_text.strip_prefix('@') {
+                    let mode = mode.to_lowercase();
+                    let text_ok = match mode.as_str() {
+                        "offline" => a.status == AgentStatus::Offline,
+                        "home"    => a.location.eq_ignore_ascii_case("Home"),
+                        "sm"      => a.location.eq_ignore_ascii_case("SM"),
+                        "vps"     => a.location.eq_ignore_ascii_case("VPS"),
+                        "mobile"  => a.location.eq_ignore_ascii_case("Mobile"),
+                        "outdated" => !a.oc_version.is_empty()
+                            && a.oc_version != "?"
+                            && !self.latest_oc_version.is_empty()
+                            && !a.oc_version.contains(&self.latest_oc_version),
+                        _ => false,
+                    };
+                    if !text_ok { return None; }
+                } else {
+                    // Fuzzy match across name, IP, location, version, OS
+                    let haystack = format!("{} {} {} {} {}",
+                        a.name, a.host, a.location, a.oc_version, a.os);
+                    if fuzzy_match(&haystack, &self.filter_text).is_none() {
+                        return None;
+                    }
+                }
+            }
+
+            Some(i)
         }).collect()
     }
 
@@ -3157,6 +3188,28 @@ fn mini_bar_color(pct: Option<f32>, t: &Theme, warn: f32, crit: f32) -> Color {
     }
 }
 
+/// Fuzzy match: returns byte-index positions in `text` of each character in `query`
+/// (in order, not necessarily adjacent). Case-insensitive.
+fn fuzzy_match(text: &str, query: &str) -> Option<Vec<usize>> {
+    if query.is_empty() { return Some(vec![]); }
+    let mut positions = Vec::with_capacity(query.len());
+    let mut text_chars = text.char_indices().peekable();
+    for qc in query.chars().flat_map(|c| c.to_lowercase()) {
+        loop {
+            match text_chars.next() {
+                Some((idx, tc)) => {
+                    if tc.to_lowercase().next() == Some(qc) {
+                        positions.push(idx);
+                        break;
+                    }
+                }
+                None => return None,
+            }
+        }
+    }
+    Some(positions)
+}
+
 fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool) {
     let t = &app.theme;
     let fb = if active { t.border_active } else { t.border };
@@ -3182,6 +3235,12 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
 
     let rows: Vec<Row> = {
         let filtered_indices = app.filtered_agent_indices();
+        app.filter_matches = filtered_indices.len();
+        let filter_query: Option<&str> = if !app.filter_text.is_empty() && !app.filter_text.starts_with('@') {
+            Some(&app.filter_text)
+        } else {
+            None
+        };
         filtered_indices.into_iter().enumerate().map(|(row_idx, i)| {
         let a = &app.agents[i];
         let sel = i == app.selected && active;
@@ -3205,9 +3264,48 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             Some(_) => t.status_offline,
             None => t.text_dim,
         };
+        // Build highlighted name cell
+        let name_cell = if let Some(ref q) = filter_query {
+            if let Some(positions) = fuzzy_match(&a.name, q) {
+                // Group consecutive chars into runs to reduce allocations
+                let mut spans: Vec<Span> = Vec::new();
+                let mut run = String::new();
+                let mut run_highlighted = false;
+                let mut pos_iter = positions.iter().peekable();
+                for (idx, ch) in a.name.char_indices() {
+                    let highlighted = pos_iter.peek() == Some(&&idx);
+                    if highlighted { pos_iter.next(); }
+                    if run.is_empty() {
+                        run_highlighted = highlighted;
+                    } else if highlighted != run_highlighted {
+                        let style = if run_highlighted {
+                            Style::default().fg(t.accent).bold()
+                        } else {
+                            Style::default().fg(t.text_bold).bold()
+                        };
+                        spans.push(Span::styled(std::mem::take(&mut run), style));
+                        run_highlighted = highlighted;
+                    }
+                    run.push(ch);
+                }
+                if !run.is_empty() {
+                    let style = if run_highlighted {
+                        Style::default().fg(t.accent).bold()
+                    } else {
+                        Style::default().fg(t.text_bold).bold()
+                    };
+                    spans.push(Span::styled(run, style));
+                }
+                Cell::from(Line::from(spans))
+            } else {
+                Cell::from(a.name.clone()).style(Style::default().fg(t.text_bold).bold())
+            }
+        } else {
+            Cell::from(a.name.clone()).style(Style::default().fg(t.text_bold).bold())
+        };
         let mut cells = vec![
             Cell::from(format!("{}{}", cursor, a.emoji)),
-            Cell::from(a.name.clone()).style(Style::default().fg(t.text_bold).bold()),
+            name_cell,
         ];
         if show_ip {
             cells.push(Cell::from(a.host.clone()).style(Style::default().fg(t.accent2)));
@@ -3268,12 +3366,12 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     } else {
         vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Length(12), Constraint::Min(10)]
     };
-    let fleet_title = if app.filter_active {
-        if app.filter_text.is_empty() {
-            " ◆── Fleet 🔍 (type to search) ──◆ ".to_string()
-        } else {
-            format!(" ◆── Fleet 🔍 {} ──◆ ", app.filter_text)
-        }
+    let fleet_title = if app.filter_active && app.filter_text.is_empty() {
+        " ◆── Fleet 🔍 (type to search) ──◆ ".to_string()
+    } else if !app.filter_text.is_empty() {
+        let n = app.filter_matches;
+        let suffix = if n == 1 { "match" } else { "matches" };
+        format!(" ◆── Fleet 🔍 {} — {} {} ──◆ ", app.filter_text, n, suffix)
     } else if app.group_filter != GroupFilter::All {
         format!(" ◆── Fleet [{}] ──◆ ", app.group_filter.label())
     } else {
