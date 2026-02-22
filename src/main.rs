@@ -1484,11 +1484,28 @@ impl App {
             ]).output().await;
             let ts_online = ts_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
             let ts_ok = ts_online == "True" || ts_online == "true";
-            let _ = tx.send(DiagStep {
-                label: "Tailscale".into(),
-                status: if ts_ok { DiagStatus::Pass } else { DiagStatus::Fail },
-                detail: if ts_ok { "online".into() } else { format!("status: {}", ts_online) },
-            });
+            if !ts_ok && fix {
+                let _ = tx.send(DiagStep { label: "Tailscale".into(), status: DiagStatus::Running, detail: "restarting Tailscale...".into() });
+                let ts_fix_cmd = if is_mac {
+                    format!("{}sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || echo FAIL", pfx)
+                } else {
+                    "sudo systemctl restart tailscaled 2>/dev/null; sleep 2; sudo tailscale up --login-server=https://vpn.tinyblue.dev --accept-routes --reset 2>&1 || echo FAIL".into()
+                };
+                let ts_fix = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &ts_fix_cmd]).output().await;
+                let fixed = ts_fix.as_ref().map(|o| !String::from_utf8_lossy(&o.stdout).contains("FAIL")).unwrap_or(false);
+                let _ = tx.send(DiagStep {
+                    label: "Tailscale".into(),
+                    status: if fixed { DiagStatus::Fixed } else { DiagStatus::Fail },
+                    detail: if fixed { "restarted".into() } else { format!("restart failed — status was: {}", ts_online) },
+                });
+            } else {
+                let _ = tx.send(DiagStep {
+                    label: "Tailscale".into(),
+                    status: if ts_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                    detail: if ts_ok { "online".into() } else { format!("status: {}", ts_online) },
+                });
+            }
 
             // Step 3: OpenClaw installed
             let _ = tx.send(DiagStep { label: "OpenClaw installed".into(), status: DiagStatus::Running, detail: String::new() });
@@ -1546,11 +1563,33 @@ impl App {
             ]).output().await;
             let api_resp = api_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
             let api_ok = !api_resp.contains("FAIL") && !api_resp.is_empty();
-            let _ = tx.send(DiagStep {
-                label: "Gateway API".into(),
-                status: if api_ok { DiagStatus::Pass } else { DiagStatus::Fail },
-                detail: if api_ok { "responding".into() } else { "not responding".into() },
-            });
+            if !api_ok && fix {
+                let _ = tx.send(DiagStep { label: "Gateway API".into(), status: DiagStatus::Running, detail: "restarting gateway...".into() });
+                let restart_cmd = if is_mac {
+                    format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)
+                } else {
+                    "systemctl --user restart openclaw-gateway 2>/dev/null || sudo systemctl restart openclaw-gateway 2>/dev/null || openclaw gateway restart 2>&1 | tail -1".into()
+                };
+                let _ = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &restart_cmd]).output().await;
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                // Re-check
+                let recheck = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &format!("curl -s -m 3 http://localhost:{}/health 2>/dev/null || echo FAIL", gw_port)
+                ]).output().await;
+                let recheck_ok = recheck.as_ref().map(|o| !String::from_utf8_lossy(&o.stdout).contains("FAIL")).unwrap_or(false);
+                let _ = tx.send(DiagStep {
+                    label: "Gateway API".into(),
+                    status: if recheck_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
+                    detail: if recheck_ok { "gateway restarted — API responding".into() } else { "gateway restart attempted but still not responding".into() },
+                });
+            } else {
+                let _ = tx.send(DiagStep {
+                    label: "Gateway API".into(),
+                    status: if api_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                    detail: if api_ok { "responding".into() } else { "not responding".into() },
+                });
+            }
 
             // Step 6: Config file exists
             let _ = tx.send(DiagStep { label: "Config file".into(), status: DiagStatus::Running, detail: String::new() });
@@ -1558,11 +1597,24 @@ impl App {
                 &format!("{}@{}", user, host), "test -f ~/.openclaw/openclaw.json && echo EXISTS || echo MISSING"
             ]).output().await;
             let cfg_exists = cfg_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "EXISTS").unwrap_or(false);
-            let _ = tx.send(DiagStep {
-                label: "Config file".into(),
-                status: if cfg_exists { DiagStatus::Pass } else { DiagStatus::Fail },
-                detail: if cfg_exists { "~/.openclaw/openclaw.json".into() } else { "missing".into() },
-            });
+            if !cfg_exists && fix {
+                let _ = tx.send(DiagStep { label: "Config file".into(), status: DiagStatus::Running, detail: "creating default config...".into() });
+                let init_cmd = format!("{}mkdir -p ~/.openclaw && openclaw init --non-interactive 2>/dev/null || echo '{{}}' > ~/.openclaw/openclaw.json && echo CREATED", pfx);
+                let init_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &init_cmd]).output().await;
+                let created = init_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("CREATED")).unwrap_or(false);
+                let _ = tx.send(DiagStep {
+                    label: "Config file".into(),
+                    status: if created { DiagStatus::Fixed } else { DiagStatus::Fail },
+                    detail: if created { "config initialized".into() } else { "failed to create config".into() },
+                });
+            } else {
+                let _ = tx.send(DiagStep {
+                    label: "Config file".into(),
+                    status: if cfg_exists { DiagStatus::Pass } else { DiagStatus::Fail },
+                    detail: if cfg_exists { "~/.openclaw/openclaw.json".into() } else { "missing".into() },
+                });
+            }
 
             // Step 7: Workspace exists
             let _ = tx.send(DiagStep { label: "Agent workspace".into(), status: DiagStatus::Running, detail: String::new() });
@@ -1570,11 +1622,24 @@ impl App {
                 &format!("{}@{}", user, host), "ls ~/CLAUDE/clawd/SOUL.md 2>/dev/null && echo HAS_SOUL || echo NO_SOUL"
             ]).output().await;
             let has_soul = ws_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("HAS_SOUL")).unwrap_or(false);
-            let _ = tx.send(DiagStep {
-                label: "Agent workspace".into(),
-                status: if has_soul { DiagStatus::Pass } else { DiagStatus::Fail },
-                detail: if has_soul { "SOUL.md found".into() } else { "no SOUL.md — agent may lack identity".into() },
-            });
+            if !has_soul && fix {
+                let _ = tx.send(DiagStep { label: "Agent workspace".into(), status: DiagStatus::Running, detail: "creating workspace...".into() });
+                let ws_cmd = format!("mkdir -p ~/CLAUDE/clawd/memory && echo '# SOUL.md' > ~/CLAUDE/clawd/SOUL.md && echo '# AGENTS.md' > ~/CLAUDE/clawd/AGENTS.md && echo '# MEMORY.md' > ~/CLAUDE/clawd/MEMORY.md && echo CREATED");
+                let ws_result = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), &ws_cmd]).output().await;
+                let created = ws_result.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("CREATED")).unwrap_or(false);
+                let _ = tx.send(DiagStep {
+                    label: "Agent workspace".into(),
+                    status: if created { DiagStatus::Fixed } else { DiagStatus::Fail },
+                    detail: if created { "workspace scaffolded (SOUL.md, AGENTS.md, MEMORY.md)".into() } else { "failed to create workspace".into() },
+                });
+            } else {
+                let _ = tx.send(DiagStep {
+                    label: "Agent workspace".into(),
+                    status: if has_soul { DiagStatus::Pass } else { DiagStatus::Fail },
+                    detail: if has_soul { "SOUL.md found".into() } else { "no SOUL.md — agent may lack identity".into() },
+                });
+            }
 
             // Done
             let passes = 7; // we'll count from received steps
