@@ -305,6 +305,7 @@ struct App {
     diag_steps: Vec<DiagStep>,
     diag_rx: Option<mpsc::UnboundedReceiver<DiagStep>>,
     diag_auto_fix: bool,
+    diag_title: Option<String>,
     diag_start: Option<Instant>,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
@@ -430,7 +431,7 @@ impl App {
             detail_info_area: Rect::default(), detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
-            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None,
+            diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: String::new(), ws_crons: vec![], ws_loading: false, chat_poll_rx: None, chat_polling: false, wizard_ssh_rx: None,
@@ -1129,6 +1130,7 @@ impl App {
         let gw_port = agent.gateway_port;
         self.diag_active = true;
         self.diag_auto_fix = fix;
+        self.diag_title = None;
         self.diag_start = Some(Instant::now());
         self.diag_steps = vec![DiagStep { label: format!("Diagnosing {}...", name), status: DiagStatus::Running, detail: String::new() }];
 
@@ -2937,7 +2939,7 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, popup);
 
     let agent_name = if app.selected < app.agents.len() { &app.agents[app.selected].name } else { "?" };
-    let title = format!(" {} Diagnostics — {} ", if app.diag_auto_fix { "🔧 Fix" } else { "🔍 Check" }, agent_name);
+    let title = if let Some(ref t) = app.diag_title { format!(" {} ", t) } else { format!(" {} Diagnostics — {} ", if app.diag_auto_fix { "🔧 Fix" } else { "🔍 Check" }, agent_name) };
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
@@ -4756,73 +4758,107 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('U') => {
-                                    // Update OC on single agent — streaming output to chat
+                                    // Update OC on highlighted agent — streams via diagnostic overlay
                                     if let Some(agent) = app.agents.get(app.selected) {
                                         let host = agent.host.clone();
                                         let user = agent.ssh_user.clone();
-                                        let name = agent.name.clone();
-                                        let db_name = agent.db_name.clone();
+                                        let name = agent.db_name.clone();
                                         let is_mac = agent.os.to_lowercase().contains("mac");
                                         let self_ip = app.self_ip.clone();
-                                        app.toast(&format!("🔄 Updating OpenClaw on {}...", name));
-                                        if let Some(pool) = &app.db_pool {
-                                            let pool = pool.clone();
-                                            let sender = app.user();
-                                            tokio::spawn(async move {
-                                                // Create the chat message first (pending)
-                                                let msg_id = crate::db::send_direct(&pool, &sender, &db_name, &format!("🔄 Updating OpenClaw on {}...", name)).await.unwrap_or(0);
-                                                let _ = crate::db::update_chat_status(&pool, msg_id, "streaming").await;
 
-                                                let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-                                                // Use script with clear phase markers for streaming
-                                                let cmd = format!(
-                                                    "{}echo '📋 Current version:' && openclaw --version 2>/dev/null || echo '(not installed)' &&                                                     echo '' && echo '⬇️  Installing openclaw@latest...' &&                                                     sudo npm install -g openclaw@latest 2>&1 &&                                                     echo '' && echo '✅ New version:' && openclaw --version 2>/dev/null &&                                                     echo '' && echo '🔄 Restarting gateway...' &&                                                     (openclaw gateway restart 2>&1 || echo 'gateway restart skipped') &&                                                     echo '' && echo '🏁 Update complete!'", pfx);
+                                        // Reuse diag overlay for live streaming
+                                        app.diag_active = true;
+                                        app.diag_auto_fix = false;
+                                        app.diag_title = Some(format!("⬆️  Update — {}", name));
+                                        app.diag_start = Some(Instant::now());
+                                        app.diag_steps = vec![DiagStep {
+                                            label: format!("Updating OpenClaw on {}...", name),
+                                            status: DiagStatus::Running,
+                                            detail: String::new(),
+                                        }];
 
-                                                use tokio::io::AsyncBufReadExt;
-                                                let mut child = if host == "localhost" || host == self_ip {
-                                                    tokio::process::Command::new("bash")
-                                                        .args(["-c", &cmd])
-                                                        .stdout(std::process::Stdio::piped())
-                                                        .stderr(std::process::Stdio::piped())
-                                                        .spawn()
-                                                } else {
-                                                    tokio::process::Command::new("ssh")
-                                                        .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes","-tt",
-                                                            &format!("{}@{}", user, host), &cmd])
-                                                        .stdout(std::process::Stdio::piped())
-                                                        .stderr(std::process::Stdio::piped())
-                                                        .spawn()
-                                                };
+                                        let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
+                                        app.diag_rx = Some(rx);
 
-                                                match child {
-                                                    Ok(mut child) => {
-                                                        let stdout = child.stdout.take();
-                                                        let mut full_output = String::new();
-                                                        let mut last_write = std::time::Instant::now();
+                                        tokio::spawn(async move {
+                                            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
-                                                        if let Some(stdout) = stdout {
-                                                            let mut reader = tokio::io::BufReader::new(stdout).lines();
-                                                            while let Ok(Some(line)) = reader.next_line().await {
-                                                                if !full_output.is_empty() { full_output.push('\n'); }
-                                                                full_output.push_str(&line);
-                                                                // Write partial update every 500ms
-                                                                if last_write.elapsed() > std::time::Duration::from_millis(500) {
-                                                                    let _ = crate::db::update_chat_partial(&pool, msg_id, &full_output).await;
-                                                                    last_write = std::time::Instant::now();
-                                                                }
-                                                            }
-                                                        }
+                                            // Step 1: current version
+                                            let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Running, detail: String::new() });
+                                            let cur_ver = if host == "localhost" || host == self_ip {
+                                                tokio::process::Command::new("bash").args(["-c", &format!("{}openclaw --version 2>/dev/null || echo '(not installed)'", pfx)]).output().await.ok()
+                                            } else {
+                                                tokio::process::Command::new("ssh").args(["-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                                    &format!("{}@{}", user, host), &format!("{}openclaw --version 2>/dev/null || echo '(not installed)'", pfx)]).output().await.ok()
+                                            };
+                                            let cur = cur_ver.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+                                            let _ = tx.send(DiagStep { label: "Current version".into(), status: DiagStatus::Pass, detail: cur });
 
-                                                        let _ = child.wait().await;
-                                                        if full_output.is_empty() { full_output = "(no output)".into(); }
-                                                        let _ = crate::db::respond_to_chat(&pool, msg_id, &full_output).await;
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = crate::db::respond_to_chat(&pool, msg_id, &format!("Failed to spawn: {}", e)).await;
+                                            // Step 2: npm install
+                                            let _ = tx.send(DiagStep { label: "Installing openclaw@latest".into(), status: DiagStatus::Running, detail: "running npm install...".into() });
+                                            let install_cmd = format!("{}sudo npm install -g openclaw@latest 2>&1", pfx);
+
+                                            use tokio::io::AsyncBufReadExt;
+                                            let mut child = if host == "localhost" || host == self_ip {
+                                                tokio::process::Command::new("bash").args(["-c", &install_cmd])
+                                                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()
+                                            } else {
+                                                tokio::process::Command::new("ssh").args(["-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                                    &format!("{}@{}", user, host), &install_cmd])
+                                                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()
+                                            };
+
+                                            let mut install_ok = false;
+                                            let mut last_line = String::new();
+                                            if let Ok(ref mut child) = child {
+                                                if let Some(stdout) = child.stdout.take() {
+                                                    let mut reader = tokio::io::BufReader::new(stdout).lines();
+                                                    while let Ok(Some(line)) = reader.next_line().await {
+                                                        let clean = line.trim().to_string();
+                                                        if clean.is_empty() { continue; }
+                                                        last_line = clean.clone();
+                                                        // Show each meaningful line as a sub-step
+                                                        let _ = tx.send(DiagStep {
+                                                            label: "  npm".into(),
+                                                            status: DiagStatus::Running,
+                                                            detail: clean.chars().take(70).collect(),
+                                                        });
                                                     }
                                                 }
+                                                install_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
+                                            }
+
+                                            let _ = tx.send(DiagStep {
+                                                label: "Installing openclaw@latest".into(),
+                                                status: if install_ok { DiagStatus::Fixed } else { DiagStatus::Fail },
+                                                detail: if install_ok { last_line.chars().take(60).collect() } else { "install failed".into() },
                                             });
-                                        }
+
+                                            // Step 3: new version
+                                            let _ = tx.send(DiagStep { label: "New version".into(), status: DiagStatus::Running, detail: String::new() });
+                                            let new_ver = if host == "localhost" || host == self_ip {
+                                                tokio::process::Command::new("bash").args(["-c", &format!("{}openclaw --version 2>/dev/null || echo '?'", pfx)]).output().await.ok()
+                                            } else {
+                                                tokio::process::Command::new("ssh").args(["-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                                    &format!("{}@{}", user, host), &format!("{}openclaw --version 2>/dev/null || echo '?'", pfx)]).output().await.ok()
+                                            };
+                                            let new_v = new_ver.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+                                            let _ = tx.send(DiagStep { label: "New version".into(), status: DiagStatus::Pass, detail: new_v });
+
+                                            // Step 4: restart gateway
+                                            let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Running, detail: String::new() });
+                                            let restart_cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
+                                            let restart_out = if host == "localhost" || host == self_ip {
+                                                tokio::process::Command::new("bash").args(["-c", &restart_cmd]).output().await.ok()
+                                            } else {
+                                                tokio::process::Command::new("ssh").args(["-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                                                    &format!("{}@{}", user, host), &restart_cmd]).output().await.ok()
+                                            };
+                                            let restart_msg = restart_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("ok".into());
+                                            let _ = tx.send(DiagStep { label: "Restarting gateway".into(), status: DiagStatus::Fixed, detail: restart_msg });
+
+                                            let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Update complete — press Esc to close".into() });
+                                        });
                                     }
                                 }
                                 KeyCode::Char('G') => {
