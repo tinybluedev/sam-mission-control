@@ -41,6 +41,7 @@ struct Agent {
     ssh_user: String,
     capabilities: Vec<String>,
     token_burn: i32,
+    latency_ms: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -85,7 +86,7 @@ enum Focus { Fleet, Chat, AgentChat, Command }
 enum Screen { Dashboard, AgentDetail, TaskBoard, VpnStatus, Help }
 
 #[derive(PartialEq, Clone, Copy)]
-enum SortMode { Name, Status, Location, Version }
+enum SortMode { Name, Status, Location, Version, Latency }
 
 impl SortMode {
     fn next(self) -> Self {
@@ -93,13 +94,15 @@ impl SortMode {
             Self::Name => Self::Status,
             Self::Status => Self::Location,
             Self::Location => Self::Version,
-            Self::Version => Self::Name,
+            Self::Version => Self::Latency,
+            Self::Latency => Self::Name,
         }
     }
     fn label(&self) -> &str {
         match self {
             Self::Name => "name", Self::Status => "status",
             Self::Location => "location", Self::Version => "version",
+            Self::Latency => "latency",
         }
     }
 }
@@ -110,6 +113,7 @@ struct ProbeResult {
     os: String,
     kernel: String,
     oc_version: String,
+    latency_ms: Option<u32>,
 }
 
 struct App {
@@ -183,6 +187,7 @@ impl App {
                         ssh_user: cfg.map(|c| c.ssh_user().to_string()).unwrap_or_else(|| "root".into()),
                         capabilities: caps,
                         token_burn: da.token_burn_today,
+                        latency_ms: None,
                     });
                 }
             }
@@ -247,6 +252,10 @@ impl App {
             }
             SortMode::Location => a.location.cmp(&b.location),
             SortMode::Version => b.oc_version.cmp(&a.oc_version),
+            SortMode::Latency => {
+                let lat = |a: &Agent| a.latency_ms.unwrap_or(9999);
+                lat(a).cmp(&lat(b))
+            }
         });
     }
 
@@ -333,13 +342,13 @@ impl App {
             let (host, user, sip) = (a.host.clone(), a.ssh_user.clone(), self.self_ip.clone());
             let tx = tx.clone();
             tokio::spawn(async move {
-                let (status, os, kern, oc) = probe_agent(&host, &user, &sip).await;
-                let _ = tx.send(ProbeResult { index: i, status, os, kernel: kern, oc_version: oc });
+                let (status, os, kern, oc, lat) = probe_agent(&host, &user, &sip).await;
+                let _ = tx.send(ProbeResult { index: i, status, os, kernel: kern, oc_version: oc, latency_ms: lat });
             });
         }
     }
 
-    fn drain_refresh_results(&mut self) -> Vec<(usize, AgentStatus, String, String, String)> {
+    fn drain_refresh_results(&mut self) -> Vec<(usize, AgentStatus, String, String, String, Option<u32>)> {
         let mut updates = vec![];
         if let Some(rx) = &mut self.refresh_rx {
             while let Ok(r) = rx.try_recv() {
@@ -348,8 +357,9 @@ impl App {
                     if !r.os.is_empty() { self.agents[r.index].os = r.os.clone(); }
                     if !r.kernel.is_empty() { self.agents[r.index].kernel = r.kernel.clone(); }
                     if !r.oc_version.is_empty() { self.agents[r.index].oc_version = r.oc_version.clone(); }
+                    self.agents[r.index].latency_ms = r.latency_ms;
                     self.agents[r.index].last_seen = now_str();
-                    updates.push((r.index, r.status, r.os, r.kernel, r.oc_version));
+                    updates.push((r.index, r.status, r.os, r.kernel, r.oc_version, r.latency_ms));
                 }
             }
         }
@@ -378,12 +388,14 @@ impl App {
 
 // ---- SSH Probe ----
 
-async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, String, String, String) {
+async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, String, String, String, Option<u32>) {
+    let start = Instant::now();
     if host == "localhost" || host == self_ip {
         let os = Command::new("bash").args(["-c", ". /etc/os-release 2>/dev/null && echo \"$NAME $VERSION_ID\" || echo unknown"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         let kern = Command::new("uname").arg("-r").output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         let oc = Command::new("bash").args(["-c", "openclaw --version 2>/dev/null || echo ?"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-        return (AgentStatus::Online, os, kern, oc);
+        let ms = start.elapsed().as_millis() as u32;
+        return (AgentStatus::Online, os, kern, oc, Some(ms));
     }
     let tgt = format!("{}@{}", user, host);
     let script = r#"OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC""#;
@@ -393,7 +405,7 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, Str
     ).await;
     let result = match result {
         Ok(r) => r,
-        Err(_) => return (AgentStatus::Offline, String::new(), String::new(), String::new()),
+        Err(_) => return (AgentStatus::Offline, String::new(), String::new(), String::new(), None),
     };
     match result {
         Ok(o) if o.status.success() => {
@@ -404,9 +416,10 @@ async fn probe_agent(host: &str, user: &str, self_ip: &str) -> (AgentStatus, Str
                 else if let Some(v) = l.strip_prefix("KERN:") { kern = v.trim().into(); }
                 else if let Some(v) = l.strip_prefix("OC:") { oc = v.trim().into(); }
             }
-            (AgentStatus::Online, os, kern, oc)
+            let ms = start.elapsed().as_millis() as u32;
+            (AgentStatus::Online, os, kern, oc, Some(ms))
         }
-        _ => (AgentStatus::Offline, String::new(), String::new(), String::new()),
+        _ => (AgentStatus::Offline, String::new(), String::new(), String::new(), None),
     }
 }
 
@@ -573,8 +586,13 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     let t = &app.theme;
     let fb = if active { t.border_active } else { t.border };
 
-    let hcells = ["  ", "Agent", "Location", "Status", "Version"]
-        .iter().map(|h| Cell::from(*h).style(Style::default().fg(t.text_bold).bold()));
+    let show_latency = area.width > 70;
+    let hcells_vec: Vec<&str> = if show_latency {
+        vec!["  ", "Agent", "Location", "Status", "Ping", "Version"]
+    } else {
+        vec!["  ", "Agent", "Location", "Status", "Version"]
+    };
+    let hcells = hcells_vec.iter().map(|h| Cell::from(*h).style(Style::default().fg(t.text_bold).bold()));
     let hrow = Row::new(hcells).height(1).bottom_margin(1);
 
     let rows: Vec<Row> = app.agents.iter().enumerate().map(|(i, a)| {
@@ -588,19 +606,37 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             AgentStatus::Offline => t.status_offline, _ => t.text_dim,
         };
         let cursor = if sel { "▶" } else { " " };
-        Row::new(vec![
+        let lat_str = match a.latency_ms {
+            Some(ms) => format!("{}ms", ms),
+            None => "—".into(),
+        };
+        let lat_color = match a.latency_ms {
+            Some(ms) if ms < 100 => t.status_online,
+            Some(ms) if ms < 500 => t.status_busy,
+            Some(_) => t.status_offline,
+            None => t.text_dim,
+        };
+        let mut cells = vec![
             Cell::from(format!("{}{}", cursor, a.emoji)),
             Cell::from(a.name.clone()).style(Style::default().fg(t.text_bold).bold()),
             Cell::from(a.location.clone()).style(Style::default().fg(loc_color)),
             Cell::from(a.status.to_string()).style(Style::default().fg(st_color)),
-            Cell::from(a.oc_version.clone()).style(Style::default().fg(t.version)),
-        ]).style(Style::default().bg(bg)).height(1)
+        ];
+        if show_latency {
+            cells.push(Cell::from(lat_str).style(Style::default().fg(lat_color)));
+        }
+        cells.push(Cell::from(a.oc_version.clone()).style(Style::default().fg(t.version)));
+        Row::new(cells).style(Style::default().bg(bg)).height(1)
     }).collect();
 
     app.fleet_row_start_y = area.y + 1; // +1 for border, +1 for header handled in click calc
 
     let show_version = area.width > 55;
-    let widths = if show_version {
+    let widths = if show_latency && show_version {
+        vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Length(12), Constraint::Length(7), Constraint::Min(12)]
+    } else if show_latency {
+        vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Min(12), Constraint::Length(7), Constraint::Length(0)]
+    } else if show_version {
         vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Length(12), Constraint::Min(12)]
     } else {
         vec![Constraint::Length(4), Constraint::Length(14), Constraint::Length(9), Constraint::Min(12), Constraint::Length(0)]
@@ -724,6 +760,8 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         ("OC Version", a.oc_version.clone(), t.version),
         ("SSH User", a.ssh_user.clone(), t.text),
         ("Capabilities", caps, t.text),
+        ("Latency", match a.latency_ms { Some(ms) => format!("{}ms", ms), None => "—".into() },
+            match a.latency_ms { Some(ms) if ms < 100 => t.status_online, Some(ms) if ms < 500 => t.status_busy, Some(_) => t.status_offline, _ => t.text_dim }),
         ("Tokens Today", format!("{}", a.token_burn), t.text),
         ("Last Seen", a.last_seen.clone(), t.text),
         ("Task", a.current_task.as_deref().unwrap_or("none").to_string(), t.text_dim),
@@ -1136,18 +1174,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !updates.is_empty() {
             // Write to DB in background
             if let Some(pool) = &app.db_pool {
-                for (idx, _status, _os, _kern, _oc) in &updates {
+                for (idx, _status, _os, _kern, _oc, lat) in &updates {
                     let a = &app.agents[*idx];
                     let p = pool.clone();
-                    let (name, st, os, kern, oc) = (
+                    let (name, st, os, kern, oc, latency) = (
                         a.db_name.clone(), a.status.to_db_str().to_string(),
                         if a.os.is_empty() { None } else { Some(a.os.clone()) },
                         if a.kernel.is_empty() { None } else { Some(a.kernel.clone()) },
                         if a.oc_version.is_empty() { None } else { Some(a.oc_version.clone()) },
+                        *lat,
                     );
                     tokio::spawn(async move {
-                        let _ = db::update_agent_status(&p, &name, &st,
-                            os.as_deref(), kern.as_deref(), oc.as_deref()).await;
+                        let _ = db::update_agent_status_full(&p, &name, &st,
+                            os.as_deref(), kern.as_deref(), oc.as_deref(), latency).await;
                     });
                 }
             }
@@ -1284,6 +1323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         ssh_user: app.wizard.ssh_user.clone(),
                                         capabilities: vec![],
                                         token_burn: 0,
+                                        latency_ms: None,
                                     });
                                     app.wizard.active = false;
                                     app.status_message = format!("✅ Agent '{}' created", app.wizard.agent_name);
