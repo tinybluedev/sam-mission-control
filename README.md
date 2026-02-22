@@ -1,73 +1,129 @@
-# 🛰️ S.A.M Mission Control
+# S.A.M Mission Control
 
-Fleet orchestration TUI for AI agents.
+A terminal-based fleet orchestration tool for managing distributed AI agents over SSH and Tailscale mesh networks. Built in Rust with [Ratatui](https://ratatui.rs).
 
-## Install
+![Dashboard](docs/screenshots/dashboard.png)
+
+## Features
+
+- **Fleet Dashboard** — Real-time agent status with SSH health probes
+- **AI Chat** — Talk to any agent via OpenClaw HTTP API (SSH fallback when HTTP is blocked)
+- **Task Board** — Create, assign, and track tasks across agents
+- **Agent Detail** — Deep-dive into individual agent info and direct messaging
+- **Multi-select** — Batch operations on groups of agents
+- **8 Color Themes** — Standard, Noir, Paper, 1977, 2077, Matrix, Sunset, Arctic
+- **Fleet Doctor** — Diagnose and auto-fix common fleet issues
+- **Zero Network Exposure** — SSH + Unix socket only, no open ports
+
+## Screenshots
+
+### Splash Screen
+![Splash](docs/screenshots/splash.png)
+
+### Agent Detail & Chat
+![Agent Detail](docs/screenshots/agent-detail.png)
+
+### Task Board
+![Task Board](docs/screenshots/task-board.png)
+
+### Keybindings
+![Help](docs/screenshots/help.png)
+
+### Fleet Doctor
+![Doctor](docs/screenshots/doctor.png)
+
+### CLI Status
+![Status](docs/screenshots/status-cli.png)
+
+### Themes
+![Sunset Theme](docs/screenshots/theme-sunset.png)
+
+## Quick Start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tinybluedev/sam-mission-control/main/install.sh | bash
-```
-
-Or build manually:
-
-```bash
-git clone https://github.com/tinybluedev/sam-mission-control.git
-cd sam-mission-control
-cargo build --release
-sudo cp target/release/sam-mission-control /usr/local/bin/sam
-```
-
-## Setup
-
-```bash
+curl -sSL https://raw.githubusercontent.com/tinybluedev/sam-mission-control/main/install.sh | bash
 sam init
+sam
 ```
 
-That's it. The wizard walks you through everything — database connection, config, and self-registration. All interactive. Pass flags to skip prompts:
+## Commands
 
-```bash
-sam init --db-host 10.0.0.1 --db-pass 'secret'
-```
+| Command | Description |
+|---------|-------------|
+| `sam` | Launch the TUI dashboard |
+| `sam status` | Quick fleet status (non-interactive) |
+| `sam doctor` | Diagnose fleet issues |
+| `sam doctor --fix` | Auto-repair fleet issues |
+| `sam init` | Interactive first-time setup |
+| `sam onboard <ip>` | Provision a new agent |
+| `sam deploy <agent> --file <path>` | Push files to agent workspace |
+| `sam version` | Show version |
 
-## Usage
+## Keybindings
 
-```bash
-sam                           # Launch TUI
-sam onboard <ip>              # Add an agent to your fleet
-sam deploy all --file SOUL.md # Push files to agents
-sam status                    # Quick fleet check
-sam chat cyber "hello"        # Message an agent
-```
-
-## What You Get
-
-- **Fleet dashboard** — live status of every agent with SSH probing
-- **AI chat** — talk to agents through OpenClaw's API (real AI responses)
-- **Resource monitoring** — CPU, RAM, disk with color-coded bars
-- **Alerts** — automatic notifications when things go wrong
-- **Task board** — create and track fleet work
-- **One-command onboarding** — `sam onboard <ip>` handles everything
-- **8 themes** — cycle with `c`, backgrounds with `b`
-
-## Keys
-
-`?` in the TUI shows all keybindings. The important ones:
-
-| Key | What it does |
-|-----|-------------|
-| `Enter` | Open agent detail + chat |
-| `f` | Filter/search agents |
-| `/` | Run command across fleet |
-| `g` | Restart agent gateway |
-| `e` | View agent config |
+| Key | Action |
+|-----|--------|
+| `Tab` | Switch focus: Fleet ↔ Chat |
+| `Enter` | Open agent detail / send message |
+| `j/k` or `↑/↓` | Navigate fleet list |
 | `t` | Task board |
-| `w` | Alerts |
+| `s` | Sort agents |
+| `f` | Filter/search |
+| `c` | Cycle color theme |
+| `r` | Refresh all agents (SSH) |
+| `a` | New agent wizard |
+| `g` | Restart gateway (selected) |
+| `?` | Help |
+| `q` | Quit |
 
 ## Requirements
 
-- MySQL or MariaDB (any version)
-- SSH key access to your machines
-- [OpenClaw](https://openclaw.ai) on each agent (auto-installed by `sam onboard`)
+- Rust 1.75+ (for building)
+- MySQL/MariaDB database
+- SSH access to fleet machines (key-based auth)
+- [OpenClaw](https://github.com/openclaw/openclaw) on managed agents
+- [Tailscale](https://tailscale.com) or [Headscale](https://github.com/juanfont/headscale) mesh (recommended)
+
+## Configuration
+
+Config file: `~/.config/sam/config.toml`
+
+```toml
+[database]
+host = "10.0.0.2"
+port = 3306
+user = "sam"
+name = "sam_fleet"
+
+[self]
+ip = "10.0.0.1"
+```
+
+Or use environment variables via `.env`:
+
+```bash
+SAM_DB_URL=mysql://user:pass@host:port/database
+SAM_SELF_IP=10.0.0.1
+```
+
+## Architecture
+
+```
+┌─────────────┐     SSH      ┌──────────┐
+│  sam (TUI)  │─────────────▶│ Agent 1  │
+│  on master  │     SSH      ├──────────┤
+│  node       │─────────────▶│ Agent 2  │
+│             │     SSH      ├──────────┤
+│             │─────────────▶│ Agent N  │
+└──────┬──────┘              └──────────┘
+       │
+       ▼
+┌─────────────┐
+│   MySQL DB  │
+│ (fleet state│
+│  chat, tasks│
+└─────────────┘
+```
 
 ## License
 

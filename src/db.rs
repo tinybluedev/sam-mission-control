@@ -25,7 +25,7 @@ pub fn get_pool() -> Pool {
             let port = env::var("SAM_DB_PORT").unwrap_or_else(|_| "3306".into());
             let user = env::var("SAM_DB_USER").unwrap_or_else(|_| "root".into());
             let pass = env::var("SAM_DB_PASS").unwrap_or_else(|_| String::new());
-            let db = env::var("SAM_DB_NAME").unwrap_or_else(|_| "quantum_memory".into());
+            let db = env::var("SAM_DB_NAME").unwrap_or_else(|_| "sam_fleet".into());
             build_db_url(&host, &port, &user, &pass, &db)
         });
     Pool::new(url.as_str())

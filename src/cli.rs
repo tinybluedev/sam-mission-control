@@ -71,8 +71,8 @@ pub enum Commands {
     Onboard {
         /// Tailscale IP or hostname of the target machine
         host: String,
-        /// SSH username (default: papasmurf)
-        #[arg(short, long, default_value = "papasmurf")]
+        /// SSH username (default: admin)
+        #[arg(short, long, default_value = "admin")]
         user: String,
         /// Agent name/ID
         #[arg(short, long)]
@@ -301,11 +301,11 @@ pub fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
     cfg.database.password = Some(input.trim().into());
 
     input.clear();
-    print!("  Database name [quantum_memory]: ");
+    print!("  Database name [sam_fleet]: ");
     io::stdout().flush()?;
     io::stdin().read_line(&mut input)?;
     let db = input.trim();
-    cfg.database.database = Some(if db.is_empty() { "quantum_memory".into() } else { db.into() });
+    cfg.database.database = Some(if db.is_empty() { "sam_fleet".into() } else { db.into() });
 
     // Identity
     println!("\n━━━ Identity ━━━");
@@ -617,7 +617,7 @@ pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Resul
         let out = tokio::time::timeout(std::time::Duration::from_secs(5),
             Command::new("ssh").args([
                 "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                &format!("papasmurf@{}", ip), workspace_cmd
+                &format!("admin@{}", ip), workspace_cmd
             ]).output()
         ).await;
 
@@ -630,7 +630,7 @@ pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Resul
         };
 
         // SCP the file
-        let dest = format!("papasmurf@{}:{}/{}", ip, workspace, file);
+        let dest = format!("admin@{}:{}/{}", ip, workspace, file);
         let scp_out = tokio::time::timeout(std::time::Duration::from_secs(10),
             Command::new("scp").args([
                 "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
@@ -678,7 +678,7 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         io::stdin().read_line(&mut input).unwrap();
         input.trim().to_string()
     });
-    let db_name = db_name.map(|s| s.to_string()).unwrap_or_else(|| prompt("Database name", "quantum_memory"));
+    let db_name = db_name.map(|s| s.to_string()).unwrap_or_else(|| prompt("Database name", "sam_fleet"));
     let self_ip = self_ip.map(|s| s.to_string()).unwrap_or_else(|| {
         let detected = std::process::Command::new("hostname").arg("-I").output()
             .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("127.0.0.1").to_string())
@@ -825,7 +825,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
     for agent in &targets {
         let name = &agent.agent_name;
         let ip = agent.tailscale_ip.as_deref().unwrap_or("?");
-        let user = if name == "almalinux9" { "nick" } else { "papasmurf" };
+        let user = if name.is_empty() { "admin" } else { "admin" };
         let is_mac = agent.os_info.as_deref().unwrap_or("").to_lowercase().contains("mac");
         let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
