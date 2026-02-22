@@ -344,6 +344,13 @@ struct App {
     fleet_diag_done: bool,
     fleet_diag_results: Vec<FleetDiagResult>,
     fleet_diag_rx: Option<mpsc::UnboundedReceiver<FleetDiagMsg>>,
+    // Fleet-wide grep search overlay
+    fleet_search_active: bool,
+    fleet_search_query: String,
+    fleet_search_steps: Vec<DiagStep>,
+    fleet_search_rx: Option<mpsc::UnboundedReceiver<DiagStep>>,
+    fleet_search_scroll: u16,
+    fleet_search_running: bool,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -502,6 +509,7 @@ impl App {
             theme_name: tn, bg_density: bd, theme: Theme::resolve(tn, bd), routed_msg_ids: std::collections::HashSet::new(),
             diag_active: false, diag_steps: vec![], diag_rx: None, diag_auto_fix: false, diag_start: None, diag_title: None, diag_overlay_scroll: 0,
             fleet_diag_active: false, fleet_diag_fix: false, fleet_diag_selected: 0, fleet_diag_done: false, fleet_diag_results: vec![], fleet_diag_rx: None,
+            fleet_search_active: false, fleet_search_query: String::new(), fleet_search_steps: vec![], fleet_search_rx: None, fleet_search_scroll: 0, fleet_search_running: false,
             svc_list: vec![], config_load_rx: None, svc_selected: 0, svc_config: None, svc_loading: false, svc_load_rx: None, svc_detail_scroll: 0,
             ws_files: vec![], ws_selected: 0, ws_content: None, ws_content_scroll: 0, ws_load_rx: None, ws_file_rx: None,
             ws_editing: false, ws_edit_buffer: vec![], ws_cursor: (0, 0), ws_undo_stack: vec![], ws_discard_confirm: false,
@@ -2381,6 +2389,115 @@ print('ok')
         self.toast(&format!("✓ Saved {}", fname));
     }
 
+    fn start_fleet_search(&mut self) {
+        let query = self.fleet_search_query.trim().to_string();
+        if query.is_empty() {
+            self.toast("Enter a search query first");
+            return;
+        }
+
+        let targets: Vec<(String, String, String, bool)> = if self.multi_selected.is_empty() {
+            self.agents.iter()
+                .filter(|a| a.status == AgentStatus::Online)
+                .map(|a| (a.name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac")))
+                .collect()
+        } else {
+            self.multi_selected.iter()
+                .filter_map(|&i| self.agents.get(i))
+                .filter(|a| a.status == AgentStatus::Online)
+                .map(|a| (a.name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac")))
+                .collect()
+        };
+
+        self.fleet_search_active = true;
+        self.fleet_search_running = true;
+        self.fleet_search_scroll = 0;
+        self.fleet_search_steps.clear();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.fleet_search_rx = Some(rx);
+        let self_ip = self.self_ip.clone();
+
+        tokio::spawn(async move {
+            let _ = tx.send(DiagStep {
+                label: "Fleet search".into(),
+                status: DiagStatus::Running,
+                detail: format!("query: {}", query),
+            });
+            let _ = tx.send(DiagStep {
+                label: "Targets".into(),
+                status: DiagStatus::Pass,
+                detail: format!("{} online agent(s)", targets.len()),
+            });
+
+            if targets.is_empty() {
+                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "No online agents selected".into() });
+                return;
+            }
+
+            let mut handles = Vec::new();
+            for (name, host, user, is_mac) in targets {
+                let self_ip = self_ip.clone();
+                let query = query.clone();
+                handles.push(tokio::spawn(async move {
+                    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                    let q = shell::escape(&query);
+                    let cmd = format!(
+                        "{}for f in {}; do [ -f \"$f\" ] && grep -n -i -- {} \"$f\"; done 2>/dev/null | head -n {}",
+                        pfx, FLEET_SEARCH_TARGET_GLOBS, q, FLEET_SEARCH_MAX_RESULTS
+                    );
+
+                    let output = if host == "localhost" || host == self_ip {
+                        tokio::time::timeout(Duration::from_secs(FLEET_SEARCH_TIMEOUT_SECS), tokio::process::Command::new("bash").args(["-lc", &cmd]).output()).await.ok().and_then(|r| r.ok())
+                    } else {
+                        tokio::time::timeout(
+                            Duration::from_secs(FLEET_SEARCH_TIMEOUT_SECS),
+                            tokio::process::Command::new("ssh")
+                                .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                    &format!("{}@{}", user, host), &cmd])
+                                .output()
+                        ).await.ok().and_then(|r| r.ok())
+                    };
+
+                    match output {
+                        Some(o) => {
+                            let out = String::from_utf8_lossy(&o.stdout).to_string();
+                            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                            let (count, preview) = summarize_fleet_search_output(&out);
+                            if count > 0 {
+                                (DiagStep {
+                                    label: name,
+                                    status: DiagStatus::Pass,
+                                    detail: if preview.is_empty() { format!("{} match(es)", count) } else { format!("{} match(es) — {}", count, preview) },
+                                }, true)
+                            } else if !err.is_empty() {
+                                (DiagStep { label: name, status: DiagStatus::Fail, detail: err.chars().take(FLEET_SEARCH_ERROR_MAX_CHARS).collect() }, false)
+                            } else {
+                                (DiagStep { label: name, status: DiagStatus::Skipped, detail: "no matches".into() }, false)
+                            }
+                        }
+                        None => (DiagStep { label: name, status: DiagStatus::Fail, detail: "timeout".into() }, false),
+                    }
+                }));
+            }
+
+            let mut matched_agents = 0usize;
+            let mut total_agents = 0usize;
+            for h in handles {
+                if let Ok((step, matched)) = h.await {
+                    total_agents += 1;
+                    if matched { matched_agents += 1; }
+                    let _ = tx.send(step);
+                }
+            }
+            let _ = tx.send(DiagStep {
+                label: "DONE".into(),
+                status: DiagStatus::Pass,
+                detail: format!("{} / {} agent(s) with matches", matched_agents, total_agents),
+            });
+        });
+    }
+
     fn start_refresh(&mut self) {
         if self.refreshing { return; }
         self.refreshing = true;
@@ -2707,6 +2824,19 @@ const LINES_PER_MSG_EST: usize = 3;
 const SPINNER_FRAME_MS: u64 = 100;
 /// Input poll interval in milliseconds. Lower values improve key/menu responsiveness.
 const INPUT_POLL_MS: u64 = 10;
+const FLEET_SEARCH_PREVIEW_LINES: usize = 2;
+const FLEET_SEARCH_PREVIEW_CHARS: usize = 120;
+const FLEET_SEARCH_MAX_RESULTS: usize = 80;
+const FLEET_SEARCH_TIMEOUT_SECS: u64 = 10;
+const FLEET_SEARCH_ERROR_MAX_CHARS: usize = 100;
+const FLEET_SEARCH_TARGET_GLOBS: &str = "~/.openclaw/openclaw.json ~/CLAUDE/clawd/*.md ~/CLAUDE/clawd/memory/*.md";
+
+fn summarize_fleet_search_output(stdout: &str) -> (usize, String) {
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let count = lines.len();
+    let preview = lines.iter().take(FLEET_SEARCH_PREVIEW_LINES).map(|l| l.trim()).collect::<Vec<_>>().join(" | ");
+    (count, preview.chars().take(FLEET_SEARCH_PREVIEW_CHARS).collect())
+}
 
 fn fmt_hhmm(t: &str) -> String {
     t.chars().take(5).collect()
@@ -3734,6 +3864,76 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
     frame.render_widget(diag, popup);
 }
 
+fn render_fleet_search(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = frame.area();
+    let w = ((area.width as f32 * 0.75) as u16).max(70).min(area.width.saturating_sub(4));
+    let h = ((area.height as f32 * 0.75) as u16).max(12).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Query: ", Style::default().fg(t.text_dim)),
+            Span::styled(&app.fleet_search_query, Style::default().fg(t.text).bold()),
+            if !app.fleet_search_running { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
+        ]),
+        Line::from(""),
+    ];
+
+    for step in &app.fleet_search_steps {
+        if step.label == "DONE" {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(format!("  {}", step.detail), Style::default().fg(if step.status == DiagStatus::Fail { t.status_offline } else { t.status_online }).bold())));
+            continue;
+        }
+        if step.status == DiagStatus::Running {
+            let c = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", c), Style::default().fg(t.pending)),
+                Span::styled(&step.label, Style::default().fg(t.text).bold()),
+                Span::styled(format!(" — {}", step.detail), Style::default().fg(t.text_dim)),
+            ]));
+        } else {
+            let (icon, color) = match step.status {
+                DiagStatus::Pass => ("✓ ", t.status_online),
+                DiagStatus::Fail => ("✗ ", t.status_offline),
+                DiagStatus::Skipped => ("⊘ ", t.text_dim),
+                DiagStatus::Fixed => ("🔧", t.status_busy),
+                DiagStatus::Running => ("⏳", t.pending),
+                DiagStatus::Rollback => ("⏪", t.status_busy),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+                Span::styled(&step.label, Style::default().fg(t.text).bold()),
+                Span::styled(format!(" — {}", step.detail), Style::default().fg(t.text_dim)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if app.fleet_search_running {
+            "  Enter search  Backspace edit  ↑↓ scroll  Esc close"
+        } else {
+            "  Type to edit query  Enter search again  ↑↓ scroll  Esc close"
+        },
+        Style::default().fg(t.text_dim),
+    )));
+
+    let search = Paragraph::new(lines)
+        .scroll((app.fleet_search_scroll, 0))
+        .block(Block::default()
+            .title(Span::styled(" 🔎 Fleet Search — memory + config grep ", Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(Style::default().fg(t.accent))
+            .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(search, popup);
+}
+
 fn render_services(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let split = Layout::default().direction(Direction::Horizontal)
@@ -4531,6 +4731,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("  N (Shift)", "Clear selection", act_style),
         ("  a", "New agent wizard", act_style),
         ("  /", "Fleet command (runs on all agents)", act_style),
+        ("  F (Shift)", "Fleet search (grep memory + config)", act_style),
         ("  g", "Restart gateway (selected)", act_style),
         ("  G (Shift)", "Investigate gateway (selected)", act_style),
         ("  o", "OpenClaw version audit", act_style),
@@ -4627,7 +4828,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Dashboard => match app.focus {
             Focus::Chat => vec![("Tab","fleet"),("⏎","send"),("@","target"),("Esc","back")],
             Focus::Command => vec![("⏎","run"),("Esc","cancel")],
-            _ => vec![("⏎","open"),("d","check"),("D","fix"),("U","update"),("u","update all"),("g","group"),("t","tasks"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
+            _ => vec![("⏎","open"),("d","check"),("D","fix"),("U","update"),("u","update all"),("F","search"),("g","group"),("t","tasks"),("f","filter"),("r","refresh"),("?","help"),("q","quit")],
         },
         Screen::AgentDetail => match app.focus {
             Focus::AgentChat => vec![("⏎","send"),("@","tag"),("Tab","next"),("Esc","info"),("1-5","tabs")],
@@ -4808,6 +5009,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 render_fleet_diagnostics(f, &app);
             } else if app.diag_active {
                 render_diagnostics(f, &app);
+            }
+            if app.fleet_search_active {
+                render_fleet_search(f, &app);
             }
 
             // Config viewer overlay
@@ -5037,6 +5241,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.selected = idx;
                                     app.start_diagnostics(fix);
                                 }
+                            }
+                            _ => {}
+                        }
+                    } else
+                    if app.fleet_search_active {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.fleet_search_active = false;
+                                app.fleet_search_running = false;
+                                app.fleet_search_rx = None;
+                            }
+                            KeyCode::PageUp => {
+                                app.fleet_search_scroll = app.fleet_search_scroll.saturating_sub(5);
+                            }
+                            KeyCode::PageDown => {
+                                app.fleet_search_scroll = app.fleet_search_scroll.saturating_add(5);
+                            }
+                            KeyCode::Up => {
+                                app.fleet_search_scroll = app.fleet_search_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                app.fleet_search_scroll = app.fleet_search_scroll.saturating_add(1);
+                            }
+                            KeyCode::Enter => app.start_fleet_search(),
+                            KeyCode::Backspace => {
+                                if !app.fleet_search_running { app.fleet_search_query.pop(); }
+                            }
+                            KeyCode::Char(ch) => {
+                                if !app.fleet_search_running { app.fleet_search_query.push(ch); }
                             }
                             _ => {}
                         }
@@ -5587,6 +5820,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.multi_selected.clear();
                                     app.toast("Selection cleared");
                                 }
+                                KeyCode::Char('F') => {
+                                    app.fleet_search_active = true;
+                                    app.fleet_search_running = false;
+                                    app.fleet_search_scroll = 0;
+                                    app.fleet_search_steps.clear();
+                                }
                                 KeyCode::Char('h') => {
                                     // Fleet health summary
                                     let total = app.agents.len();
@@ -5964,6 +6203,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        if app.fleet_search_active {
+            if let Some(ref mut rx) = app.fleet_search_rx {
+                while let Ok(step) = rx.try_recv() {
+                    if step.label == "DONE" { app.fleet_search_running = false; }
+                    app.fleet_search_steps.push(step);
+                }
+            }
+        }
 
         if let Some(ref mut rx) = app.wizard_ssh_rx {
             if let Ok(result) = rx.try_recv() {
@@ -6126,10 +6373,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::INPUT_POLL_MS;
+    use super::{INPUT_POLL_MS, summarize_fleet_search_output};
 
     #[test]
     fn input_poll_interval_is_low_for_responsive_ui() {
         assert!(INPUT_POLL_MS <= 10);
+    }
+
+    #[test]
+    fn fleet_search_summary_counts_and_previews_matches() {
+        let (count, preview) = summarize_fleet_search_output("a:1:foo\nb:2:bar\n");
+        assert_eq!(count, 2);
+        assert!(preview.contains("a:1:foo"));
+        assert!(preview.contains("b:2:bar"));
     }
 }
