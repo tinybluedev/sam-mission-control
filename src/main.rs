@@ -188,6 +188,9 @@ struct App {
     // Alerts
     alerts: Vec<Alert>,
     alert_flash: Option<Instant>,
+    // Filter
+    filter_active: bool,
+    filter_text: String,
     // Multi-select
     multi_selected: std::collections::HashSet<usize>,
     // Theme
@@ -259,6 +262,7 @@ impl App {
             tasks: vec![], task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
             show_splash: true, splash_start: Instant::now(),
+            filter_active: false, filter_text: String::new(),
             alerts: vec![], alert_flash: None,
             multi_selected: HashSet::new(),
             spinner_frame: 0, sort_mode: SortMode::Name,
@@ -497,6 +501,23 @@ impl App {
             self.refreshing = false;
         }
         updates
+    }
+
+    fn filtered_agents(&self) -> Vec<usize> {
+        if self.filter_text.is_empty() {
+            (0..self.agents.len()).collect()
+        } else {
+            let q = self.filter_text.to_lowercase();
+            self.agents.iter().enumerate()
+                .filter(|(_, a)| {
+                    a.name.to_lowercase().contains(&q)
+                    || a.db_name.to_lowercase().contains(&q)
+                    || a.location.to_lowercase().contains(&q)
+                    || a.host.contains(&q)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        }
     }
 
     fn check_alerts(&mut self) {
@@ -917,8 +938,13 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     } else {
         vec![Constraint::Length(5), Constraint::Length(14), Constraint::Length(8), Constraint::Min(12), Constraint::Length(0)]
     };
+    let fleet_title = if app.filter_active {
+        format!(" Fleet 🔍 {} ", app.filter_text)
+    } else {
+        " Fleet ".to_string()
+    };
     let table = Table::new(rows, widths).header(hrow)
-    .block(Block::default().title(Span::styled(" Fleet ", Style::default().fg(fb).bold()))
+    .block(Block::default().title(Span::styled(fleet_title, Style::default().fg(fb).bold()))
         .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(fb))
         .style(Style::default().bg(app.bg_density.bg()))
         .padding(Padding::new(1, 1, 0, 0)));
@@ -1845,6 +1871,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         Screen::Dashboard => match app.focus {
+                            Focus::Fleet if app.filter_active => match key.code {
+                                KeyCode::Esc => { app.filter_active = false; app.filter_text.clear(); }
+                                KeyCode::Enter => { app.filter_active = false; }
+                                KeyCode::Backspace => { app.filter_text.pop(); }
+                                KeyCode::Char(ch) => { app.filter_text.push(ch); }
+                                KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                                KeyCode::Down | KeyCode::Char('j') => app.next(),
+                                _ => {}
+                            },
                             Focus::Fleet => match key.code {
                                 KeyCode::Char('q') => app.should_quit = true,
                                 KeyCode::Tab => app.focus = Focus::Chat,
@@ -1866,6 +1901,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         app.multi_selected.insert(app.selected);
                                     }
                                     app.next();
+                                }
+                                KeyCode::Char('f') => {
+                                    app.filter_active = true;
+                                    app.filter_text.clear();
                                 }
                                 KeyCode::Char('?') => app.screen = Screen::Help,
                                 KeyCode::Char('r') => app.start_refresh(),
