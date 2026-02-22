@@ -236,6 +236,26 @@ pub async fn respond_to_chat(pool: &Pool, msg_id: i64, response: &str) -> Result
     Ok(())
 }
 
+/// Update just the status of a chat message (e.g. pending → thinking → streaming)
+pub async fn update_chat_status(pool: &Pool, msg_id: i64, status: &str) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "UPDATE mc_chat SET status=? WHERE id=?",
+        (status, msg_id),
+    ).await?;
+    Ok(())
+}
+
+/// Update partial response (streaming) without marking as complete
+pub async fn update_chat_partial(pool: &Pool, msg_id: i64, partial: &str) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "UPDATE mc_chat SET response=?, status='streaming' WHERE id=?",
+        (partial, msg_id),
+    ).await?;
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
