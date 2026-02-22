@@ -1163,7 +1163,7 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
             // Step 2: stream npm install (stdout + stderr merged via 2>&1)
             let _ = tx.send(DiagStep { label: "Installing openclaw@latest".into(), status: DiagStatus::Running, detail: "running npm install...".into() });
             // 2>&1 merges stderr so we capture error messages too
-            let install_cmd = format!("{}sudo npm install -g openclaw@latest 2>&1; echo "__EXIT:$?__"", pfx);
+            let install_cmd = format!("{}sudo npm install -g openclaw@latest 2>&1; echo EXITCODE:$?:DONE", pfx);
             use tokio::io::AsyncBufReadExt;
             let mut child = if host == "localhost" || host == self_ip {
                 tokio::process::Command::new("bash").args(["-c", &install_cmd])
@@ -1184,8 +1184,8 @@ async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
                         let clean = line.trim().to_string();
                         if clean.is_empty() { continue; }
                         // Parse exit code marker
-                        if clean.starts_with("__EXIT:") {
-                            let code = clean.trim_start_matches("__EXIT:").trim_end_matches("__");
+                        if clean.starts_with("EXITCODE:") {
+                            let code = clean.trim_start_matches("EXITCODE:").trim_end_matches(":DONE");
                             install_ok = code == "0";
                             continue;
                         }
