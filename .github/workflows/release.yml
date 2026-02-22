@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: sam-mission-control-x86_64-linux
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: sam-mission-control-x86_64-macos
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: sam-mission-control-aarch64-macos
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        shell: bash
+        run: cp target/${{ matrix.target }}/release/sam-mission-control ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | sed -n '2p')
+          if [ -z "$PREVIOUS_TAG" ]; then
+            LOG=$(git log --oneline)
+          else
+            LOG=$(git log --oneline "${PREVIOUS_TAG}..HEAD")
+          fi
+          echo "CHANGELOG<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$LOG" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: |
+            ## Changes since last release
+
+            ${{ steps.changelog.outputs.CHANGELOG }}
+          files: |
+            artifacts/sam-mission-control-x86_64-linux/sam-mission-control-x86_64-linux
+            artifacts/sam-mission-control-x86_64-macos/sam-mission-control-x86_64-macos
+            artifacts/sam-mission-control-aarch64-macos/sam-mission-control-aarch64-macos

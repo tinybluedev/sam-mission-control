@@ -61,10 +61,13 @@ pub fn load_fleet_config() -> Result<FleetConfig, String> {
 }
 
 fn dirs_next() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config").join("sam"))
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".config").join("sam"))
 }
 
 /// Resolve chat target aliases. Returns the canonical agent name.
+#[allow(dead_code)]
 pub fn resolve_alias(input: &str, agents: &[AgentConfig]) -> String {
     let lower = input.to_lowercase();
     // Direct name match
@@ -89,7 +92,7 @@ pub fn resolve_alias(input: &str, agents: &[AgentConfig]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_alias, AgentConfig};
+    use super::{AgentConfig, resolve_alias};
 
     fn agent(name: &str, display: Option<&str>) -> AgentConfig {
         AgentConfig {
@@ -103,7 +106,10 @@ mod tests {
 
     #[test]
     fn resolve_alias_prefers_exact_name_and_display() {
-        let agents = vec![agent("webserver", Some("Web Server")), agent("gpu-node", Some("GPU Node"))];
+        let agents = vec![
+            agent("webserver", Some("Web Server")),
+            agent("gpu-node", Some("GPU Node")),
+        ];
         assert_eq!(resolve_alias("webserver", &agents), "webserver");
         assert_eq!(resolve_alias("web server", &agents), "webserver");
     }

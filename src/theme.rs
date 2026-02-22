@@ -4,10 +4,10 @@ use ratatui::prelude::*;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum BgDensity {
-    Dark,       // Default — near black
-    Medium,     // Slightly lighter
-    Light,      // Visible grey
-    White,      // Light mode
+    Dark,        // Default — near black
+    Medium,      // Slightly lighter
+    Light,       // Visible grey
+    White,       // Light mode
     Transparent, // Pure terminal default
 }
 
@@ -51,14 +51,14 @@ impl BgDensity {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ThemeName {
-    Standard,   // Original cyan/blue
-    Noir,       // All white/grey on black
-    Paper,      // All black on white
-    Retro1977,  // Warm amber/orange/brown
-    Cyber2077,  // Neon pink/cyan/yellow
-    Matrix,     // Green on black
-    Sunset,     // Warm orange/red/purple
-    Arctic,     // Cool blue/white/silver
+    Standard,  // Original cyan/blue
+    Noir,      // All white/grey on black
+    Paper,     // All black on white
+    Retro1977, // Warm amber/orange/brown
+    Cyber2077, // Neon pink/cyan/yellow
+    Matrix,    // Green on black
+    Sunset,    // Warm orange/red/purple
+    Arctic,    // Cool blue/white/silver
 }
 
 impl ThemeName {
@@ -92,17 +92,17 @@ impl ThemeName {
 // The actual resolved colors for rendering
 #[derive(Clone, Copy)]
 pub struct Theme {
-    pub accent: Color,         // Primary accent (borders, highlights)
-    pub accent2: Color,        // Secondary accent
-    pub text: Color,           // Main text
-    pub text_dim: Color,       // Dimmed text (timestamps, labels)
-    pub text_bold: Color,      // Bold/emphasized text
-    pub border: Color,         // Inactive borders
-    pub border_active: Color,  // Active borders
-    pub selected_bg: Color,    // Selected row background
-    pub sender_self: Color,    // Chat: own messages
-    pub sender_other: Color,   // Chat: other messages
-    pub response: Color,       // Chat: response text
+    pub accent: Color,        // Primary accent (borders, highlights)
+    pub accent2: Color,       // Secondary accent
+    pub text: Color,          // Main text
+    pub text_dim: Color,      // Dimmed text (timestamps, labels)
+    pub text_bold: Color,     // Bold/emphasized text
+    pub border: Color,        // Inactive borders
+    pub border_active: Color, // Active borders
+    pub selected_bg: Color,   // Selected row background
+    pub sender_self: Color,   // Chat: own messages
+    pub sender_other: Color,  // Chat: other messages
+    pub response: Color,      // Chat: response text
     pub status_online: Color,
     pub status_busy: Color,
     pub status_offline: Color,
@@ -111,7 +111,7 @@ pub struct Theme {
     pub loc_vps: Color,
     pub loc_mobile: Color,
     pub version: Color,
-    pub pending: Color,        // Awaiting response
+    pub pending: Color, // Awaiting response
     pub header_title: Color,
 }
 
@@ -119,8 +119,20 @@ impl Theme {
     pub fn resolve(name: ThemeName, bg: BgDensity) -> Self {
         let light = bg.is_light();
         match name {
-            ThemeName::Standard => if light { Self::standard_light() } else { Self::standard() },
-            ThemeName::Noir => if light { Self::paper() } else { Self::noir() },
+            ThemeName::Standard => {
+                if light {
+                    Self::standard_light()
+                } else {
+                    Self::standard()
+                }
+            }
+            ThemeName::Noir => {
+                if light {
+                    Self::paper()
+                } else {
+                    Self::noir()
+                }
+            }
             ThemeName::Paper => Self::paper(),
             ThemeName::Retro1977 => Self::retro1977(light),
             ThemeName::Cyber2077 => Self::cyber2077(light),

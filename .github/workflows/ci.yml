@@ -7,9 +7,12 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -18,6 +21,16 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (zero warnings)
+        run: cargo clippy -- -D warnings
 
       - name: Build
         run: cargo build --release
@@ -36,6 +49,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
