@@ -340,6 +340,9 @@ impl App {
                     let msg = message.clone();
                     let pool = pool.clone();
                     let msg_id = ids.get(i).copied().unwrap_or(0);
+                    let bcast_host = agent.host.clone();
+                    let bcast_user = agent.ssh_user.clone();
+                    let bcast_port = agent.gateway_port;
                     tokio::spawn(async move {
                         let client = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(60))
@@ -361,7 +364,28 @@ impl App {
                                     Err(e) => format!("Parse error: {}", e),
                                 }
                             }
-                            Err(e) => format!("⚠ {}", e),
+                            Err(_) => {
+                            // SSH fallback for broadcast
+                            let ssh_cmd = format!(
+                                "curl -sS --connect-timeout 10 -m 55 http://localhost:{}/v1/chat/completions -H 'Authorization: Bearer {}' -H 'Content-Type: application/json' -d '{}'",
+                                bcast_port, tok, serde_json::to_string(&body).unwrap_or_default().replace("'", "'\''")
+                            );
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(60),
+                                tokio::process::Command::new("ssh")
+                                    .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                                        &format!("{}@{}", bcast_user, bcast_host), &ssh_cmd])
+                                    .output()
+                            ).await {
+                                Ok(Ok(o)) if o.status.success() => {
+                                    let s = String::from_utf8_lossy(&o.stdout);
+                                    serde_json::from_str::<serde_json::Value>(&s).ok()
+                                        .and_then(|j| j["choices"][0]["message"]["content"].as_str().map(|s| s.to_string()))
+                                        .unwrap_or_else(|| "⚠ SSH fallback parse error".into())
+                                }
+                                _ => "⚠ unreachable".into(),
+                            }
+                        },
                         };
                         if msg_id > 0 {
                             let _ = db::respond_to_chat(&pool, msg_id, &response).await;
@@ -382,6 +406,7 @@ impl App {
         let host = agent.host.clone();
         let port = agent.gateway_port;
         let token = agent.gateway_token.clone();
+        let ssh_user = agent.ssh_user.clone();
 
         self.agent_chat_history.push(ChatLine {
             sender: self.user(), target: Some(target.clone()), message: message.clone(),
