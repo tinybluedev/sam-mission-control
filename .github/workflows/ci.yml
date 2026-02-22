@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test
+
+  security-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Security audit
+        run: cargo audit
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for hardcoded secrets
+        run: |
+          echo "Scanning for potential secrets..."
+          FOUND=0
+
+          # Check for IP patterns that look like private infra
+          if grep -rn '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}' src/ --include="*.rs" | grep -v '127.0.0.1\|0.0.0.0\|localhost\|test\|example\|0\.0\.0\.0' | grep -v '//.*[0-9]'; then
+            echo "⚠️  Found hardcoded IPs in source"
+            FOUND=1
+          fi
+
+          # Check for password patterns
+          if grep -rni 'password\s*=\s*"[^"]\+"\|passwd\|secret.*=.*"' src/ --include="*.rs" | grep -v 'sanitize\|mask\|test\|example\|placeholder'; then
+            echo "⚠️  Found potential hardcoded passwords"
+            FOUND=1
+          fi
+
+          if [ $FOUND -eq 0 ]; then
+            echo "✅ No secrets detected"
+          fi

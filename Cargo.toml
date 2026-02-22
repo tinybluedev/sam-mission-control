@@ -1,0 +1,24 @@
+[package]
+name = "sam-mission-control"
+description = "Fleet orchestration TUI for coordinated AI agent deployment"
+authors = ["tinybluedev"]
+license = "MIT"
+repository = "https://github.com/tinybluedev/sam-mission-control"
+keywords = ["tui", "fleet", "agents", "orchestration", "ssh"]
+categories = ["command-line-utilities"]
+version = "1.2.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.60", features = ["derive"] }
+crossterm = "0.29.0"
+dirs = "6.0.0"
+dotenvy = "0.15.7"
+mysql_async = "0.36.1"
+ratatui = "0.30.0"
+regex-lite = "0.1.9"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.49.0", features = ["full"] }
+toml = "1.0.3"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
