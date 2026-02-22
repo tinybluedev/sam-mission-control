@@ -268,6 +268,7 @@ struct App {
     wizard: wizard::AgentWizard,
     // Task board
     tasks: Vec<db::Task>,
+    task_filter_agent: Option<String>,
     task_selected: usize,
     task_input: String,
     task_input_active: bool,
@@ -385,7 +386,7 @@ impl App {
             refresh_rx: None, refreshing: false, self_ip,
             command_input: String::new(),
             wizard: wizard::AgentWizard::new(),
-            tasks: vec![], task_selected: 0, task_input: String::new(), task_input_active: false,
+            tasks: vec![], task_filter_agent: None, task_selected: 0, task_input: String::new(), task_input_active: false,
             last_task_poll: Instant::now(),
             spawned_agents: vec![], show_splash: true, splash_start: Instant::now(),
             config_text: None, config_scroll: 0,
@@ -1948,9 +1949,9 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         Span::styled(a.status.to_string(), Style::default().fg(st_color)),
         Span::raw("    "),
         Span::styled(match app.focus {
-            Focus::AgentChat => "  Info  ▌Chat▐  Files ",
-            Focus::Workspace => "  Info   Chat  ▌Files▐",
-            _ => " ▌Info▐  Chat   Files ",
+            Focus::AgentChat => "  1:Info  2:▌Chat▐  3:Files  4:Tasks ",
+            Focus::Workspace => "  1:Info  2:Chat  3:▌Files▐  4:Tasks ",
+            _ => "  1:▌Info▐  2:Chat  3:Files  4:Tasks ",
         }, Style::default().fg(t.accent).bold()),
     ]))
     .block(Block::default().borders(Borders::ALL).border_type(BorderType::Double)
@@ -2211,6 +2212,8 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
 
 
 fn render_task_board(frame: &mut Frame, app: &App) {
+    let filter_label = app.task_filter_agent.as_ref()
+        .map(|a| format!(" ({})", a)).unwrap_or_default();
     let t = &app.theme;
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -2305,7 +2308,7 @@ fn render_task_board(frame: &mut Frame, app: &App) {
         Constraint::Length(5), Constraint::Length(5), Constraint::Length(14),
         Constraint::Length(14), Constraint::Min(15),
     ]).header(hrow)
-    .block(Block::default().title(Span::styled(" ◆── Tasks ──◆ ", Style::default().fg(t.border_active).bold()))
+    .block(Block::default().title(Span::styled(format!(" ◆── Tasks{} ──◆ ", filter_label), Style::default().fg(t.border_active).bold()))
         .borders(Borders::ALL).border_type(t.border_type).border_style(Style::default().fg(t.border_active))
         .style(Style::default().bg(app.bg_density.bg()))
         .padding(Padding::new(1, 1, 0, 0)));
@@ -2860,6 +2863,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('1') => app.focus = Focus::Fleet,
                                 KeyCode::Char('2') => app.focus = Focus::AgentChat,
                                 KeyCode::Char('3') => {} // already here
+                                KeyCode::Char('4') | KeyCode::Char('t') => {
+                                    app.task_filter_agent = Some(app.agents[app.selected].db_name.clone());
+                                    app.screen = Screen::TaskBoard;
+                                    app.last_task_poll = Instant::now() - Duration::from_secs(10);
+                                }
                                 KeyCode::Up => { if app.ws_selected > 0 { app.ws_selected -= 1; } }
                                 KeyCode::Down => { if app.ws_selected < app.ws_files.len().saturating_sub(1) { app.ws_selected += 1; } }
                                 KeyCode::Enter => app.start_file_load(),
@@ -2893,6 +2901,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     KeyCode::Tab => { app.focus = Focus::Workspace; app.start_workspace_load(); }
                                     KeyCode::Char('1') if app.agent_chat_input.is_empty() => app.focus = Focus::Fleet,
                                     KeyCode::Char('3') if app.agent_chat_input.is_empty() => { app.focus = Focus::Workspace; app.start_workspace_load(); }
+                                    KeyCode::Char('4') if app.agent_chat_input.is_empty() => {
+                                        app.task_filter_agent = Some(app.agents[app.selected].db_name.clone());
+                                        app.screen = Screen::TaskBoard;
+                                        app.last_task_poll = Instant::now() - Duration::from_secs(10);
+                                    }
                                     KeyCode::Enter => app.send_agent_message().await,
                                     KeyCode::Backspace => { app.agent_chat_input.pop(); app.update_autocomplete(); }
                                     KeyCode::Char(c) => { app.agent_chat_input.push(c); app.update_autocomplete(); }
@@ -2908,6 +2921,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('2') => app.focus = Focus::AgentChat,
                                 KeyCode::Char('3') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
                                 KeyCode::Char('w') => { app.focus = Focus::Workspace; app.start_workspace_load(); }
+                                KeyCode::Char('4') | KeyCode::Char('t') => {
+                                    app.task_filter_agent = Some(app.agents[app.selected].db_name.clone());
+                                    app.screen = Screen::TaskBoard;
+                                    app.last_task_poll = Instant::now() - Duration::from_secs(10);
+                                }
                                 KeyCode::Char('q') => app.should_quit = true,
                                 KeyCode::Char('r') => app.start_refresh(),
                                 KeyCode::Char('b') => app.cycle_bg(),
@@ -3006,7 +3024,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             app.task_input.clear();
                                             app.task_input_active = false;
                                             if let Some(pool) = &app.db_pool {
-                                                let _ = db::create_task(pool, &desc, 5, &app.user(), None).await;
+                                                let agent = app.task_filter_agent.as_deref(); let _ = db::create_task(pool, &desc, 5, &app.user(), agent).await;
                                                 if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
                                             }
                                         }
@@ -3225,6 +3243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 KeyCode::Char('x') => app.screen = Screen::SpawnManager,
                                 KeyCode::Char('t') => {
+                                    app.task_filter_agent = None;
                                     app.screen = Screen::TaskBoard;
                                     app.last_task_poll = Instant::now() - Duration::from_secs(10);
                                 }
@@ -3349,7 +3368,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Poll tasks every 5s when on task board
         if app.screen == Screen::TaskBoard && app.last_task_poll.elapsed() > Duration::from_secs(5) {
             if let Some(pool) = &app.db_pool {
-                if let Ok(tasks) = db::load_tasks(pool, 50).await { app.tasks = tasks; }
+                if let Ok(mut tasks) = db::load_tasks(pool, 50).await {
+                    if let Some(ref agent) = app.task_filter_agent {
+                        tasks.retain(|t| t.assigned_agent.as_ref().map(|a| a == agent).unwrap_or(false));
+                    }
+                    app.tasks = tasks;
+                }
             }
             app.last_task_poll = Instant::now();
         }
