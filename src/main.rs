@@ -369,7 +369,7 @@ impl App {
         } else { String::new() };
         let chat_count = self.chat_history.len();
         self.status_message = format!(
-            "v0.9 │ {}/{} online{} │ sort:{} │ chat({}) │ {}/{} │ r b c s ?=help",
+            "v1.0 │ {}/{} online{} │ sort:{} │ chat({}) │ {}/{} │ /=cmd ?=help",
             on, total, refresh, self.sort_mode.label(), chat_count,
             self.theme_name.label(), self.bg_density.label()
         );
@@ -1002,22 +1002,40 @@ fn render_help(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let sections = vec![
         ("", ""),
-        ("NAVIGATION", ""),
-        ("  Tab", "Switch focus (Fleet ↔ Chat / Info ↔ Agent Chat)"),
+        ("DASHBOARD", ""),
+        ("  Tab", "Switch focus: Fleet ↔ Chat"),
         ("  ↑↓ / j k", "Navigate fleet list"),
-        ("  Enter", "Open agent detail with dedicated chat"),
-        ("  Esc", "Back to dashboard"),
-        ("  r", "Refresh all agents via SSH (non-blocking)"),
+        ("  Enter", "Open agent detail"),
+        ("  r", "Refresh all agents (SSH)"),
+        ("  s", "Sort: name → status → location → version"),
+        ("  t", "Task board"),
+        ("  v", "VPN mesh status"),
+        ("  a", "New agent wizard"),
+        ("  /", "Fleet command (runs on all agents)"),
+        ("  o", "OpenClaw version audit"),
+        ("  u", "Bulk update OpenClaw"),
+        ("  g", "Restart gateway (selected agent)"),
+        ("  c", "Cycle color theme"),
+        ("  b", "Cycle background density"),
         ("  q", "Quit"),
         ("", ""),
-        ("THEMES", ""),
-        ("  b", "Cycle background: dark → medium → light → white → terminal"),
-        ("  c", "Cycle colors: standard → noir → paper → 1977 → 2077 → matrix → sunset → arctic"),
+        ("AGENT DETAIL", ""),
+        ("  Tab", "Switch: Info ↔ Chat"),
+        ("  Enter", "Send direct message"),
+        ("  Esc", "Back to dashboard"),
         ("", ""),
-        ("CHAT", ""),
-        ("  @agent msg", "Message a specific agent (dashboard)"),
-        ("  Type + Enter", "Send to focused agent (detail screen)"),
-        ("  PgUp/PgDn", "Scroll chat"),
+        ("TASK BOARD", ""),
+        ("  j / k", "Navigate tasks"),
+        ("  n", "Create new task"),
+        ("  d", "Mark done"),
+        ("  Esc", "Back"),
+        ("", ""),
+        ("MOUSE", ""),
+        ("  Click", "Focus panel / select agent"),
+        ("  Scroll", "Scroll chat panels"),
+        ("", ""),
+        ("THEMES (8)", "standard noir paper 1977 2077 matrix sunset arctic"),
+        ("BACKGROUNDS", "dark medium light white terminal"),
     ];
 
     let lines: Vec<Line> = sections.iter().map(|(l, r)| {
@@ -1031,13 +1049,15 @@ fn render_help(frame: &mut Frame, app: &App) {
         }
     }).collect();
 
-    let help = Paragraph::new(lines).block(Block::default().title(" Help — press any key to close ")
+    let help = Paragraph::new(lines).block(Block::default()
+        .title(Span::styled(" Help — press any key to close ", Style::default().fg(t.accent).bold()))
         .borders(Borders::ALL).border_type(BorderType::Rounded)
         .border_style(Style::default().fg(t.accent))
         .style(Style::default().bg(app.bg_density.bg()))
         .padding(Padding::new(2, 2, 1, 1)));
     frame.render_widget(help, frame.area());
 }
+
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
