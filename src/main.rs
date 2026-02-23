@@ -8916,6 +8916,101 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         })
         .collect();
 
+    // ── Session & Connection panel ────────────────────
+    info.push(Line::from(""));
+    info.push(Line::from(Span::styled(
+        "  ─── Session & Connection ───",
+        Style::default().fg(t.accent).bold(),
+    )));
+    info.push(Line::from(""));
+
+    // Gateway: port / pid / uptime / status
+    let gw_status_str = match a.gateway_status {
+        GatewayStatus::Online => "online",
+        GatewayStatus::Offline => "offline",
+        GatewayStatus::Restarting => "restarting",
+        GatewayStatus::Unknown => "unknown",
+    };
+    let gw_color = match a.gateway_status {
+        GatewayStatus::Online => t.status_online,
+        GatewayStatus::Offline => t.status_offline,
+        GatewayStatus::Restarting => t.status_busy,
+        GatewayStatus::Unknown => t.text_dim,
+    };
+    let gw_pid_str = match a.gateway_pid {
+        Some(pid) if pid > 0 => format!("pid:{}", pid),
+        _ => "pid:—".into(),
+    };
+    let gw_up_str = if a.uptime_seconds > 0 {
+        format!("  up:{}", format_uptime(a.uptime_seconds))
+    } else {
+        String::new()
+    };
+    let gw_detail = format!(":{} {}{}  {}", a.gateway_port, gw_pid_str, gw_up_str, gw_status_str);
+    info.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<14}", "Gateway"),
+            Style::default().fg(t.text_bold).bold(),
+        ),
+        Span::styled(gw_detail, Style::default().fg(gw_color)),
+    ]));
+
+    // Last heartbeat
+    let hb_value = if a.last_seen.is_empty() { "—" } else { &a.last_seen };
+    info.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<14}", "Heartbeat"),
+            Style::default().fg(t.text_bold).bold(),
+        ),
+        Span::styled(hb_value.to_string(), Style::default().fg(t.text)),
+    ]));
+
+    // Context % bar
+    let ctx_bar = mini_bar(a.context_pct, 10);
+    let ctx_color = mini_bar_color(a.context_pct, t, 50.0, 80.0);
+    info.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<14}", "Context"),
+            Style::default().fg(t.text_bold).bold(),
+        ),
+        Span::styled(ctx_bar, Style::default().fg(ctx_color)),
+    ]));
+
+    // Active messaging channels from svc_list
+    let channel_names: Vec<String> = app
+        .svc_list
+        .iter()
+        .filter(|s| {
+            s.enabled
+                && s.name != "gateway"
+                && s.name != "model"
+        })
+        .map(|s| format!("{} {}", s.icon, s.name))
+        .collect();
+    let channels_display = if channel_names.is_empty() {
+        "none".to_string()
+    } else {
+        channel_names.join("  ")
+    };
+    info.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<14}", "Channels"),
+            Style::default().fg(t.text_bold).bold(),
+        ),
+        Span::styled(
+            channels_display,
+            Style::default().fg(if channel_names.is_empty() {
+                t.text_dim
+            } else {
+                t.status_online
+            }),
+        ),
+    ]));
+
     // Append OS art decoration at the bottom of info panel
     info.push(Line::from(""));
     for art_line in os_art {
