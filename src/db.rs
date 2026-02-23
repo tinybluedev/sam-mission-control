@@ -76,6 +76,7 @@ pub struct DbAgent {
     pub gateway_token: Option<String>,
     pub ssh_user: Option<String>,
     pub gateway_pid: Option<i32>,
+    pub agent_note: Option<String>,
 }
 
 /// Load all agents from `mc_fleet_status`, ordered by name.
@@ -92,6 +93,10 @@ pub async fn run_migrations(pool: &Pool) -> Result<(), mysql_async::Error> {
     ).await;
     let _ = conn.exec_drop(
         "ALTER TABLE mc_fleet_status ADD COLUMN IF NOT EXISTS gateway_pid INT DEFAULT NULL",
+        (),
+    ).await;
+    let _ = conn.exec_drop(
+        "ALTER TABLE mc_fleet_status ADD COLUMN IF NOT EXISTS agent_note TEXT DEFAULT NULL",
         (),
     ).await;
     // Ensure mc_operations table exists
@@ -139,7 +144,7 @@ pub async fn update_resource_metrics(
 pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let rows: Vec<mysql_async::Row> = conn.query(
-        "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token, gateway_pid, ssh_user FROM mc_fleet_status ORDER BY agent_name",
+        "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token, gateway_pid, ssh_user, agent_note FROM mc_fleet_status ORDER BY agent_name",
     ).await?;
     let agents = rows
         .into_iter()
@@ -161,10 +166,24 @@ pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error>
             gateway_port: r.get::<Option<i32>, _>(11).flatten().unwrap_or(18789),
             gateway_token: r.get::<Option<String>, _>(12).flatten(),
             ssh_user: r.get::<Option<String>, _>(14).flatten(),
-            gateway_pid: r.get::<Option<i32>, _>(14).flatten(),
+            gateway_pid: r.get::<Option<i32>, _>(13).flatten(),
+            agent_note: r.get::<Option<String>, _>(15).flatten(),
         })
         .collect();
     Ok(agents)
+}
+
+pub async fn update_agent_note(
+    pool: &Pool,
+    agent_name: &str,
+    agent_note: &str,
+) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "UPDATE mc_fleet_status SET agent_note=?, updated_at=NOW() WHERE agent_name=?",
+        (agent_note, agent_name),
+    ).await?;
+    Ok(())
 }
 
 pub async fn update_gateway_pid(
@@ -546,7 +565,7 @@ mod tests {
     fn unicode_values_do_not_alter_query_template() {
         let unicode_agent = "代理人'; DROP TABLE mc_fleet_status; --";
         let unicode_message = "こんにちは\'; UPDATE mc_chat SET message='pwned";
-        let agent_query = "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token, gateway_pid, ssh_user FROM mc_fleet_status ORDER BY agent_name";
+        let agent_query = "SELECT agent_name, hostname, tailscale_ip, status, oc_version, os_info, kernel, capabilities, token_burn_today, uptime_seconds, current_task_id, COALESCE(gateway_port,18789), gateway_token, gateway_pid, ssh_user, agent_note FROM mc_fleet_status ORDER BY agent_name";
         let chat_query = "INSERT INTO mc_chat (sender, target, message, status, kind) VALUES (?, ?, ?, 'pending', ?)";
         assert!(!agent_query.contains(unicode_agent));
         assert!(!chat_query.contains(unicode_message));
@@ -1126,4 +1145,3 @@ pub async fn append_audit_log(
     ).await?;
     Ok(())
 }
-

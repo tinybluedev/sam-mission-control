@@ -45,6 +45,7 @@ struct Agent {
     oc_version: String,
     last_seen: String,
     current_task: Option<String>,
+    agent_note: String,
     ssh_user: String,
     capabilities: Vec<String>,
     token_burn: i32,
@@ -625,6 +626,9 @@ struct App {
     model_options: Vec<String>,
     model_load_rx: Option<mpsc::UnboundedReceiver<ModelLoadResult>>,
     model_write_rx: Option<mpsc::UnboundedReceiver<ModelWriteResult>>,
+    agent_note_editing: bool,
+    agent_note_buffer: String,
+    agent_note_save_rx: Option<mpsc::UnboundedReceiver<AgentNoteSaveResult>>,
     // Workspace (agent file management)
     ws_files: Vec<WorkspaceFile>,
     ws_selected: usize,
@@ -814,6 +818,7 @@ impl App {
                         oc_version: da.oc_version.unwrap_or_default(),
                         last_seen: String::new(),
                         current_task: None,
+                        agent_note: da.agent_note.unwrap_or_default(),
                         ssh_user: cfg
                             .map(|c| c.ssh_user().to_string())
                             .unwrap_or_else(|| "root".into()),
@@ -1041,6 +1046,9 @@ impl App {
             model_picker_active: false,
             model_picker_selected: 0,
             model_write_rx: None,
+            agent_note_editing: false,
+            agent_note_buffer: String::new(),
+            agent_note_save_rx: None,
             selected_agents: std::collections::HashSet::new(),
             tui_start: Instant::now(),
             vim_mode: false,
@@ -2339,6 +2347,27 @@ PY"#, escaped_model);
             }
             let _ = diag_tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: "Model updated".into() });
             let _ = tx.send(ModelWriteResult { agent_db_name: db_name, model, restarted: restart_gateway });
+        });
+    }
+
+    fn start_agent_note_save(&mut self) {
+        if self.selected >= self.agents.len() {
+            return;
+        }
+        let Some(pool) = &self.db_pool else {
+            return;
+        };
+        let agent_db_name = self.agents[self.selected].db_name.clone();
+        let note = self.agent_note_buffer.clone();
+        self.agents[self.selected].agent_note = note.clone();
+        self.agent_note_editing = false;
+        self.agent_note_buffer.clear();
+        let pool = pool.clone();
+        let (tx, rx) = mpsc::unbounded_channel::<AgentNoteSaveResult>();
+        self.agent_note_save_rx = Some(rx);
+        tokio::spawn(async move {
+            let ok = db::update_agent_note(&pool, &agent_db_name, &note).await.is_ok();
+            let _ = tx.send(AgentNoteSaveResult { agent_db_name, ok });
         });
     }
 
@@ -6646,6 +6675,11 @@ struct ModelWriteResult {
     restarted: bool,
 }
 
+struct AgentNoteSaveResult {
+    agent_db_name: String,
+    ok: bool,
+}
+
 const SERVICE_ICONS: &[(&str, &str)] = &[
     ("telegram", "📱"),
     ("discord", "🎮"),
@@ -7951,6 +7985,13 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     } else {
         "loading…".to_string()
     };
+    let note_value = if app.agent_note_editing {
+        format!("{}▌", app.agent_note_buffer)
+    } else if a.agent_note.trim().is_empty() {
+        "—".to_string()
+    } else {
+        a.agent_note.clone()
+    };
     let rows = vec![
         ("Host", a.host.clone(), t.text),
         (
@@ -7969,6 +8010,7 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         ("Kernel", a.kernel.clone(), t.text),
         ("OC Version", a.oc_version.clone(), t.version),
         ("Model", model_value, t.accent),
+        ("Notes", note_value, t.text),
         ("SSH User", a.ssh_user.clone(), t.text),
         ("Capabilities", caps, t.text),
         (
@@ -10300,17 +10342,24 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ("Esc", "info"),
                 ("1-5", "tabs"),
             ],
-            _ => vec![
-                ("⏎", "detail"),
-                ("d", "check"),
-                ("D", "fix"),
-                ("U", "update"),
-                ("w", "files"),
-                ("t", "tasks"),
-                ("5", "svc"),
-                ("Tab", "chat"),
-                ("Esc", "back"),
-            ],
+            _ => {
+                if app.agent_note_editing {
+                    vec![("type", "note"), ("⏎", "save"), ("Esc", "cancel")]
+                } else {
+                    vec![
+                        ("⏎", "detail"),
+                        ("n", "note"),
+                        ("d", "check"),
+                        ("D", "fix"),
+                        ("U", "update"),
+                        ("w", "files"),
+                        ("t", "tasks"),
+                        ("5", "svc"),
+                        ("Tab", "chat"),
+                        ("Esc", "back"),
+                    ]
+                }
+            }
         },
         Screen::TaskBoard => {
             if app.task_filter_agent.is_some() {
@@ -10493,6 +10542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         oc_version: da.oc_version.unwrap_or_default(),
                         last_seen: String::new(),
                         current_task: None,
+                        agent_note: da.agent_note.unwrap_or_default(),
                         gateway_pid: da.gateway_pid,
                         gateway_status: GatewayStatus::Unknown,
                         mem_free_mb: None,
@@ -10827,6 +10877,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             os: String::new(), kernel: String::new(),
                                             oc_version: String::new(), last_seen: String::new(),
                                             current_task: None,
+                                            agent_note: String::new(),
                                             ssh_user: app.wizard.ssh_user.clone(),
                                             capabilities: vec![],
                                             token_burn: 0,
@@ -10867,6 +10918,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         oc_version: String::new(),
                                         last_seen: String::new(),
                                         current_task: None,
+                                        agent_note: String::new(),
                                         ssh_user: app.wizard.ssh_user.clone(),
                                         capabilities: vec![],
                                         token_burn: 0,
@@ -11639,36 +11691,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                     }
-                                    _ => match key.code {
-                                        KeyCode::Esc => {
-                                            app.screen = Screen::Dashboard;
-                                            app.focus = Focus::Fleet;
-                                        }
-                                        KeyCode::Tab => app.focus = Focus::AgentChat,
-                                        KeyCode::Char('1') => app.focus = Focus::Fleet,
-                                        KeyCode::Char('2') => app.focus = Focus::AgentChat,
-                                        KeyCode::Char('3') | KeyCode::Char('w') => {
-                                            app.focus = Focus::Workspace;
-                                            app.start_workspace_load();
-                                        }
-                                        KeyCode::Char('4') | KeyCode::Char('t') => {
-                                            app.task_filter_agent =
-                                                Some(app.agents[app.selected].db_name.clone());
-                                            app.screen = Screen::TaskBoard;
-                                            app.last_task_poll =
-                                                Instant::now() - Duration::from_secs(10);
-                                        }
-                                        KeyCode::Char('5') => {
-                                            app.focus = Focus::Services;
-                                            app.start_services_load();
-                                        }
-                                        KeyCode::Char('d') => app.start_diagnostics(false),
-                                        KeyCode::Char('D') => app.start_diagnostics(true),
-                                        KeyCode::Char('U') => app.start_oc_update(),
-                                        KeyCode::Char('q') => app.should_quit = true,
-                                        KeyCode::Char('r') => app.start_refresh(),
-                                        KeyCode::Char('b') => app.cycle_bg(),
-                                        KeyCode::Char('e') => {
+                                    _ => {
+                                        if app.agent_note_editing {
+                                            match key.code {
+                                                KeyCode::Esc => {
+                                                    app.agent_note_editing = false;
+                                                    app.agent_note_buffer.clear();
+                                                }
+                                                KeyCode::Enter => app.start_agent_note_save(),
+                                                KeyCode::Backspace => {
+                                                    app.agent_note_buffer.pop();
+                                                }
+                                                KeyCode::Char(c) => app.agent_note_buffer.push(c),
+                                                _ => {}
+                                            }
+                                        } else {
+                                            match key.code {
+                                                KeyCode::Esc => {
+                                                    app.screen = Screen::Dashboard;
+                                                    app.focus = Focus::Fleet;
+                                                }
+                                                KeyCode::Tab => app.focus = Focus::AgentChat,
+                                                KeyCode::Char('1') => app.focus = Focus::Fleet,
+                                                KeyCode::Char('2') => app.focus = Focus::AgentChat,
+                                                KeyCode::Char('3') | KeyCode::Char('w') => {
+                                                    app.focus = Focus::Workspace;
+                                                    app.start_workspace_load();
+                                                }
+                                                KeyCode::Char('4') | KeyCode::Char('t') => {
+                                                    app.task_filter_agent =
+                                                        Some(app.agents[app.selected].db_name.clone());
+                                                    app.screen = Screen::TaskBoard;
+                                                    app.last_task_poll =
+                                                        Instant::now() - Duration::from_secs(10);
+                                                }
+                                                KeyCode::Char('5') => {
+                                                    app.focus = Focus::Services;
+                                                    app.start_services_load();
+                                                }
+                                                KeyCode::Char('n') => {
+                                                    if app.selected < app.agents.len() {
+                                                        app.agent_note_editing = true;
+                                                        app.agent_note_buffer = app.agents[app.selected].agent_note.clone();
+                                                    }
+                                                }
+                                                KeyCode::Char('d') => app.start_diagnostics(false),
+                                                KeyCode::Char('D') => app.start_diagnostics(true),
+                                                KeyCode::Char('U') => app.start_oc_update(),
+                                                KeyCode::Char('q') => app.should_quit = true,
+                                                KeyCode::Char('r') => app.start_refresh(),
+                                                KeyCode::Char('b') => app.cycle_bg(),
+                                                KeyCode::Char('e') => {
                                             // Fetch remote config (non-blocking)
                                             if let Some(agent) = app.agents.get(app.selected) {
                                                 let host = agent.host.clone();
@@ -11723,9 +11796,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     }));
                                                 });
                                             }
-                                        }
-                                        KeyCode::Char('c') => app.cycle_theme(),
-                                        KeyCode::Char('l') => {
+                                                }
+                                                KeyCode::Char('c') => app.cycle_theme(),
+                                                KeyCode::Char('l') => {
                                             // Fetch gateway logs for this agent
                                             if let Some(agent) = app.agents.get(app.selected) {
                                                 let host = agent.host.clone();
@@ -11818,8 +11891,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     agent_name
                                                 );
                                             }
+                                                }
+                                                _ => {}
+                                            }
                                         }
-                                        _ => {}
                                     },
                                 },
                                 Screen::Alerts => match key.code {
@@ -12823,6 +12898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 oc_version: String::new(),
                 last_seen: String::new(),
                 current_task: None,
+                agent_note: String::new(),
                 ssh_user: pending.ssh_user.clone(),
                 capabilities: vec![],
                 token_burn: 0,
@@ -12961,6 +13037,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 app.model_write_rx = None;
+            }
+        }
+
+        if let Some(ref mut rx) = app.agent_note_save_rx {
+            if let Ok(result) = rx.try_recv() {
+                if app.selected < app.agents.len() && app.agents[app.selected].db_name == result.agent_db_name {
+                    if result.ok {
+                        app.toast("🗒 Note saved");
+                    } else {
+                        app.toast("⚠ Failed to save note");
+                    }
+                }
+                app.agent_note_save_rx = None;
             }
         }
 
