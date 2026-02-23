@@ -839,6 +839,11 @@ struct App {
     svc_panel_errors: HashMap<String, String>,
     config_load_rx: Option<mpsc::UnboundedReceiver<Option<String>>>,
     svc_detail_scroll: u16,
+    // Service plugin configuration form
+    svc_form_active: bool,
+    svc_form_plugin: String,
+    svc_form_fields: Vec<(String, String, bool)>, // (field_name, value, required)
+    svc_form_focus: usize,
     // Agent model management
     agent_model: Option<String>,
     agent_model_agent: Option<String>,
@@ -1242,6 +1247,10 @@ impl App {
             svc_loading: false,
             svc_load_rx: None,
             svc_detail_scroll: 0,
+            svc_form_active: false,
+            svc_form_plugin: String::new(),
+            svc_form_fields: vec![],
+            svc_form_focus: 0,
             ws_files: vec![],
             ws_selected: 0,
             ws_content: None,
@@ -5949,6 +5958,155 @@ print('ok')
         }
     }
 
+    fn open_svc_form(&mut self) {
+        if self.svc_selected >= self.svc_list.len() {
+            return;
+        }
+        let svc = &self.svc_list[self.svc_selected];
+        if svc.name == "model" || svc.name == "gateway" {
+            return;
+        }
+        let name = svc.name.clone();
+        // Validate plugin name: only allow alphanumeric, hyphens, underscores
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            self.toast("❌ Invalid plugin name");
+            return;
+        }
+        // Load existing channel values if present
+        let existing = self
+            .svc_config
+            .as_ref()
+            .and_then(|c| c.get("channels"))
+            .and_then(|c| c.get(&name))
+            .cloned();
+        let fields: Vec<(String, String, bool)> = if let Some((_, _, meta_fields)) = plugin_meta(&name) {
+            meta_fields
+                .iter()
+                .map(|(field, _label, req)| {
+                    let val = existing
+                        .as_ref()
+                        .and_then(|e| e.get(*field))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (field.to_string(), val, *req)
+                })
+                .collect()
+        } else {
+            // Unknown plugin: offer a generic botToken field
+            let val = existing
+                .as_ref()
+                .and_then(|e| e.get("botToken"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            vec![("botToken".to_string(), val, true)]
+        };
+        self.svc_form_active = true;
+        self.svc_form_plugin = name;
+        self.svc_form_fields = fields;
+        self.svc_form_focus = 0;
+    }
+
+    fn save_svc_form(&mut self) {
+        if self.selected >= self.agents.len() || self.svc_form_plugin.is_empty() {
+            return;
+        }
+        let plugin = self.svc_form_plugin.clone();
+        // Validate plugin name: only allow alphanumeric, hyphens, underscores
+        if !plugin.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            self.toast("❌ Invalid plugin name");
+            return;
+        }
+        // Validate required fields
+        for (fname, val, req) in &self.svc_form_fields {
+            if *req && val.trim().is_empty() {
+                self.toast(&format!("❌ {} is required", fname));
+                return;
+            }
+        }
+        // Build channel config JSON object
+        let mut channel_obj = serde_json::Map::new();
+        for (fname, val, _) in &self.svc_form_fields {
+            let v = val.trim().to_string();
+            if !v.is_empty() {
+                channel_obj.insert(fname.clone(), serde_json::Value::String(v));
+            }
+        }
+        // Build Python script to merge channel config and enable plugin
+        let channel_json = serde_json::to_string(&serde_json::Value::Object(channel_obj))
+            .unwrap_or_else(|_| "{}".into());
+        // Escape for embedding in Python single-quoted string
+        let escaped_json = channel_json
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t");
+        let cmd = format!(
+            r#"python3 -c "
+import json, os
+p = os.path.expanduser('~/.openclaw/openclaw.json')
+with open(p) as f:
+    d = json.load(f)
+ch = d.setdefault('channels', {{}})
+existing = ch.get('{plugin}', {{}})
+if not isinstance(existing, dict):
+    existing = {{}}
+new_vals = json.loads('{escaped_json}')
+existing.update(new_vals)
+ch['{plugin}'] = existing
+plugins = d.setdefault('plugins', {{}})
+entries = plugins.setdefault('entries', [])
+if isinstance(entries, dict):
+    entries = [dict(v if isinstance(v, dict) else {{}}, name=k) for k, v in entries.items()]
+    plugins['entries'] = entries
+done = False
+for e in entries:
+    if isinstance(e, dict) and e.get('name') == '{plugin}':
+        e['enabled'] = True
+        done = True
+        break
+if not done:
+    entries.append({{'name': '{plugin}', 'enabled': True}})
+with open(p, 'w') as f:
+    json.dump(d, f, indent=2)
+print('ok')
+""#,
+            plugin = plugin,
+            escaped_json = escaped_json,
+        );
+
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let agent_db_name = agent.db_name.clone();
+        let jump_host = agent.jump_host.clone();
+        let jump_user = agent.jump_user.clone();
+        let self_ip = self.self_ip.clone();
+        let icon = svc_icon(&plugin);
+        self.toast(&format!("{} {} configured & enabled", icon, plugin));
+        self.queue_audit_mutation(
+            "agent.service_configure",
+            &format!("{}:{}", agent_db_name, plugin),
+            "configured",
+        );
+
+        tokio::spawn(async move {
+            let _ = App::ssh_run(&host, &user, jump_host.as_deref(), jump_user.as_deref(), &self_ip, &cmd).await;
+        });
+
+        self.svc_form_active = false;
+        // Optimistic update
+        if let Some(svc) = self.svc_list.get_mut(self.svc_selected) {
+            svc.enabled = true;
+            svc.has_channel_config = true;
+            svc.summary = "configured".into();
+        }
+        // Reload config in background
+        self.start_services_load();
+    }
+
     /// Load workspace files for focused agent via SSH (non-blocking)
     fn start_workspace_load(&mut self) {
         if self.selected >= self.agents.len() {
@@ -7217,247 +7375,71 @@ const SERVICE_ICONS: &[(&str, &str)] = &[
     ("tlon", "🌐"),
 ];
 
-/// Build labeled form lines from a parsed openclaw.json config.
-/// Each field is rendered with a bold label, its current value, and a dim description.
-fn build_config_form_lines<'a>(config: &serde_json::Value, t: &Theme) -> Vec<Line<'a>> {
-    let label_style = Style::default().fg(t.text_bold).bold();
-    let value_style = Style::default().fg(t.accent);
-    let desc_style = Style::default().fg(t.text_dim);
-    let section_style = Style::default().fg(t.accent).bold();
-    let warn_style = Style::default().fg(Color::Yellow);
+/// Plugin metadata: (name, description, &[(field_name, label, required)])
+const PLUGIN_META: &[(&str, &str, &[(&str, &str, bool)])] = &[
+    ("telegram", "Connect your agent to Telegram for chat and group messaging", &[
+        ("botToken", "Bot Token", true),
+        ("botId", "Bot ID", true),
+    ]),
+    ("discord", "Connect your agent to Discord servers and channels", &[
+        ("botToken", "Bot Token", true),
+        ("botId", "Bot ID", true),
+    ]),
+    ("signal", "Private messaging through the Signal protocol", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("whatsapp", "Connect your agent to WhatsApp messaging", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("slack", "Integrate your agent with Slack workspaces", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("irc", "Connect your agent to IRC networks", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("matrix", "Connect to Matrix/Element rooms", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("imessage", "Connect your agent to iMessage (macOS only)", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("bluebubbles", "iMessage bridge via BlueBubbles server", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("msteams", "Integrate with Microsoft Teams channels", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("nostr", "Publish and interact on the Nostr protocol", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("twitch", "Connect your agent to Twitch chat", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("line", "Connect to LINE messaging platform", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("googlechat", "Integrate with Google Chat spaces", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("mattermost", "Connect to Mattermost team channels", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("feishu", "Integrate with Feishu/Lark workspaces", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("zalo", "Connect to Zalo messaging platform", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("nextcloud-talk", "Connect to Nextcloud Talk rooms", &[
+        ("botToken", "Bot Token", true),
+    ]),
+    ("tlon", "Connect to Tlon/Urbit messaging", &[
+        ("botToken", "Bot Token", true),
+    ]),
+];
 
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Helper closures
-    let val_str = |v: &serde_json::Value| -> String {
-        match v {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Bool(b) => b.to_string(),
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::Null => "—".into(),
-            serde_json::Value::Array(a) => {
-                if a.is_empty() {
-                    "[]".into()
-                } else {
-                    let items: Vec<String> = a.iter().map(|v| match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    }).collect();
-                    items.join(", ")
-                }
-            }
-            serde_json::Value::Object(_) => "{…}".into(),
-        }
-    };
-
-    // ── Gateway ──
-    if let Some(gw) = config.get("gateway") {
-        lines.push(Line::from(Span::styled("  ─── Gateway ───", section_style)));
-        lines.push(Line::from(""));
-
-        let fields: Vec<(&str, &str, &str)> = vec![
-            ("mode", "gateway.mode", "Gateway mode (e.g. proxy, local)"),
-            ("bind", "gateway.bind", "Network bind address (lan, localhost, 0.0.0.0)"),
-            ("port", "gateway.port", "Port number for the gateway API"),
-        ];
-        for (key, path, desc) in &fields {
-            let val = gw.get(key).map(|v| val_str(v)).unwrap_or_else(|| "—".into());
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {:<20}", path), label_style),
-                Span::styled(val, value_style),
-            ]));
-            lines.push(Line::from(Span::styled(format!("  {:<20}{}", "", desc), desc_style)));
-        }
-
-        // Auth
-        if let Some(auth) = gw.get("auth") {
-            let has_token = auth.get("token").and_then(|t| t.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {:<20}", "gateway.auth.token"), label_style),
-                Span::styled(
-                    if has_token { "✓ set" } else { "✗ not set" },
-                    if has_token { value_style } else { warn_style },
-                ),
-            ]));
-            lines.push(Line::from(Span::styled(format!("  {:<20}API authentication token", ""), desc_style)));
-        }
-
-        // Chat completions
-        if let Some(chat) = gw.get("chatCompletions") {
-            let enabled = chat.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {:<20}", "gateway.chatCompletions"), label_style),
-                Span::styled(
-                    if enabled { "enabled" } else { "disabled" },
-                    if enabled { value_style } else { warn_style },
-                ),
-            ]));
-            lines.push(Line::from(Span::styled(format!("  {:<20}Chat completions API endpoint", ""), desc_style)));
-        }
-        lines.push(Line::from(""));
-    }
-
-    // ── Agents / Defaults ──
-    if let Some(agents) = config.get("agents") {
-        lines.push(Line::from(Span::styled("  ─── Agent Defaults ───", section_style)));
-        lines.push(Line::from(""));
-
-        if let Some(defaults) = agents.get("defaults") {
-            // Model
-            if let Some(model) = defaults.get("model") {
-                let primary = model.get("primary").map(|v| val_str(v)).unwrap_or_else(|| "—".into());
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<20}", "agents.model.primary"), label_style),
-                    Span::styled(primary, value_style),
-                ]));
-                lines.push(Line::from(Span::styled(format!("  {:<20}Primary LLM model identifier", ""), desc_style)));
-            }
-
-            // Context tokens
-            if let Some(ctx) = defaults.get("contextTokens") {
-                let ctx_val = ctx.as_u64().unwrap_or(0);
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<20}", "agents.contextTokens"), label_style),
-                    Span::styled(format!("{}", ctx_val), value_style),
-                ]));
-                lines.push(Line::from(Span::styled(format!("  {:<20}Maximum context window size in tokens", ""), desc_style)));
-            }
-
-            // Max tokens
-            if let Some(max_t) = defaults.get("maxTokens") {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<20}", "agents.maxTokens"), label_style),
-                    Span::styled(val_str(max_t), value_style),
-                ]));
-                lines.push(Line::from(Span::styled(format!("  {:<20}Maximum output tokens per response", ""), desc_style)));
-            }
-
-            // Temperature
-            if let Some(temp) = defaults.get("temperature") {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<20}", "agents.temperature"), label_style),
-                    Span::styled(val_str(temp), value_style),
-                ]));
-                lines.push(Line::from(Span::styled(format!("  {:<20}Sampling temperature (0.0-2.0)", ""), desc_style)));
-            }
-
-            // Other defaults
-            for (key, val) in defaults.as_object().into_iter().flat_map(|o| o.iter()) {
-                if matches!(key.as_str(), "model" | "contextTokens" | "maxTokens" | "temperature") {
-                    continue;
-                }
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<20}", format!("agents.{}", key)), label_style),
-                    Span::styled(val_str(val), value_style),
-                ]));
-            }
-        }
-        lines.push(Line::from(""));
-    }
-
-    // ── Plugins ──
-    if let Some(plugins) = config.get("plugins").and_then(|p| p.get("entries")).and_then(|e| e.as_object()) {
-        lines.push(Line::from(Span::styled("  ─── Plugins ───", section_style)));
-        lines.push(Line::from(""));
-
-        for (name, entry) in plugins {
-            let enabled = entry.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
-            let icon = svc_icon(name);
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {} {:<18}", icon, name), label_style),
-                Span::styled(
-                    if enabled { "● enabled" } else { "○ disabled" },
-                    Style::default().fg(if enabled { t.status_online } else { t.text_dim }),
-                ),
-            ]));
-            lines.push(Line::from(Span::styled(format!("  {:<20}Plugin integration for {}", "", name), desc_style)));
-        }
-        lines.push(Line::from(""));
-    }
-
-    // ── Channels ──
-    if let Some(channels) = config.get("channels").and_then(|c| c.as_object()) {
-        lines.push(Line::from(Span::styled("  ─── Channels ───", section_style)));
-        lines.push(Line::from(""));
-
-        for (name, ch_config) in channels {
-            let icon = svc_icon(name);
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {} {}", icon, name), label_style),
-            ]));
-
-            // Show channel fields
-            if let Some(obj) = ch_config.as_object() {
-                for (key, val) in obj {
-                    let display_val = if key.to_lowercase().contains("token")
-                        || key.to_lowercase().contains("secret")
-                        || key.to_lowercase().contains("password")
-                    {
-                        if val.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
-                            "✓ set".to_string()
-                        } else {
-                            "✗ not set".to_string()
-                        }
-                    } else {
-                        val_str(val)
-                    };
-                    let ch_desc = config_field_description(&format!("channels.{}.{}", name, key));
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("    {:<18}", key), Style::default().fg(t.text)),
-                        Span::styled(display_val, value_style),
-                    ]));
-                    if !ch_desc.is_empty() {
-                        lines.push(Line::from(Span::styled(format!("    {:<18}{}", "", ch_desc), desc_style)));
-                    }
-                }
-            }
-            lines.push(Line::from(""));
-        }
-    }
-
-    // ── Remaining top-level keys ──
-    let known_sections = ["gateway", "agents", "plugins", "channels"];
-    if let Some(obj) = config.as_object() {
-        let remaining: Vec<_> = obj.iter()
-            .filter(|(k, _)| !known_sections.contains(&k.as_str()))
-            .collect();
-        if !remaining.is_empty() {
-            lines.push(Line::from(Span::styled("  ─── Other Settings ───", section_style)));
-            lines.push(Line::from(""));
-            for (key, val) in remaining {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<20}", key), label_style),
-                    Span::styled(val_str(val), value_style),
-                ]));
-            }
-            lines.push(Line::from(""));
-        }
-    }
-
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  No configuration fields found",
-            desc_style,
-        )));
-    }
-
-    lines
-}
-
-/// Return a human-readable description for known config field paths.
-fn config_field_description(path: &str) -> &'static str {
-    let suffix = path.rsplit('.').next().unwrap_or(path);
-    match suffix {
-        "token" | "botToken" => "Bot authentication token",
-        "botId" => "Bot user/application ID",
-        "secret" | "signingSecret" => "Signing secret for request verification",
-        "channelId" => "Default channel or chat ID",
-        "webhookUrl" => "Incoming webhook URL",
-        "appId" => "Application identifier",
-        "allowedUsers" => "List of allowed user IDs",
-        "prefix" => "Command prefix character",
-        _ => "",
-    }
+fn plugin_meta(name: &str) -> Option<&'static (&'static str, &'static str, &'static [(&'static str, &'static str, bool)])> {
+    PLUGIN_META.iter().find(|(n, _, _)| *n == name)
 }
 
 fn svc_icon(name: &str) -> &'static str {
@@ -10083,6 +10065,10 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(t.text_dim),
     )));
     items.push(Line::from(Span::styled(
+        "  c      configure plugin",
+        Style::default().fg(t.text_dim),
+    )));
+    items.push(Line::from(Span::styled(
         "  e      view config",
         Style::default().fg(t.text_dim),
     )));
@@ -10251,7 +10237,17 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                 }
             }
         } else {
-            // Plugin/channel service
+            // Plugin/channel service — guided onboarding
+            let meta = plugin_meta(&svc.name);
+            // Show description
+            if let Some((_, desc, _)) = meta {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", desc),
+                    Style::default().fg(t.text_dim).italic(),
+                )));
+                lines.push(Line::from(""));
+            }
+
             lines.push(Line::from(Span::styled(
                 "  Status",
                 Style::default().fg(t.text_bold).bold(),
@@ -10265,7 +10261,6 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                     "  ✓ Channel configured",
                     Style::default().fg(t.status_online),
                 )));
-                // Parse summary for details
                 for part in svc.summary.split("  ") {
                     let part = part.trim();
                     if part.is_empty() {
@@ -10282,12 +10277,27 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(t.status_online),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "  ⚠ No channel config",
+                    "  ⚠ No channel config — needs setup",
                     Style::default().fg(Color::Yellow),
                 )));
+                // Show required fields
+                if let Some((_, _, fields)) = meta {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "  Required fields:",
+                        Style::default().fg(t.text_dim),
+                    )));
+                    for (fname, label, req) in *fields {
+                        let marker = if *req { "●" } else { "○" };
+                        lines.push(Line::from(Span::styled(
+                            format!("    {} {} ({})", marker, label, fname),
+                            Style::default().fg(t.text_dim),
+                        )));
+                    }
+                }
                 lines.push(Line::from(Span::styled(
-                    "    This plugin won't work without channel settings",
-                    Style::default().fg(t.text_dim),
+                    "    Press [c] to configure",
+                    Style::default().fg(t.accent),
                 )));
             } else if !svc.enabled && svc.has_channel_config {
                 lines.push(Line::from(Span::styled(
@@ -10299,17 +10309,33 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(t.text_dim),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "    Press Space to enable this plugin",
-                    Style::default().fg(t.text_dim),
+                    "    Press [Space] to enable this plugin",
+                    Style::default().fg(t.accent),
                 )));
             } else {
+                // Fully unconfigured — guided onboarding
                 lines.push(Line::from(Span::styled(
-                    "  ✗ Plugin disabled",
-                    Style::default().fg(t.status_offline),
-                )));
-                lines.push(Line::from(Span::styled(
-                    "  ✗ No channel config",
+                    "  ✗ Not configured",
                     Style::default().fg(t.text_dim),
+                )));
+                if let Some((_, _, fields)) = meta {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "  To get started, you'll need:",
+                        Style::default().fg(t.text),
+                    )));
+                    for (fname, label, req) in *fields {
+                        let marker = if *req { "●" } else { "○" };
+                        lines.push(Line::from(Span::styled(
+                            format!("    {} {} ({})", marker, label, fname),
+                            Style::default().fg(if *req { t.text } else { t.text_dim }),
+                        )));
+                    }
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  Press [c] to configure this plugin",
+                    Style::default().fg(t.accent),
                 )));
             }
 
@@ -10317,6 +10343,10 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(Span::styled(
                 "  Actions",
                 Style::default().fg(t.text_bold).bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  [c]     Configure plugin",
+                Style::default().fg(t.accent),
             )));
             lines.push(Line::from(Span::styled(
                 if svc.enabled {
@@ -12044,26 +12074,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let rect = Rect::new(x, y, w, h);
                     let clear = Block::default().style(Style::default().bg(app.bg_density.bg()));
                     f.render_widget(clear, rect);
-
-                    let (title, lines) = if app.config_raw_mode || app.config_json.is_none() {
-                        // Raw mode: show the raw JSON text
-                        let raw_lines: Vec<Line> = config
-                            .lines()
-                            .map(|l| {
-                                Line::from(Span::styled(l.to_string(), Style::default().fg(t.text)))
-                            })
-                            .collect();
-                        (" openclaw.json (raw) — 'e' labeled view · Esc to close ".to_string(), raw_lines)
-                    } else {
-                        // Labeled form mode: parse JSON and render with labels + descriptions
-                        let form_lines = build_config_form_lines(app.config_json.as_ref().unwrap(), t);
-                        (" openclaw.json — 'e' raw view · ↑↓ scroll · Esc to close ".to_string(), form_lines)
-                    };
-
+                    let lines: Vec<Line> = config
+                        .lines()
+                        .map(|l| {
+                            let style = if l.starts_with("──") {
+                                Style::default().fg(t.accent).bold()
+                            } else {
+                                Style::default().fg(t.text)
+                            };
+                            Line::from(Span::styled(l.to_string(), style))
+                        })
+                        .collect();
                     let p = Paragraph::new(lines).scroll((app.config_scroll, 0)).block(
                         Block::default()
                             .title(Span::styled(
-                                title,
+                                " Config Overview — Esc to close ",
                                 Style::default().fg(t.accent).bold(),
                             ))
                             .borders(Borders::ALL)
@@ -12071,6 +12096,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .border_style(Style::default().fg(t.accent))
                             .style(Style::default().bg(app.bg_density.bg()))
                             .padding(Padding::new(1, 1, 1, 0)),
+                    );
+                    f.render_widget(p, rect);
+                }
+                // Plugin configuration form overlay
+                if app.svc_form_active {
+                    let t = &app.theme;
+                    let area = f.area();
+                    let field_count = app.svc_form_fields.len();
+                    let form_h = (6 + field_count * 2).min(area.height as usize - 4) as u16;
+                    let form_w = 56u16.min(area.width - 4);
+                    let x = (area.width - form_w) / 2;
+                    let y = (area.height - form_h) / 2;
+                    let rect = Rect::new(x, y, form_w, form_h);
+                    let clear = Block::default().style(Style::default().bg(app.bg_density.bg()));
+                    f.render_widget(clear, rect);
+                    let mut form_lines = vec![
+                        Line::from(Span::styled(
+                            format!("  Configure {}", app.svc_form_plugin),
+                            Style::default().fg(t.accent).bold(),
+                        )),
+                        Line::from(""),
+                    ];
+                    for (i, (fname, val, req)) in app.svc_form_fields.iter().enumerate() {
+                        let focused = i == app.svc_form_focus;
+                        let label = plugin_meta(&app.svc_form_plugin)
+                            .and_then(|(_, _, fields)| fields.iter().find(|(f, _, _)| *f == fname.as_str()))
+                            .map(|(_, l, _)| *l)
+                            .unwrap_or(fname.as_str());
+                        let marker = if *req { "● " } else { "  " };
+                        form_lines.push(Line::from(vec![
+                            Span::styled(format!("  {}{}: ", marker, label), Style::default().fg(t.text_dim)),
+                        ]));
+                        let field_style = if focused {
+                            Style::default().fg(Color::Black).bg(t.status_busy)
+                        } else {
+                            Style::default().fg(t.text)
+                        };
+                        let display_val = if val.is_empty() && !focused {
+                            "(empty)".to_string()
+                        } else if focused {
+                            format!("{}▏", val)
+                        } else {
+                            val.clone()
+                        };
+                        form_lines.push(Line::from(Span::styled(
+                            format!("    {}", display_val),
+                            field_style,
+                        )));
+                    }
+                    form_lines.push(Line::from(""));
+                    form_lines.push(Line::from(Span::styled(
+                        "  Tab switch field  Enter save  Esc cancel",
+                        Style::default().fg(t.text_dim),
+                    )));
+                    let p = Paragraph::new(form_lines).block(
+                        Block::default()
+                            .title(Span::styled(
+                                " Plugin Setup ",
+                                Style::default().fg(t.accent).bold(),
+                            ))
+                            .borders(Borders::ALL)
+                            .border_type(t.border_type)
+                            .border_style(Style::default().fg(t.accent))
+                            .style(Style::default().bg(app.bg_density.bg()))
+                            .padding(Padding::new(1, 1, 0, 0)),
                     );
                     f.render_widget(p, rect);
                 }
@@ -12521,6 +12611,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         _ => {}
                                     }
                                 }
+                                Screen::AgentDetail if app.svc_form_active => {
+                                    match key.code {
+                                        KeyCode::Esc => {
+                                            app.svc_form_active = false;
+                                        }
+                                        KeyCode::Tab => {
+                                            if !app.svc_form_fields.is_empty() {
+                                                app.svc_form_focus = (app.svc_form_focus + 1) % app.svc_form_fields.len();
+                                            }
+                                        }
+                                        KeyCode::BackTab => {
+                                            if !app.svc_form_fields.is_empty() {
+                                                app.svc_form_focus = if app.svc_form_focus == 0 {
+                                                    app.svc_form_fields.len() - 1
+                                                } else {
+                                                    app.svc_form_focus - 1
+                                                };
+                                            }
+                                        }
+                                        KeyCode::Enter => {
+                                            app.save_svc_form();
+                                        }
+                                        KeyCode::Backspace => {
+                                            if let Some(field) = app.svc_form_fields.get_mut(app.svc_form_focus) {
+                                                field.1.pop();
+                                            }
+                                        }
+                                        KeyCode::Char(c) => {
+                                            if let Some(field) = app.svc_form_fields.get_mut(app.svc_form_focus) {
+                                                field.1.push(c);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 Screen::AgentDetail => match app.focus {
                                     Focus::Services => match key.code {
                                         KeyCode::Esc => app.focus = Focus::Fleet,
@@ -12554,6 +12679,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                         KeyCode::Char(' ') => app.toggle_service(),
+                                        KeyCode::Char('c') => app.open_svc_form(),
                                         KeyCode::Char('r') => app.start_services_load(),
                                         KeyCode::Char('d') => app.start_diagnostics(false),
                                         KeyCode::Char('D') => app.start_diagnostics(true),
@@ -12625,12 +12751,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                         KeyCode::Char('e') => {
-                                            // Open labeled config viewer
+                                            // Open structured config viewer
                                             if let Some(ref config) = app.svc_config {
-                                                let pretty = serde_json::to_string_pretty(config)
-                                                    .unwrap_or_default();
-                                                app.config_text = Some(pretty);
-                                                app.config_json = Some(config.clone());
+                                                let mut lines = Vec::new();
+                                                // Gateway section
+                                                if let Some(gw) = config.get("gateway") {
+                                                    lines.push("── Gateway ──".to_string());
+                                                    for (k, v) in gw.as_object().into_iter().flatten() {
+                                                        match v {
+                                                            serde_json::Value::Object(inner) => {
+                                                                lines.push(format!("  {}:", k));
+                                                                for (ik, iv) in inner {
+                                                                    let display = match iv { serde_json::Value::String(s) => s.clone(), _ => iv.to_string() };
+                                                                    lines.push(format!("    {}: {}", ik, display));
+                                                                }
+                                                            }
+                                                            serde_json::Value::String(s) => lines.push(format!("  {}: {}", k, s)),
+                                                            _ => lines.push(format!("  {}: {}", k, v)),
+                                                        }
+                                                    }
+                                                    lines.push(String::new());
+                                                }
+                                                // Agents/model section
+                                                if let Some(agents) = config.get("agents").and_then(|a| a.get("defaults")) {
+                                                    lines.push("── Model Defaults ──".to_string());
+                                                    if let Some(m) = agents.get("model").and_then(|m| m.get("primary")).and_then(|p| p.as_str()) {
+                                                        lines.push(format!("  model: {}", m));
+                                                    }
+                                                    if let Some(ctx) = agents.get("contextTokens").and_then(|c| c.as_u64()) {
+                                                        lines.push(format!("  contextTokens: {}", ctx));
+                                                    }
+                                                    lines.push(String::new());
+                                                }
+                                                // Plugins section
+                                                if let Some(plugins) = config.get("plugins").and_then(|p| p.get("entries")) {
+                                                    lines.push("── Plugins ──".to_string());
+                                                    if let Some(arr) = plugins.as_array() {
+                                                        for entry in arr {
+                                                            let name = entry.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                                                            let enabled = entry.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+                                                            lines.push(format!("  {} {} {}", if enabled { "●" } else { "○" }, svc_icon(name), name));
+                                                        }
+                                                    } else if let Some(obj) = plugins.as_object() {
+                                                        for (name, val) in obj {
+                                                            let enabled = val.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+                                                            lines.push(format!("  {} {} {}", if enabled { "●" } else { "○" }, svc_icon(name), name));
+                                                        }
+                                                    }
+                                                    lines.push(String::new());
+                                                }
+                                                // Channels section
+                                                if let Some(channels) = config.get("channels").and_then(|c| c.as_object()) {
+                                                    lines.push("── Channels ──".to_string());
+                                                    for (name, ch) in channels {
+                                                        lines.push(format!("  {} {}:", svc_icon(name), name));
+                                                        if let Some(obj) = ch.as_object() {
+                                                            for (k, v) in obj {
+                                                                let display = match v {
+                                                                    serde_json::Value::String(s) => {
+                                                                        if k.to_lowercase().contains("token") || k.to_lowercase().contains("secret") {
+                                                                            let masked: String = s.chars().take(8).collect();
+                                                                            format!("{}…", masked)
+                                                                        } else {
+                                                                            s.clone()
+                                                                        }
+                                                                    }
+                                                                    serde_json::Value::Array(a) => format!("[{} items]", a.len()),
+                                                                    _ => v.to_string(),
+                                                                };
+                                                                lines.push(format!("    {}: {}", k, display));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                app.config_text = Some(lines.join("\n"));
                                                 app.config_scroll = 0;
                                                 app.config_raw_mode = false;
                                             }
