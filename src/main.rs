@@ -52,6 +52,9 @@ struct Agent {
     cpu_pct: Option<f32>,
     ram_pct: Option<f32>,
     disk_pct: Option<f32>,
+    hw_cpu_model: String,
+    hw_ram_total_mb: Option<i64>,
+    hw_disk_layout: String,
     mem_free_mb: Option<i64>,
     swap_mb: Option<i64>,
     gateway_port: i32,
@@ -273,6 +276,9 @@ struct ProbeResult {
     cpu_pct: Option<f32>,
     ram_pct: Option<f32>,
     disk_pct: Option<f32>,
+    hw_cpu_model: String,
+    hw_ram_total_mb: Option<i64>,
+    hw_disk_layout: String,
     mem_free_mb: Option<i64>,
     swap_mb: Option<i64>,
     activity: String,
@@ -338,6 +344,14 @@ fn format_app_uptime(secs: u64) -> String {
     let hours = secs / 3600;
     let mins = (secs % 3600) / 60;
     if hours > 0 { format!("{}h {}m", hours, mins) } else { format!("{}m", mins) }
+}
+
+fn format_ram_total(total_mb: Option<i64>) -> String {
+    match total_mb {
+        Some(mb) if mb >= 1024 => format!("{:.1} GB", mb as f32 / 1024.0),
+        Some(mb) if mb > 0 => format!("{} MB", mb),
+        _ => "—".into(),
+    }
 }
 
 fn format_last_seen(dt: &str) -> String {
@@ -823,6 +837,9 @@ impl App {
                         cpu_pct: None,
                         ram_pct: None,
                         disk_pct: None,
+                        hw_cpu_model: String::new(),
+                        hw_ram_total_mb: None,
+                        hw_disk_layout: String::new(),
                         gateway_port: da.gateway_port,
                         gateway_token: da.gateway_token.clone(),
                         gateway_pid: da.gateway_pid,
@@ -6039,7 +6056,7 @@ PY",
             let tx = tx.clone();
             let full = self.refresh_cycle % 5 == 0; // full probe every 5th cycle
             tokio::spawn(async move {
-                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx) =
+                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx, hw_cpu_model, hw_ram_total_mb, hw_disk_layout) =
                     probe_agent(&host, &user, &sip, full).await;
                 let _ = tx.send(ProbeResult {
                     index: i,
@@ -6051,6 +6068,9 @@ PY",
                     cpu_pct: cpu,
                     ram_pct: ram,
                     disk_pct: disk,
+                    hw_cpu_model,
+                    hw_ram_total_mb,
+                    hw_disk_layout,
                     activity: act,
                     context_pct: ctx,
                     gateway_status: GatewayStatus::Unknown,
@@ -6087,6 +6107,15 @@ PY",
                     self.agents[r.index].cpu_pct = r.cpu_pct;
                     self.agents[r.index].ram_pct = r.ram_pct;
                     self.agents[r.index].disk_pct = r.disk_pct;
+                    if !r.hw_cpu_model.is_empty() {
+                        self.agents[r.index].hw_cpu_model = r.hw_cpu_model;
+                    }
+                    if r.hw_ram_total_mb.is_some() {
+                        self.agents[r.index].hw_ram_total_mb = r.hw_ram_total_mb;
+                    }
+                    if !r.hw_disk_layout.is_empty() {
+                        self.agents[r.index].hw_disk_layout = r.hw_disk_layout;
+                    }
                     if r.gateway_status != GatewayStatus::Unknown {
                         self.agents[r.index].gateway_status = r.gateway_status;
                     }
@@ -6293,6 +6322,9 @@ async fn probe_agent(
     Option<f32>,
     String,
     Option<f32>,
+    String,
+    Option<i64>,
+    String,
 ) {
     let start = Instant::now();
     // Fast probe: just SSH echo (connectivity + latency only)
@@ -6328,6 +6360,9 @@ async fn probe_agent(
                 None,
                 String::new(),
                 None,
+                String::new(),
+                None,
+                String::new(),
             ),
             _ => (
                 AgentStatus::Offline,
@@ -6340,6 +6375,9 @@ async fn probe_agent(
                 None,
                 String::new(),
                 None,
+                String::new(),
+                None,
+                String::new(),
             ),
         };
     }
@@ -6405,6 +6443,33 @@ async fn probe_agent(
             })
             .ok()
             .flatten();
+        let hw_cpu_model = Command::new("bash")
+            .args([
+                "-c",
+                r#"awk -F: '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/^ *//' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo ?"#,
+            ])
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let hw_ram_total_mb = Command::new("bash")
+            .args([
+                "-c",
+                r#"free -m 2>/dev/null | awk '/Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f", $1/1024/1024}'"#,
+            ])
+            .output()
+            .await
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().ok());
+        let hw_disk_layout = Command::new("bash")
+            .args([
+                "-c",
+                r#"lsblk -rno NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | head -6 | tr '\n' ';' || df -h 2>/dev/null | awk 'NR==1 || /^\/dev\//' | head -6 | tr '\n' ';'"#,
+            ])
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
         let ms = start.elapsed().as_millis() as u32;
         return (
             AgentStatus::Online,
@@ -6417,10 +6482,13 @@ async fn probe_agent(
             disk,
             "local".into(),
             None,
+            hw_cpu_model,
+            hw_ram_total_mb,
+            hw_disk_layout,
         );
     }
     let tgt = format!("{}@{}", user, host);
-    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); GWPID=$(pgrep -f 'openclaw.*gateway' 2>/dev/null | head -1 || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; echo "GWPID:$GWPID"; ACT=$(openclaw status --json 2>/dev/null || ~/.npm-global/bin/openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
+    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); CPU_MODEL=$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/^ *//' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo ?); RAM_TOTAL_MB=$(free -m 2>/dev/null | awk '/Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f", $1/1024/1024}' || echo ?); DISK_LAYOUT=$(lsblk -rno NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | head -6 | tr '\n' ';' || df -h 2>/dev/null | awk 'NR==1 || /^\/dev\//' | head -6 | tr '\n' ';' || echo ?); GWPID=$(pgrep -f 'openclaw.*gateway' 2>/dev/null | head -1 || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; echo "CPU_MODEL:$CPU_MODEL"; echo "RAM_TOTAL_MB:$RAM_TOTAL_MB"; echo "DISK_LAYOUT:$DISK_LAYOUT"; echo "GWPID:$GWPID"; ACT=$(openclaw status --json 2>/dev/null || ~/.npm-global/bin/openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new("ssh")
@@ -6453,6 +6521,9 @@ async fn probe_agent(
                 None,
                 String::new(),
                 None,
+                String::new(),
+                None,
+                String::new(),
             );
         }
     };
@@ -6469,8 +6540,8 @@ async fn probe_agent(
                     oc = v.trim().into();
                 }
             }
-            let (mut cpu, mut ram, mut disk, mut act, mut ctx) =
-                (None, None, None, String::new(), None);
+            let (mut cpu, mut ram, mut disk, mut act, mut ctx, mut hw_cpu_model, mut hw_ram_total_mb, mut hw_disk_layout) =
+                (None, None, None, String::new(), None, String::new(), None, String::new());
             for l in s.lines() {
                 if let Some(v) = l.strip_prefix("CPU:") {
                     cpu = v.trim().parse::<f32>().ok();
@@ -6482,6 +6553,12 @@ async fn probe_agent(
                     act = v.trim().to_string();
                 } else if let Some(v) = l.strip_prefix("CTX:") {
                     ctx = v.trim().parse::<f32>().ok();
+                } else if let Some(v) = l.strip_prefix("CPU_MODEL:") {
+                    hw_cpu_model = v.trim().to_string();
+                } else if let Some(v) = l.strip_prefix("RAM_TOTAL_MB:") {
+                    hw_ram_total_mb = v.trim().parse::<i64>().ok();
+                } else if let Some(v) = l.strip_prefix("DISK_LAYOUT:") {
+                    hw_disk_layout = v.trim().to_string();
                 }
             }
             let ms = start.elapsed().as_millis() as u32;
@@ -6496,6 +6573,9 @@ async fn probe_agent(
                 disk,
                 act,
                 ctx,
+                hw_cpu_model,
+                hw_ram_total_mb,
+                hw_disk_layout,
             )
         }
         _ => (
@@ -6509,6 +6589,9 @@ async fn probe_agent(
             None,
             String::new(),
             None,
+            String::new(),
+            None,
+            String::new(),
         ),
     }
 }
@@ -6754,6 +6837,7 @@ const SCHEDULE_CHECK_INTERVAL_SECS: u64 = 60;
 /// Minimum content width (chars) for message word-wrap, preventing extremely narrow wrapping.
 const MIN_WRAP_WIDTH: usize = 10;
 const PANEL_SCRIPT_TIMEOUT_SECS: u64 = 15;
+const HW_DETAIL_TRUNCATE_CHARS: usize = 42;
 const MAX_PANEL_DISPLAY_LINES: usize = 24;
 /// Approximate lines rendered per chat message (header + body + blank), used to estimate
 /// the number of unseen messages from a raw line count.
@@ -7985,6 +8069,15 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
             },
         ),
         (
+            "CPU Model",
+            if a.hw_cpu_model.is_empty() {
+                "—".into()
+            } else {
+                truncate_str(&a.hw_cpu_model, HW_DETAIL_TRUNCATE_CHARS)
+            },
+            t.text,
+        ),
+        (
             "RAM",
             match a.ram_pct {
                 Some(p) => format!("{:.1}%", p),
@@ -7997,6 +8090,7 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
                 _ => t.text_dim,
             },
         ),
+        ("RAM Total", format_ram_total(a.hw_ram_total_mb), t.text),
         (
             "Disk",
             match a.disk_pct {
@@ -8009,6 +8103,15 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
                 Some(_) => t.status_online,
                 _ => t.text_dim,
             },
+        ),
+        (
+            "Disk Layout",
+            if a.hw_disk_layout.is_empty() {
+                "—".into()
+            } else {
+                truncate_str(&a.hw_disk_layout, HW_DETAIL_TRUNCATE_CHARS)
+            },
+            t.text_dim,
         ),
         (
             "Latency",
@@ -10504,6 +10607,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cpu_pct: None,
                         ram_pct: None,
                         disk_pct: None,
+                        hw_cpu_model: String::new(),
+                        hw_ram_total_mb: None,
+                        hw_disk_layout: String::new(),
                         gateway_port: da.gateway_port,
                         gateway_token: da.gateway_token.clone(),
                         uptime_seconds: da.uptime_seconds,
@@ -10832,6 +10938,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             token_burn: 0,
                                             latency_ms: None,
                                             cpu_pct: None, ram_pct: None, disk_pct: None,
+                                            hw_cpu_model: String::new(),
+                                            hw_ram_total_mb: None,
+                                            hw_disk_layout: String::new(),
                                             gateway_port: 18789,
                                             gateway_token: None,
                                             uptime_seconds: 0,
@@ -10874,6 +10983,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         cpu_pct: None,
                                         ram_pct: None,
                                         disk_pct: None,
+                                        hw_cpu_model: String::new(),
+                                        hw_ram_total_mb: None,
+                                        hw_disk_layout: String::new(),
                                         gateway_port: 18789,
                                         gateway_token: None,
                                         gateway_pid: None,
@@ -12828,6 +12940,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 token_burn: 0,
                 latency_ms: None,
                 cpu_pct: None, ram_pct: None, disk_pct: None,
+                hw_cpu_model: String::new(),
+                hw_ram_total_mb: None,
+                hw_disk_layout: String::new(),
                 gateway_port: commit.gateway_port,
                 gateway_token: Some(gw_token),
                 uptime_seconds: 0,
@@ -13264,7 +13379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, ChatLine, INPUT_POLL_MS};
+    use super::{App, ChatLine, INPUT_POLL_MS, format_ram_total};
 
     #[test]
     fn input_poll_interval_is_low_for_responsive_ui() {
@@ -13350,5 +13465,12 @@ mod tests {
         ];
         App::apply_thread_depth(&mut msgs);
         assert_eq!(msgs[4].depth, 3);
+    }
+
+    #[test]
+    fn ram_total_formatter_shows_gb_and_mb() {
+        assert_eq!(format_ram_total(Some(512)), "512 MB");
+        assert_eq!(format_ram_total(Some(2048)), "2.0 GB");
+        assert_eq!(format_ram_total(None), "—");
     }
 }
