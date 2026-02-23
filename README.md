@@ -188,6 +188,8 @@ Environment variables are also supported via a `.env` file:
 | `agent[].emoji` | ❌ | Emoji prefix shown in TUI |
 | `agent[].location` | ❌ | Physical/logical location label |
 | `agent[].ssh_user` | ❌ | SSH username (default: `root`) |
+| `agent[].jump_host` | ❌ | Optional SSH bastion/jump host (`-J`) |
+| `agent[].jump_user` | ❌ | Optional jump-host SSH user (defaults to `agent[].ssh_user`) |
 
 ## Contributing
 
