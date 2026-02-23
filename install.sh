@@ -1,119 +1,156 @@
 #!/usr/bin/env bash
 # S.A.M Mission Control — Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/tinybluedev/sam-mission-control/main/install.sh | bash
+# curl -fsSL https://raw.githubusercontent.com/tinybluedev/sam-mission-control/main/install.sh | bash
 set -euo pipefail
 
 REPO="tinybluedev/sam-mission-control"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 BIN_NAME="sam"
+BUILD_LOG="/tmp/sam-build-$(date +%s).log"
 
-echo ""
-echo "  🛰️  S.A.M Mission Control — Installer"
-echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
+# ── Colors ──────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+BLUE='\033[0;34m'; MAGENTA='\033[0;35m'
 
-# ── OS Detection ────────────────────────────────────────────────
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-echo "  Detected OS: $OS ($ARCH)"
+# ── Spinner ──────────────────────────────────────────────────────
+SPIN_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+SPIN_PID=""
+spin_start() {
+    local msg="$1"
+    ( i=0; while true; do
+        printf "\r  ${CYAN}${SPIN_FRAMES[$((i % 10))]}${RESET}  ${msg}   "
+        sleep 0.08; ((i++))
+    done ) &
+    SPIN_PID=$!
+}
+spin_stop() {
+    if [ -n "$SPIN_PID" ]; then kill "$SPIN_PID" 2>/dev/null; SPIN_PID=""; fi
+    printf "\r\033[K"
+}
+ok()   { spin_stop; echo -e "  ${GREEN}✓${RESET}  $1"; }
+fail() { spin_stop; echo -e "  ${RED}✗${RESET}  $1"; exit 1; }
+info() { echo -e "  ${DIM}·${RESET}  $1"; }
 
-case "$OS" in
-    Linux)   ;;
-    Darwin)  ;;
-    *)
-        echo "  ❌ Unsupported operating system: $OS"
-        echo "     S.A.M supports Linux and macOS."
-        exit 1
-        ;;
-esac
-
-# ── Dependency checks ───────────────────────────────────────────
-if ! command -v git &>/dev/null; then
-    echo "  ❌ git is not installed."
-    case "$OS" in
-        Linux)  echo "     Install with: sudo apt install git  (Debian/Ubuntu)" ;;
-        Darwin) echo "     Install with: brew install git  or  xcode-select --install" ;;
-    esac
-    exit 1
-fi
-
-if ! command -v curl &>/dev/null; then
-    echo "  ❌ curl is not installed."
-    case "$OS" in
-        Linux)  echo "     Install with: sudo apt install curl" ;;
-        Darwin) echo "     Install with: brew install curl" ;;
-    esac
-    exit 1
-fi
-
-# ── Rust / Cargo ────────────────────────────────────────────────
-if ! command -v cargo &>/dev/null; then
-    echo "  ⚠️  Rust not found. Installing via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --quiet
-    # shellcheck source=/dev/null
-    source "$HOME/.cargo/env"
-    if ! command -v cargo &>/dev/null; then
-        echo "  ❌ Rust installation failed. Please install manually: https://rustup.rs"
-        exit 1
+# ── Detect distro ────────────────────────────────────────────────
+detect_os() {
+    local OS ARCH DISTRO
+    OS="$(uname -s)"
+    ARCH="$(uname -m)"
+    if [ "$OS" = "Linux" ]; then
+        if [ -f /etc/os-release ]; then
+            # shellcheck source=/dev/null
+            . /etc/os-release
+            DISTRO="${PRETTY_NAME:-Linux}"
+        elif command -v lsb_release &>/dev/null; then
+            DISTRO="$(lsb_release -ds 2>/dev/null || echo Linux)"
+        else
+            DISTRO="Linux"
+        fi
+    elif [ "$OS" = "Darwin" ]; then
+        DISTRO="macOS $(sw_vers -productVersion 2>/dev/null || true)"
+    else
+        fail "Unsupported OS: $OS — S.A.M supports Linux and macOS"
     fi
-    echo "  ✅ Rust installed: $(rustc --version)"
-else
-    echo "  ✅ Rust found: $(rustc --version)"
+    echo "$DISTRO ($ARCH)"
+}
+
+# ── ASCII Banner ─────────────────────────────────────────────────
+clear
+echo ""
+echo -e "${CYAN}${BOLD}"
+cat << 'LOGO'
+   ╔═══════════════════════════════════════════════════════╗
+   ║                                                       ║
+   ║    ███████╗ █████╗ ███╗   ███╗                        ║
+   ║    ██╔════╝██╔══██╗████╗ ████║                        ║
+   ║    ███████╗███████║██╔████╔██║   Mission Control      ║
+   ║    ╚════██║██╔══██║██║╚██╔╝██║                        ║
+   ║    ███████║██║  ██║██║ ╚═╝ ██║   Fleet Orchestration  ║
+   ║    ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝                        ║
+   ║                                                       ║
+   ║         Strange Artificial Machine  v2.0              ║
+   ║                                                       ║
+   ╚═══════════════════════════════════════════════════════╝
+LOGO
+echo -e "${RESET}"
+sleep 0.4
+
+OS_LABEL="$(detect_os)"
+info "System:  ${BOLD}${OS_LABEL}${RESET}"
+info "User:    ${BOLD}${USER:-$(whoami)}${RESET}"
+info "Install: ${BOLD}${INSTALL_DIR}/${BIN_NAME}${RESET}"
+echo ""
+
+# ── Git ──────────────────────────────────────────────────────────
+if ! command -v git &>/dev/null; then
+    fail "git not found — install git and re-run"
 fi
 
-# ── Clone ───────────────────────────────────────────────────────
-echo "  [1/4] Cloning repository..."
+# ── Rust / Cargo ─────────────────────────────────────────────────
+if ! command -v cargo &>/dev/null; then
+    spin_start "Installing Rust toolchain via rustup..."
+    if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --quiet >> "$BUILD_LOG" 2>&1; then
+        fail "Rust install failed — see $BUILD_LOG"
+    fi
+    # shellcheck source=/dev/null
+    source "$HOME/.cargo/env" 2>/dev/null || true
+    ok "Rust installed: $(rustc --version 2>/dev/null | cut -d' ' -f1-2)"
+else
+    ok "Rust: $(rustc --version 2>/dev/null | cut -d' ' -f1-2)"
+fi
+
+# ── Clone ────────────────────────────────────────────────────────
 SAM_TMP=$(mktemp -d)
 trap 'rm -rf "$SAM_TMP"' EXIT
 
-if ! git clone --depth 1 "https://github.com/$REPO.git" "$SAM_TMP/sam" 2>&1; then
-    echo "  ❌ Failed to clone $REPO. Check your internet connection."
-    exit 1
+spin_start "Cloning sam-mission-control..."
+if ! git clone --depth 1 "https://github.com/$REPO.git" "$SAM_TMP/sam" >> "$BUILD_LOG" 2>&1; then
+    fail "Clone failed — check internet connection"
 fi
+ok "Repository cloned"
 cd "$SAM_TMP/sam"
 
-# ── Build ───────────────────────────────────────────────────────
-echo "  [2/4] Building (release mode) — this may take a few minutes..."
-if ! cargo build --release 2>&1; then
-    echo "  ❌ Build failed. See output above for details."
-    echo "     Ensure Rust 1.85+ is installed: rustup update stable"
-    exit 1
+# ── Build (silent, with animated progress) ───────────────────────
+spin_start "Compiling release binary (this takes 2–5 min on first run)..."
+if ! cargo build --release >> "$BUILD_LOG" 2>&1; then
+    spin_stop
+    echo -e "\n  ${RED}✗  Build failed.${RESET} Full log: ${BUILD_LOG}"
+    echo ""
+    tail -20 "$BUILD_LOG" | sed 's/^/     /'
+    echo ""
+    fail "Try: rustup update stable && re-run installer"
 fi
+ok "Binary compiled"
 
-# ── Install ─────────────────────────────────────────────────────
-echo "  [3/4] Installing to $INSTALL_DIR/$BIN_NAME..."
-if [ ! -d "$INSTALL_DIR" ]; then
-    echo "  ❌ Install directory does not exist: $INSTALL_DIR"
-    echo "     Override with: INSTALL_DIR=~/.local/bin bash install.sh"
-    exit 1
-fi
-
+# ── Install ──────────────────────────────────────────────────────
+spin_start "Installing to ${INSTALL_DIR}/${BIN_NAME}..."
 if [ -w "$INSTALL_DIR" ]; then
     cp target/release/sam-mission-control "$INSTALL_DIR/$BIN_NAME"
 else
-    echo "  ℹ️  $INSTALL_DIR is not writable. Trying sudo..."
-    if ! sudo cp target/release/sam-mission-control "$INSTALL_DIR/$BIN_NAME"; then
-        echo "  ❌ Installation failed. Try:"
-        echo "     INSTALL_DIR=~/.local/bin bash install.sh"
-        exit 1
+    if ! sudo cp target/release/sam-mission-control "$INSTALL_DIR/$BIN_NAME" >> "$BUILD_LOG" 2>&1; then
+        fail "Install failed — try: INSTALL_DIR=~/.local/bin bash install.sh"
     fi
 fi
+ok "Installed: ${INSTALL_DIR}/${BIN_NAME}"
 
-# Verify the binary is accessible
+# ── PATH check ───────────────────────────────────────────────────
 if ! command -v "$BIN_NAME" &>/dev/null; then
-    echo "  ⚠️  $INSTALL_DIR is not in your PATH."
-    echo "     Add it with: export PATH=\"$INSTALL_DIR:\$PATH\""
+    echo ""
+    echo -e "  ${YELLOW}⚠${RESET}  ${INSTALL_DIR} is not in your PATH."
+    echo -e "     Add this to your shell config:"
+    echo -e "     ${CYAN}export PATH=\"${INSTALL_DIR}:\$PATH\"${RESET}"
 fi
 
-# ── Done ────────────────────────────────────────────────────────
-echo "  [4/4] Done."
+# ── Done ─────────────────────────────────────────────────────────
 echo ""
-echo "  ✅ Installed $BIN_NAME $(target/release/sam-mission-control version 2>/dev/null | head -1 || true)"
+echo -e "  ${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+echo -e "  ${GREEN}${BOLD}  S.A.M Mission Control is installed ✓ ${RESET}"
+echo -e "  ${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo ""
-echo "  Quick start:"
-echo "    sam init --db-host <mysql-ip> --db-pass '<password>'"
-echo "    sam"
+echo -e "  Launch the first-run setup:"
 echo ""
-echo "  Add agents:"
-echo "    sam onboard <agent-ip>"
+echo -e "     ${CYAN}${BOLD}sam init${RESET}"
+echo ""
+echo -e "  ${DIM}sam init will guide you through everything — no manual config needed.${RESET}"
 echo ""
