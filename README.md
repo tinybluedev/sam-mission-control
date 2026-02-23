@@ -83,6 +83,7 @@ sam
 | `s` | Sort agents |
 | `f` | Filter/search |
 | `c` | Cycle color theme |
+| `m` | Cycle dark/light mode (`auto` → `dark` → `light`) |
 | `R` | Refresh all agents (SSH) |
 | `Space` | Toggle select current agent |
 | `a` / `A` | Select all / clear selection |
