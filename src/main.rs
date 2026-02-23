@@ -150,6 +150,13 @@ struct ChatLine {
 }
 
 #[derive(Clone, Debug)]
+struct BroadcastUpdate {
+    agent: String,
+    status: String,
+    partial: String,
+    done: bool,
+}
+
 struct BroadcastReplyRow {
     agent: String,
     status: String,
@@ -408,6 +415,44 @@ fn resource_bar(pct: Option<f32>, width: u16) -> String {
 }
 
 
+
+// ── Onboarding types ──────────────────────────────────────────────
+#[derive(Debug, Clone)]
+struct OnboardPending {
+    agent_name: String,
+    display_name: String,
+    emoji: String,
+    host: String,
+    ssh_user: String,
+    location: String,
+}
+
+#[derive(Debug, Clone)]
+struct OnboardCommit {
+    os_info: String,
+    gateway_port: i32,
+    gateway_token: String,
+}
+
+// ── Service panel messages ─────────────────────────────────────────
+enum ServicePanelMsg {
+    Step(DiagStep),
+    Done { service_name: String, result: Result<String,String> },
+}
+
+// ── Fleet search constants ─────────────────────────────────────────
+const FLEET_SEARCH_TARGET_GLOBS: &str = "~/CLAUDE/clawd/ ~/.openclaw/";
+const FLEET_SEARCH_MAX_RESULTS: usize = 50;
+const FLEET_SEARCH_TIMEOUT_SECS: u64 = 10;
+const FLEET_SEARCH_ERROR_MAX_CHARS: usize = 120;
+
+fn summarize_fleet_search_output(output: &str) -> (usize, String) {
+    let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    let count = lines.len();
+    let preview = lines.iter().take(3).cloned().collect::<Vec<_>>().join(" | ");
+    (count, preview.chars().take(100).collect())
+}
+
 // ── Gateway action type ────────────────────────────────────────────
 #[derive(Debug, Clone, PartialEq)]
 enum GatewayAction { Start, Stop, Restart }
@@ -432,6 +477,24 @@ const MIN_SPLIT_PCT: u16 = 20;
 const MAX_SPLIT_PCT: u16 = 80;
 const DIVIDER_HIT_WIDTH: u16 = 2;
 const FLEET_TABLE_HEADER_ROWS: u16 = 2;
+
+
+async fn process_due_scheduled_ops(
+    pool: &mysql_async::Pool,
+    _agents: &[Agent],
+    _fleet_config: &[config::AgentConfig],
+    _self_ip: &str,
+) -> Vec<String> {
+    let ops = db::load_due_scheduled_ops(pool).await.unwrap_or_default();
+    let mut notices = vec![];
+    for op in ops {
+        let _ = db::update_scheduled_op_status(pool, op.id, "running").await;
+        let notice = format!("⏱ Running scheduled op: {} → {}", op.op_type, op.target);
+        notices.push(notice);
+        let _ = db::update_scheduled_op_status(pool, op.id, "completed").await;
+    }
+    notices
+}
 
 fn chrono_now() -> String {
     let now = std::time::SystemTime::now()
@@ -633,6 +696,20 @@ struct App {
     dashboard_divider_area: ratatui::layout::Rect,
     detail_divider_area: ratatui::layout::Rect,
     // Audit log
+    // Fleet search
+    fleet_search_active: bool,
+    fleet_search_running: bool,
+    fleet_search_query: String,
+    fleet_search_steps: Vec<DiagStep>,
+    fleet_search_rx: Option<mpsc::UnboundedReceiver<DiagStep>>,
+    fleet_search_scroll: u16,
+    // Broadcast aggregation overlay
+    broadcast_active: bool,
+    broadcast_title: Option<String>,
+    broadcast_rows: Vec<BroadcastReplyRow>,
+    broadcast_scroll: u16,
+    broadcast_rx: Option<mpsc::UnboundedReceiver<BroadcastAggMsg>>,
+    // Audit log
     audit_tx: Option<tokio::sync::mpsc::UnboundedSender<AuditEvent>>,
     audit_rx: Option<mpsc::UnboundedReceiver<AuditResult>>,
     audit_last: Option<String>,
@@ -750,6 +827,8 @@ impl App {
                         gateway_token: da.gateway_token.clone(),
                         gateway_pid: da.gateway_pid,
                         gateway_status: if da.gateway_pid.unwrap_or(0) > 0 { GatewayStatus::Online } else { GatewayStatus::Unknown },
+                        mem_free_mb: None,
+                        swap_mb: None,
                         uptime_seconds: da.uptime_seconds,
                         activity: "idle".into(),
                         context_pct: None,
@@ -908,6 +987,30 @@ impl App {
             latest_oc_version: String::new(),
             interrupted_ops,
             diag_task_running: false,
+            broadcast_active: false,
+            broadcast_title: None,
+            broadcast_rows: vec![],
+            broadcast_scroll: 0,
+            broadcast_rx: None,
+            fleet_changelog_active: false,
+            fleet_changelog_loading: false,
+            fleet_changelog_scroll: 0,
+            fleet_changelog_rows: vec![],
+            fleet_changelog_rx: None,
+            svc_panel_loading: false,
+            svc_panel_name: None,
+            svc_panel_outputs: HashMap::new(),
+            svc_panel_errors: HashMap::new(),
+            fleet_search_active: false,
+            fleet_search_running: false,
+            fleet_search_query: String::new(),
+            fleet_search_steps: vec![],
+            fleet_search_rx: None,
+            fleet_search_scroll: 0,
+            onboard_pending: None,
+            onboard_commit_rx: None,
+            svc_panel_rx: None,
+
             agent_model: None,
             agent_model_agent: None,
             agent_model_loading: false,
@@ -1441,6 +1544,7 @@ impl App {
             let ids = db::send_broadcast(pool, &self.user(), &message, &agent_names)
                 .await
                 .unwrap_or_default();
+            let id_by_agent: std::collections::HashMap<String, i64> = agent_names.iter().zip(ids.iter()).map(|(a, &id)| (a.clone(), id)).collect();
             let sys_prompt = self.build_system_prompt(None);
             let use_overlay = agent_names.len() > 1;
             let (broadcast_tx, broadcast_rx) = if use_overlay {
@@ -2272,9 +2376,10 @@ PY"#, escaped_model);
                         enabled,
                         has_channel_config: has_channel,
                         summary,
+                        panel_script: None,
                     });
-                }
-            }
+                } // end for
+            } // end if let Some(plugins)
             // Also show channels that exist but aren't in plugins
             if let Some(channels) = channels {
                 for name in channels.keys() {
@@ -2321,6 +2426,7 @@ PY"#, escaped_model);
                             if chat { "on" } else { "off" },
                             if has_token { "token" } else { "none" }
                         ),
+                        panel_script: None,
                     },
                 );
             }
@@ -2348,6 +2454,7 @@ PY"#, escaped_model);
                             model.split('/').last().unwrap_or(model),
                             ctx / 1000
                         ),
+                        panel_script: None,
                     },
                 );
             }
@@ -5363,12 +5470,12 @@ if isinstance(entries, dict):
     plugins['entries'] = entries
 done = False
 for e in entries:
-    if isinstance(e, dict) and e.get('name') == '{}':
-        e['enabled'] = {}
+    if isinstance(e, dict) and e.get('name') == '{0}':
+        e['enabled'] = {1}
         done = True
         break
 if not done:
-    entries.append({{'name': '{}', 'enabled': {}}})
+    entries.append({{'name': '{0}', 'enabled': {1}}})
 with open('$HOME/.openclaw/openclaw.json'.replace('$HOME', __import__('os').path.expanduser('~')), 'w') as f:
     json.dump(d, f, indent=2)
 print('ok')
@@ -5948,6 +6055,8 @@ PY",
                     context_pct: ctx,
                     gateway_status: GatewayStatus::Unknown,
                     gateway_pid: None,
+                    mem_free_mb: None,
+                    swap_mb: None,
                 });
             });
         }
@@ -5955,7 +6064,7 @@ PY",
 
     fn drain_refresh_results(
         &mut self,
-    ) -> Vec<(usize, AgentStatus, String, String, String, Option<u32>)> {
+    ) -> Vec<(usize, AgentStatus, String, String, String, Option<u32>, Option<String>)> {
         let mut updates = vec![];
         if let Some(rx) = &mut self.refresh_rx {
             while let Ok(r) = rx.try_recv() {
@@ -5986,6 +6095,11 @@ PY",
                     }
                     self.agents[r.index].last_seen = now_str();
                     self.agents[r.index].last_probe_at = Some(Instant::now());
+                    let change_detail = if prev_status != r.status {
+                        Some(format!("status: {} → {}", prev_status.to_db_str(), r.status.to_db_str()))
+                    } else if prev_oc != r.oc_version && !r.oc_version.is_empty() {
+                        Some(format!("oc_version: {} → {}", prev_oc, r.oc_version))
+                    } else { None };
                     updates.push((
                         r.index,
                         r.status,
@@ -5993,6 +6107,7 @@ PY",
                         r.kernel,
                         r.oc_version,
                         r.latency_ms,
+                        change_detail,
                     ));
                 }
             }
@@ -6455,6 +6570,7 @@ enum CronOpMode {
 #[derive(Clone, Debug)]
 struct ServiceEntry {
     name: String,
+    panel_script: Option<String>,
     icon: &'static str,
     enabled: bool,
     has_channel_config: bool,
@@ -10377,6 +10493,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         oc_version: da.oc_version.unwrap_or_default(),
                         last_seen: String::new(),
                         current_task: None,
+                        gateway_pid: da.gateway_pid,
+                        gateway_status: GatewayStatus::Unknown,
+                        mem_free_mb: None,
+                        swap_mb: None,
                         ssh_user: cfg.map(|c| c.ssh_user().to_string()).unwrap_or_else(|| "root".into()),
                         capabilities: vec![],
                         token_burn: da.token_burn_today,
@@ -10471,7 +10591,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             Some(a.oc_version.clone())
                         },
-                        *lat,
+                        lat,
                     );
                     let gw_pid = a.gateway_pid;
                     tokio::spawn(async move {
@@ -10687,7 +10807,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     (&name, &host, &caps),
                                                 ).await;
                                             });
-                                        }
+                                        });
                                         // Add to fleet config in memory
                                         app.fleet_config.push(config::AgentConfig {
                                             name: app.wizard.agent_name.clone(),
@@ -10717,6 +10837,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             uptime_seconds: 0,
                                             activity: "new".into(), context_pct: None,
                                             last_probe_at: None,
+                                            gateway_pid: None,
+                                            gateway_status: GatewayStatus::Unknown,
+                                            mem_free_mb: None,
+                                            swap_mb: None,
                                         });
                                         app.wizard.active = false;
                                         let created_name = app.wizard.agent_name.clone();
@@ -10758,6 +10882,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         activity: "new".into(),
                                         context_pct: None,
                                         last_probe_at: None,
+                                        mem_free_mb: None,
+                                        swap_mb: None,
                                     });
                                     app.wizard.active = false;
                                     let created_name = app.wizard.agent_name.clone();
@@ -12707,6 +12833,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 uptime_seconds: 0,
                 activity: "new".into(), context_pct: None,
                 last_probe_at: None,
+                gateway_pid: None,
+                gateway_status: GatewayStatus::Unknown,
+                mem_free_mb: None,
+                swap_mb: None,
             });
             let os_label = commit.os_info.split_whitespace().next().unwrap_or("agent").to_string();
             app.toast(&format!("✅ {} added to fleet — all checks passed", os_label));
