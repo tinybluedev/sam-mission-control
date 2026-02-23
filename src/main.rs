@@ -343,7 +343,7 @@ fn fleet_change_detail(
         changes.push(format!("os: {} → {}", prev_os, new_os));
     }
     if !new_kernel.is_empty() && prev_kernel != new_kernel {
-        changes.push(format!("config.kernel: {} → {}", prev_kernel, new_kernel));
+        changes.push(format!("kernel: {} → {}", prev_kernel, new_kernel));
     }
     if changes.is_empty() {
         None
@@ -480,6 +480,7 @@ const FLEET_SEARCH_MAX_RESULTS: usize = 50;
 const FLEET_SEARCH_TIMEOUT_SECS: u64 = 10;
 const FLEET_SEARCH_ERROR_MAX_CHARS: usize = 120;
 const FLEET_CHANGELOG_TAIL_ROWS: u32 = 200;
+const FLEET_CHANGELOG_PAGE_SCROLL: u16 = 8;
 
 fn summarize_fleet_search_output(output: &str) -> (usize, String) {
     let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -6069,9 +6070,17 @@ PY",
         let pool = self.db_pool.clone();
         tokio::spawn(async move {
             let rows = if let Some(pool) = pool {
-                db::get_fleet_changelog(&pool, FLEET_CHANGELOG_TAIL_ROWS)
-                    .await
-                    .unwrap_or_default()
+                match db::get_fleet_changelog(&pool, FLEET_CHANGELOG_TAIL_ROWS).await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        eprintln!(
+                            "fleet changelog load failed (tail={}): {}",
+                            FLEET_CHANGELOG_TAIL_ROWS,
+                            e
+                        );
+                        vec![]
+                    }
+                }
             } else {
                 vec![]
             };
@@ -11042,11 +11051,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 KeyCode::PageUp => {
                                     app.fleet_changelog_scroll =
-                                        app.fleet_changelog_scroll.saturating_sub(8);
+                                        app.fleet_changelog_scroll.saturating_sub(FLEET_CHANGELOG_PAGE_SCROLL);
                                 }
                                 KeyCode::PageDown => {
                                     app.fleet_changelog_scroll =
-                                        app.fleet_changelog_scroll.saturating_add(8);
+                                        app.fleet_changelog_scroll.saturating_add(FLEET_CHANGELOG_PAGE_SCROLL);
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     app.fleet_changelog_scroll =
@@ -13457,7 +13466,7 @@ mod tests {
         .unwrap_or_default();
         assert!(detail.contains("version: openclaw 1.0.0 → openclaw 1.1.0"));
         assert!(detail.contains("os: Ubuntu 22.04 → Ubuntu 24.04"));
-        assert!(detail.contains("config.kernel: 5.15.0 → 6.8.0"));
+        assert!(detail.contains("kernel: 5.15.0 → 6.8.0"));
     }
 
     #[test]
