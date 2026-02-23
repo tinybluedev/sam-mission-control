@@ -5922,6 +5922,11 @@ print('ok')
             return;
         }
         let name = svc.name.clone();
+        // Validate plugin name: only allow alphanumeric, hyphens, underscores
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            self.toast("❌ Invalid plugin name");
+            return;
+        }
         // Load existing channel values if present
         let existing = self
             .svc_config
@@ -5963,6 +5968,11 @@ print('ok')
             return;
         }
         let plugin = self.svc_form_plugin.clone();
+        // Validate plugin name: only allow alphanumeric, hyphens, underscores
+        if !plugin.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            self.toast("❌ Invalid plugin name");
+            return;
+        }
         // Validate required fields
         for (fname, val, req) in &self.svc_form_fields {
             if *req && val.trim().is_empty() {
