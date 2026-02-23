@@ -318,6 +318,40 @@ fn os_emoji(os: &str) -> &'static str {
     }
 }
 
+fn fleet_change_detail(
+    prev_status: &AgentStatus,
+    new_status: &AgentStatus,
+    prev_os: &str,
+    new_os: &str,
+    prev_kernel: &str,
+    new_kernel: &str,
+    prev_oc: &str,
+    new_oc: &str,
+) -> Option<String> {
+    let mut changes: Vec<String> = vec![];
+    if prev_status != new_status {
+        changes.push(format!(
+            "status: {} → {}",
+            prev_status.to_db_str(),
+            new_status.to_db_str()
+        ));
+    }
+    if !new_oc.is_empty() && prev_oc != new_oc {
+        changes.push(format!("version: {} → {}", prev_oc, new_oc));
+    }
+    if !new_os.is_empty() && prev_os != new_os {
+        changes.push(format!("os: {} → {}", prev_os, new_os));
+    }
+    if !new_kernel.is_empty() && prev_kernel != new_kernel {
+        changes.push(format!("kernel: {} → {}", prev_kernel, new_kernel));
+    }
+    if changes.is_empty() {
+        None
+    } else {
+        Some(changes.join(" | "))
+    }
+}
+
 fn format_uptime(secs: i64) -> String {
     if secs <= 0 {
         return "—".into();
@@ -445,6 +479,8 @@ const FLEET_SEARCH_TARGET_GLOBS: &str = "~/CLAUDE/clawd/ ~/.openclaw/";
 const FLEET_SEARCH_MAX_RESULTS: usize = 50;
 const FLEET_SEARCH_TIMEOUT_SECS: u64 = 10;
 const FLEET_SEARCH_ERROR_MAX_CHARS: usize = 120;
+const FLEET_CHANGELOG_TAIL_ROWS: u32 = 200;
+const FLEET_CHANGELOG_PAGE_SCROLL: u16 = 8;
 
 fn summarize_fleet_search_output(output: &str) -> (usize, String) {
     let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -6032,6 +6068,34 @@ PY",
         });
     }
 
+    fn start_fleet_changelog_load(&mut self) {
+        self.fleet_changelog_active = true;
+        self.fleet_changelog_loading = true;
+        self.fleet_changelog_scroll = 0;
+        self.fleet_changelog_rows.clear();
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.fleet_changelog_rx = Some(rx);
+        let pool = self.db_pool.clone();
+        tokio::spawn(async move {
+            let rows = if let Some(pool) = pool {
+                match db::get_fleet_changelog(&pool, FLEET_CHANGELOG_TAIL_ROWS).await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        eprintln!(
+                            "fleet changelog load failed (tail={}): {}",
+                            FLEET_CHANGELOG_TAIL_ROWS,
+                            e
+                        );
+                        vec![]
+                    }
+                }
+            } else {
+                vec![]
+            };
+            let _ = tx.send(rows);
+        });
+    }
+
     fn start_refresh(&mut self) {
         if self.refreshing {
             return;
@@ -6103,11 +6167,16 @@ PY",
                     }
                     self.agents[r.index].last_seen = now_str();
                     self.agents[r.index].last_probe_at = Some(Instant::now());
-                    let change_detail = if prev_status != r.status {
-                        Some(format!("status: {} → {}", prev_status.to_db_str(), r.status.to_db_str()))
-                    } else if prev_oc != r.oc_version && !r.oc_version.is_empty() {
-                        Some(format!("oc_version: {} → {}", prev_oc, r.oc_version))
-                    } else { None };
+                    let change_detail = fleet_change_detail(
+                        &prev_status,
+                        &r.status,
+                        &prev_os,
+                        &r.os,
+                        &prev_kernel,
+                        &r.kernel,
+                        &prev_oc,
+                        &r.oc_version,
+                    );
                     updates.push((
                         r.index,
                         r.status,
@@ -10841,6 +10910,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Diagnostic overlay (renders on top of everything)
                 if app.fleet_diag_active {
                     render_fleet_diagnostics(f, &app);
+                } else if app.fleet_changelog_active {
+                    render_fleet_changelog(f, &app);
                 } else if app.diag_active {
                     render_diagnostics(f, &app);
                 }
@@ -11172,6 +11243,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         app.selected = idx;
                                         app.start_diagnostics(fix);
                                     }
+                                }
+                                _ => {}
+                            }
+                        } else if app.fleet_changelog_active {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    app.fleet_changelog_active = false;
+                                    app.fleet_changelog_loading = false;
+                                    app.fleet_changelog_rx = None;
+                                }
+                                KeyCode::PageUp => {
+                                    app.fleet_changelog_scroll =
+                                        app.fleet_changelog_scroll.saturating_sub(FLEET_CHANGELOG_PAGE_SCROLL);
+                                }
+                                KeyCode::PageDown => {
+                                    app.fleet_changelog_scroll =
+                                        app.fleet_changelog_scroll.saturating_add(FLEET_CHANGELOG_PAGE_SCROLL);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    app.fleet_changelog_scroll =
+                                        app.fleet_changelog_scroll.saturating_sub(1);
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    app.fleet_changelog_scroll =
+                                        app.fleet_changelog_scroll.saturating_add(1);
                                 }
                                 _ => {}
                             }
@@ -12210,6 +12306,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                                 KeyCode::Char('D') => {
                                                     app.start_fleet_diagnostics(true)
+                                                }
+                                                KeyCode::Char('L') => {
+                                                    app.start_fleet_changelog_load()
                                                 }
                                                 KeyCode::Tab => app.focus = Focus::Chat,
                                                 KeyCode::Up | KeyCode::Char('k') => app.previous(),
@@ -13468,7 +13567,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, ChatLine, INPUT_POLL_MS};
+    use super::{fleet_change_detail, AgentStatus, App, ChatLine, INPUT_POLL_MS};
 
     #[test]
     fn input_poll_interval_is_low_for_responsive_ui() {
@@ -13554,5 +13653,38 @@ mod tests {
         ];
         App::apply_thread_depth(&mut msgs);
         assert_eq!(msgs[4].depth, 3);
+    }
+
+    #[test]
+    fn fleet_change_detail_includes_version_os_and_kernel_changes() {
+        let detail = fleet_change_detail(
+            &AgentStatus::Online,
+            &AgentStatus::Online,
+            "Ubuntu 22.04",
+            "Ubuntu 24.04",
+            "5.15.0",
+            "6.8.0",
+            "openclaw 1.0.0",
+            "openclaw 1.1.0",
+        )
+        .unwrap_or_default();
+        assert!(detail.contains("version: openclaw 1.0.0 → openclaw 1.1.0"));
+        assert!(detail.contains("os: Ubuntu 22.04 → Ubuntu 24.04"));
+        assert!(detail.contains("kernel: 5.15.0 → 6.8.0"));
+    }
+
+    #[test]
+    fn fleet_change_detail_is_none_when_snapshot_fields_match() {
+        assert!(fleet_change_detail(
+            &AgentStatus::Online,
+            &AgentStatus::Online,
+            "Ubuntu",
+            "Ubuntu",
+            "6.8.0",
+            "6.8.0",
+            "openclaw 1.1.0",
+            "openclaw 1.1.0",
+        )
+        .is_none());
     }
 }
