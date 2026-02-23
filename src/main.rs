@@ -8644,20 +8644,16 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         GatewayStatus::Restarting => t.status_busy,
         GatewayStatus::Unknown => t.text_dim,
     };
-    let gw_detail = format!(
-        ":{} {}{}  {}",
-        a.gateway_port,
-        match a.gateway_pid {
-            Some(pid) if pid > 0 => format!("pid:{}", pid),
-            _ => "pid:—".into(),
-        },
-        if a.uptime_seconds > 0 {
-            format!("  up:{}", format_uptime(a.uptime_seconds))
-        } else {
-            String::new()
-        },
-        gw_status_str,
-    );
+    let gw_pid_str = match a.gateway_pid {
+        Some(pid) if pid > 0 => format!("pid:{}", pid),
+        _ => "pid:—".into(),
+    };
+    let gw_up_str = if a.uptime_seconds > 0 {
+        format!("  up:{}", format_uptime(a.uptime_seconds))
+    } else {
+        String::new()
+    };
+    let gw_detail = format!(":{} {}{}  {}", a.gateway_port, gw_pid_str, gw_up_str, gw_status_str);
     info.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
