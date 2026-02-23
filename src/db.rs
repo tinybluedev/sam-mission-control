@@ -31,6 +31,17 @@ pub fn sanitize_error(msg: &str) -> String {
 use mysql_async::Pool;
 use std::env;
 
+pub fn db_mode() -> String {
+    env::var("SAM_DB_MODE")
+        .unwrap_or_else(|_| "mysql".into())
+        .trim()
+        .to_lowercase()
+}
+
+pub fn mysql_enabled() -> bool {
+    matches!(db_mode().as_str(), "" | "mysql")
+}
+
 /// Build a MySQL connection URL from individual components, percent-encoding
 /// special characters (`$` → `%24`, `@` → `%40`, `#` → `%23`) in the password.
 pub fn build_db_url(host: &str, port: &str, user: &str, pass: &str, db: &str) -> String {
@@ -628,6 +639,26 @@ mod tests {
         let static_query = "SELECT id, agent, op_type, status, DATE_FORMAT(started_at, '%H:%i'), DATE_FORMAT(completed_at, '%H:%i'), output FROM mc_operations WHERE status='interrupted' ORDER BY id DESC LIMIT 20";
         assert!(static_query.contains("status='interrupted'"));
         assert!(static_query.contains("LIMIT 20"));
+    }
+
+    #[test]
+    fn mysql_enabled_defaults_true() {
+        unsafe {
+            std::env::remove_var("SAM_DB_MODE");
+        }
+        assert!(mysql_enabled());
+    }
+
+    #[test]
+    fn mysql_enabled_false_for_non_mysql_modes() {
+        unsafe {
+            std::env::set_var("SAM_DB_MODE", "memory");
+        }
+        assert!(!mysql_enabled());
+        unsafe {
+            std::env::set_var("SAM_DB_MODE", "sqlite");
+        }
+        assert!(!mysql_enabled());
     }
 
     #[test]

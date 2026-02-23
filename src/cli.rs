@@ -184,17 +184,30 @@ pub struct SamConfig {
 /// Database connection settings from `[database]` in `config.toml`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DatabaseConfig {
+    #[serde(default)]
+    pub mode: Option<String>,
     pub url: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub user: Option<String>,
     pub password: Option<String>,
     pub database: Option<String>,
+    #[serde(default)]
+    pub sqlite_path: Option<String>,
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
-        Self { url: None, host: None, port: None, user: None, password: None, database: None }
+        Self {
+            mode: None,
+            url: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            database: None,
+            sqlite_path: None,
+        }
     }
 }
 
@@ -312,6 +325,14 @@ impl SamConfig {
             }
             if let Some(d) = &self.database.database {
                 if std::env::var("SAM_DB_NAME").is_err() { std::env::set_var("SAM_DB_NAME", d); }
+            }
+            if let Some(mode) = &self.database.mode {
+                if std::env::var("SAM_DB_MODE").is_err() { std::env::set_var("SAM_DB_MODE", mode); }
+            }
+            if let Some(path) = &self.database.sqlite_path {
+                if std::env::var("SAM_SQLITE_PATH").is_err() {
+                    std::env::set_var("SAM_SQLITE_PATH", path);
+                }
             }
             if std::env::var("SAM_USER").is_err() {
                 std::env::set_var("SAM_USER", &self.identity.user);
@@ -968,6 +989,94 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         if v.is_empty() { default.to_string() } else { v }
     };
 
+    let write_env_if_missing = |mode: &str, cfg: &SamConfig, self_ip: &str| -> Result<(), Box<dyn std::error::Error>> {
+        let env_path = std::path::Path::new(".env");
+        if !env_path.exists() {
+            let sqlite_path = cfg.database.sqlite_path.as_deref().unwrap_or("");
+            std::fs::write(
+                env_path,
+                format!(
+                    "SAM_DB_MODE={}\nSAM_DB_URL={}\nSAM_SQLITE_PATH={}\nSAM_SELF_IP={}\nSAM_USER={}\n",
+                    mode,
+                    cfg.database.url.clone().unwrap_or_default(),
+                    sqlite_path,
+                    self_ip,
+                    cfg.identity.user,
+                ),
+            )?;
+        }
+        Ok(())
+    };
+
+    let save_non_mysql_config = |mode: &str, sqlite_path: Option<String>, self_ip: &str| -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = SamConfig {
+            database: DatabaseConfig {
+                mode: Some(mode.to_string()),
+                url: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                database: None,
+                sqlite_path,
+            },
+            tui: TuiConfig::default(),
+            fleet: FleetConfig::default(),
+            identity: IdentityConfig { user: whoami().unwrap_or_else(|| "operator".into()) },
+        };
+        cfg.save()?;
+        write_env_if_missing(mode, &cfg, self_ip)?;
+        Ok(())
+    };
+
+    let has_mysql_cli = db_host.is_some()
+        || db_port.is_some()
+        || db_user.is_some()
+        || db_pass.is_some()
+        || db_name.is_some();
+    let persistence_choice = if has_mysql_cli {
+        "yes".to_string()
+    } else {
+        prompt(
+            "Want persistent fleet memory? (yes=guided MySQL / no=SQLite embedded / skip=memory only)",
+            "yes",
+        )
+        .to_lowercase()
+    };
+
+    let self_ip = self_ip.map(|s| s.to_string()).unwrap_or_else(|| {
+        let detected = std::process::Command::new("hostname").arg("-I").output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("127.0.0.1").to_string())
+            .unwrap_or_else(|_| "127.0.0.1".into());
+        prompt("This machine's IP", &detected)
+    });
+
+    if persistence_choice == "skip" || persistence_choice == "s" {
+        save_non_mysql_config("memory", None, &self_ip)?;
+        println!("\n  ✅ Memory-only mode enabled.");
+        println!("  ℹ️ Fleet data is runtime-only (not persisted across restarts).");
+        println!("  ✅ Ready! Run `sam` to launch Mission Control.\n");
+        return Ok(());
+    }
+    if persistence_choice == "no" || persistence_choice == "n" {
+        let default_sqlite = dirs::data_local_dir()
+            .unwrap_or_else(|| dirs::config_dir().unwrap_or_default())
+            .join("sam/fleet.sqlite");
+        let sqlite_path = prompt("SQLite DB file", &default_sqlite.to_string_lossy());
+        if let Some(parent) = std::path::Path::new(&sqlite_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sqlite_path)?;
+        save_non_mysql_config("sqlite", Some(sqlite_path.clone()), &self_ip)?;
+        println!("\n  ✅ SQLite embedded mode selected.");
+        println!("  ℹ️ SQLite file: {}", sqlite_path);
+        println!("  ✅ Ready! Run `sam` to launch Mission Control.\n");
+        return Ok(());
+    }
+
     // Interactive prompts for missing values
     let db_host = db_host.map(|s| s.to_string()).unwrap_or_else(|| prompt("MySQL host", "127.0.0.1"));
     let db_port = db_port.unwrap_or_else(|| prompt("MySQL port", "3306").parse().unwrap_or(3306));
@@ -982,12 +1091,6 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         input.trim().to_string()
     });
     let db_name = db_name.map(|s| s.to_string()).unwrap_or_else(|| prompt("Database name", "sam_fleet"));
-    let self_ip = self_ip.map(|s| s.to_string()).unwrap_or_else(|| {
-        let detected = std::process::Command::new("hostname").arg("-I").output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("127.0.0.1").to_string())
-            .unwrap_or_else(|_| "127.0.0.1".into());
-        prompt("This machine's IP", &detected)
-    });
 
     println!();
 
@@ -995,7 +1098,19 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
     print!("  [1/4] Connecting to MySQL... ");
     let url = crate::db::build_db_url(&db_host, &db_port.to_string(), &db_user, &db_pass, &db_name);
     let pool = mysql_async::Pool::new(url.as_str());
-    let mut conn = pool.get_conn().await.map_err(|e| crate::db::sanitize_error(&format!("DB connection failed: {}", e)))?;
+    let mut conn = match pool.get_conn().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            println!("❌");
+            println!(
+                "  ⚠️ MySQL unavailable ({}). Falling back to memory-only mode.",
+                crate::db::sanitize_error(&format!("DB connection failed: {}", e))
+            );
+            save_non_mysql_config("memory", None, &self_ip)?;
+            println!("  ✅ Ready! Run `sam` to launch Mission Control.\n");
+            return Ok(());
+        }
+    };
     println!("✅");
 
     // Step 2: Create tables
@@ -1069,12 +1184,14 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
     print!("  [3/4] Generating config... ");
     let cfg = SamConfig {
         database: DatabaseConfig {
+            mode: Some("mysql".into()),
             url: Some(url.clone()),
             host: Some(db_host.clone()),
             port: Some(db_port),
             user: Some(db_user.clone()),
             password: Some(db_pass.clone()),
             database: Some(db_name.clone()),
+            sqlite_path: None,
         },
         tui: TuiConfig::default(),
         fleet: FleetConfig::default(),
@@ -1083,13 +1200,7 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
     cfg.save()?;
 
     // Also write .env
-    let env_path = std::path::Path::new(".env");
-    if !env_path.exists() {
-        std::fs::write(env_path, format!(
-            "SAM_DB_URL={}\nSAM_SELF_IP={}\nSAM_USER={}\n",
-            url, self_ip, cfg.identity.user,
-        ))?;
-    }
+    write_env_if_missing("mysql", &cfg, &self_ip)?;
     println!("✅ ~/.config/sam/config.toml");
 
     // Step 4: Self-register

@@ -1017,13 +1017,19 @@ async fn copy_to_clipboard(text: String) -> bool {
 
 impl App {
     async fn new(fleet_config: config::FleetConfig) -> Self {
-        let pool = db::get_pool();
-        // Run schema migrations on startup (idempotent)
-        let _ = db::run_migrations(&pool).await;
+        let pool = if db::mysql_enabled() {
+            let pool = db::get_pool();
+            // Run schema migrations on startup (idempotent)
+            let _ = db::run_migrations(&pool).await;
+            Some(pool)
+        } else {
+            None
+        };
         let self_ip = std::env::var("SAM_SELF_IP").unwrap_or_else(|_| "localhost".into());
         let mut agents = Vec::new();
 
-        match db::load_fleet(&pool).await {
+        if let Some(pool) = &pool {
+            match db::load_fleet(pool).await {
             Ok(db_agents) => {
                 for da in db_agents {
                     let cfg = fleet_config.agent.iter().find(|c| c.name == da.agent_name);
@@ -1079,52 +1085,76 @@ impl App {
             }
             Err(e) => eprintln!("DB: {}", e),
         }
+        }
 
-        let chat_history = match db::load_global_chat(&pool, 100).await {
-            Ok(msgs) => msgs
-                .iter()
-                .map(|m| ChatLine {
-                    id: m.id,
-                    sender: m.sender.clone(),
-                    target: m.target.clone(),
-                    message: m.message.clone(),
-                    response: m.response.clone(),
-                    time: m.created_at.clone(),
-                    status: m.status.clone(),
-                    kind: m.kind.clone(),
-                    thread_id: m.thread_id.clone(),
-                    parent_id: m.parent_id,
-                    depth: 0,
-                })
-                .collect(),
-            Err(_) => vec![],
+        let chat_history = if let Some(pool) = &pool {
+            match db::load_global_chat(pool, 100).await {
+                Ok(msgs) => msgs
+                    .iter()
+                    .map(|m| ChatLine {
+                        id: m.id,
+                        sender: m.sender.clone(),
+                        target: m.target.clone(),
+                        message: m.message.clone(),
+                        response: m.response.clone(),
+                        time: m.created_at.clone(),
+                        status: m.status.clone(),
+                        kind: m.kind.clone(),
+                        thread_id: m.thread_id.clone(),
+                        parent_id: m.parent_id,
+                        depth: 0,
+                    })
+                    .collect(),
+                Err(_) => vec![],
+            }
+        } else {
+            vec![]
         };
 
         // Detect operations interrupted by a previous session (started > 5 min ago, still 'running')
-        let _ = db::mark_stale_operations_interrupted(&pool).await;
-        let interrupted_ops = db::load_interrupted_operations(&pool)
-            .await
-            .unwrap_or_default();
+        let interrupted_ops = if let Some(pool) = &pool {
+            let _ = db::mark_stale_operations_interrupted(pool).await;
+            db::load_interrupted_operations(pool).await.unwrap_or_default()
+        } else {
+            vec![]
+        };
 
         let tn = ThemeName::Standard;
         let tm = ThemeMode::Auto;
         let bd = detect_system_bg_density();
-        let is_first_launch = agents.is_empty();
-        let (audit_tx, mut audit_input_rx) = mpsc::unbounded_channel::<AuditEvent>();
-        let (audit_result_tx, audit_result_rx) = mpsc::unbounded_channel::<AuditResult>();
-        let audit_pool = pool.clone();
-        tokio::spawn(async move {
-            while let Some(evt) = audit_input_rx.recv().await {
-                let result = db::append_audit_log(&audit_pool, &evt.actor, &evt.action, &evt.target, &evt.detail).await;
-                let send_result = match result {
-                    Ok(()) => audit_result_tx.send(AuditResult { ok: true, action: evt.action, target: evt.target, error: None }),
-                    Err(e) => audit_result_tx.send(AuditResult { ok: false, action: evt.action, target: evt.target, error: Some(db::sanitize_error(&e.to_string())) }),
-                };
-                if let Err(e) = send_result {
-                    eprintln!("audit result channel send failed: {}", e);
+        if let Some(audit_pool) = pool.clone() {
+            let (_audit_tx, mut audit_input_rx) = mpsc::unbounded_channel::<AuditEvent>();
+            let (audit_result_tx, _audit_result_rx) = mpsc::unbounded_channel::<AuditResult>();
+            tokio::spawn(async move {
+                while let Some(evt) = audit_input_rx.recv().await {
+                    let result = db::append_audit_log(
+                        &audit_pool,
+                        &evt.actor,
+                        &evt.action,
+                        &evt.target,
+                        &evt.detail,
+                    )
+                    .await;
+                    let send_result = match result {
+                        Ok(()) => audit_result_tx.send(AuditResult {
+                            ok: true,
+                            action: evt.action,
+                            target: evt.target,
+                            error: None,
+                        }),
+                        Err(e) => audit_result_tx.send(AuditResult {
+                            ok: false,
+                            action: evt.action,
+                            target: evt.target,
+                            error: Some(db::sanitize_error(&e.to_string())),
+                        }),
+                    };
+                    if let Err(e) = send_result {
+                        eprintln!("audit result channel send failed: {}", e);
+                    }
                 }
-            }
-        });
+            });
+        }
 
         App {
             fleet_config: fleet_config.agent,
@@ -1138,7 +1168,7 @@ impl App {
             status_message: String::new(),
             toast_message: None,
             toast_at: None,
-            db_pool: Some(pool),
+            db_pool: pool,
             chat_input: String::new(),
             chat_history,
             chat_scroll: 0,
@@ -1274,7 +1304,7 @@ impl App {
             dashboard_split_pct: None,
             db_latency_ms: None,
             db_latency_rx: None,
-            db_online: true,
+            db_online: db::mysql_enabled(),
             detail_body_area: ratatui::layout::Rect::default(),
             detail_divider_area: ratatui::layout::Rect::default(),
             detail_split_pct: None,
@@ -11823,6 +11853,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| e.into());
         }
         Some(cli::Commands::Daemon) => {
+            if !db::mysql_enabled() {
+                eprintln!("DB daemon mode requires SAM_DB_MODE=mysql. Current mode skips DB operations.");
+                return Ok(());
+            }
             let fleet_config = config::load_fleet_config().map_err(|e| format!("Error: {}", e))?;
             let pool = db::get_pool();
             let _ = db::run_migrations(&pool).await;
