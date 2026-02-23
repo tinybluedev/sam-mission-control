@@ -157,6 +157,8 @@ pub enum Commands {
         #[arg(long, default_value = "20")]
         tail: u32,
     },
+    /// Run scheduled-operations executor without launching TUI
+    Daemon,
 }
 
 /// Persistent config file (~/.config/sam/config.toml)
