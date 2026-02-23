@@ -878,6 +878,8 @@ struct App {
     // Config viewer
     config_text: Option<String>,
     config_scroll: u16,
+    config_json: Option<serde_json::Value>,
+    config_raw_mode: bool,
     // Help screen
     help_scroll: u16,
     // Multi-select
@@ -1164,6 +1166,8 @@ impl App {
             splash_start: Instant::now(),
             config_text: None,
             config_scroll: 0,
+            config_json: None,
+            config_raw_mode: false,
             help_scroll: 0,
             filter_active: false,
             filter_text: String::new(),
@@ -7172,6 +7176,249 @@ const SERVICE_ICONS: &[(&str, &str)] = &[
     ("tlon", "🌐"),
 ];
 
+/// Build labeled form lines from a parsed openclaw.json config.
+/// Each field is rendered with a bold label, its current value, and a dim description.
+fn build_config_form_lines<'a>(config: &serde_json::Value, t: &Theme) -> Vec<Line<'a>> {
+    let label_style = Style::default().fg(t.text_bold).bold();
+    let value_style = Style::default().fg(t.accent);
+    let desc_style = Style::default().fg(t.text_dim);
+    let section_style = Style::default().fg(t.accent).bold();
+    let warn_style = Style::default().fg(Color::Yellow);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Helper closures
+    let val_str = |v: &serde_json::Value| -> String {
+        match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Null => "—".into(),
+            serde_json::Value::Array(a) => {
+                if a.is_empty() {
+                    "[]".into()
+                } else {
+                    let items: Vec<String> = a.iter().map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    }).collect();
+                    items.join(", ")
+                }
+            }
+            serde_json::Value::Object(_) => "{…}".into(),
+        }
+    };
+
+    // ── Gateway ──
+    if let Some(gw) = config.get("gateway") {
+        lines.push(Line::from(Span::styled("  ─── Gateway ───", section_style)));
+        lines.push(Line::from(""));
+
+        let fields: Vec<(&str, &str, &str)> = vec![
+            ("mode", "gateway.mode", "Gateway mode (e.g. proxy, local)"),
+            ("bind", "gateway.bind", "Network bind address (lan, localhost, 0.0.0.0)"),
+            ("port", "gateway.port", "Port number for the gateway API"),
+        ];
+        for (key, path, desc) in &fields {
+            let val = gw.get(key).map(|v| val_str(v)).unwrap_or_else(|| "—".into());
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<20}", path), label_style),
+                Span::styled(val, value_style),
+            ]));
+            lines.push(Line::from(Span::styled(format!("  {:<20}{}", "", desc), desc_style)));
+        }
+
+        // Auth
+        if let Some(auth) = gw.get("auth") {
+            let has_token = auth.get("token").and_then(|t| t.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<20}", "gateway.auth.token"), label_style),
+                Span::styled(
+                    if has_token { "✓ set" } else { "✗ not set" },
+                    if has_token { value_style } else { warn_style },
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(format!("  {:<20}API authentication token", ""), desc_style)));
+        }
+
+        // Chat completions
+        if let Some(chat) = gw.get("chatCompletions") {
+            let enabled = chat.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<20}", "gateway.chatCompletions"), label_style),
+                Span::styled(
+                    if enabled { "enabled" } else { "disabled" },
+                    if enabled { value_style } else { warn_style },
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(format!("  {:<20}Chat completions API endpoint", ""), desc_style)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // ── Agents / Defaults ──
+    if let Some(agents) = config.get("agents") {
+        lines.push(Line::from(Span::styled("  ─── Agent Defaults ───", section_style)));
+        lines.push(Line::from(""));
+
+        if let Some(defaults) = agents.get("defaults") {
+            // Model
+            if let Some(model) = defaults.get("model") {
+                let primary = model.get("primary").map(|v| val_str(v)).unwrap_or_else(|| "—".into());
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<20}", "agents.model.primary"), label_style),
+                    Span::styled(primary, value_style),
+                ]));
+                lines.push(Line::from(Span::styled(format!("  {:<20}Primary LLM model identifier", ""), desc_style)));
+            }
+
+            // Context tokens
+            if let Some(ctx) = defaults.get("contextTokens") {
+                let ctx_val = ctx.as_u64().unwrap_or(0);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<20}", "agents.contextTokens"), label_style),
+                    Span::styled(format!("{}", ctx_val), value_style),
+                ]));
+                lines.push(Line::from(Span::styled(format!("  {:<20}Maximum context window size in tokens", ""), desc_style)));
+            }
+
+            // Max tokens
+            if let Some(max_t) = defaults.get("maxTokens") {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<20}", "agents.maxTokens"), label_style),
+                    Span::styled(val_str(max_t), value_style),
+                ]));
+                lines.push(Line::from(Span::styled(format!("  {:<20}Maximum output tokens per response", ""), desc_style)));
+            }
+
+            // Temperature
+            if let Some(temp) = defaults.get("temperature") {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<20}", "agents.temperature"), label_style),
+                    Span::styled(val_str(temp), value_style),
+                ]));
+                lines.push(Line::from(Span::styled(format!("  {:<20}Sampling temperature (0.0-2.0)", ""), desc_style)));
+            }
+
+            // Other defaults
+            for (key, val) in defaults.as_object().into_iter().flat_map(|o| o.iter()) {
+                if matches!(key.as_str(), "model" | "contextTokens" | "maxTokens" | "temperature") {
+                    continue;
+                }
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<20}", format!("agents.{}", key)), label_style),
+                    Span::styled(val_str(val), value_style),
+                ]));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+
+    // ── Plugins ──
+    if let Some(plugins) = config.get("plugins").and_then(|p| p.get("entries")).and_then(|e| e.as_object()) {
+        lines.push(Line::from(Span::styled("  ─── Plugins ───", section_style)));
+        lines.push(Line::from(""));
+
+        for (name, entry) in plugins {
+            let enabled = entry.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+            let icon = svc_icon(name);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} {:<18}", icon, name), label_style),
+                Span::styled(
+                    if enabled { "● enabled" } else { "○ disabled" },
+                    Style::default().fg(if enabled { t.status_online } else { t.text_dim }),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(format!("  {:<20}Plugin integration for {}", "", name), desc_style)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // ── Channels ──
+    if let Some(channels) = config.get("channels").and_then(|c| c.as_object()) {
+        lines.push(Line::from(Span::styled("  ─── Channels ───", section_style)));
+        lines.push(Line::from(""));
+
+        for (name, ch_config) in channels {
+            let icon = svc_icon(name);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} {}", icon, name), label_style),
+            ]));
+
+            // Show channel fields
+            if let Some(obj) = ch_config.as_object() {
+                for (key, val) in obj {
+                    let display_val = if key.to_lowercase().contains("token")
+                        || key.to_lowercase().contains("secret")
+                        || key.to_lowercase().contains("password")
+                    {
+                        if val.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+                            "✓ set".to_string()
+                        } else {
+                            "✗ not set".to_string()
+                        }
+                    } else {
+                        val_str(val)
+                    };
+                    let ch_desc = config_field_description(&format!("channels.{}.{}", name, key));
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("    {:<18}", key), Style::default().fg(t.text)),
+                        Span::styled(display_val, value_style),
+                    ]));
+                    if !ch_desc.is_empty() {
+                        lines.push(Line::from(Span::styled(format!("    {:<18}{}", "", ch_desc), desc_style)));
+                    }
+                }
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    // ── Remaining top-level keys ──
+    let known_sections = ["gateway", "agents", "plugins", "channels"];
+    if let Some(obj) = config.as_object() {
+        let remaining: Vec<_> = obj.iter()
+            .filter(|(k, _)| !known_sections.contains(&k.as_str()))
+            .collect();
+        if !remaining.is_empty() {
+            lines.push(Line::from(Span::styled("  ─── Other Settings ───", section_style)));
+            lines.push(Line::from(""));
+            for (key, val) in remaining {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<20}", key), label_style),
+                    Span::styled(val_str(val), value_style),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No configuration fields found",
+            desc_style,
+        )));
+    }
+
+    lines
+}
+
+/// Return a human-readable description for known config field paths.
+fn config_field_description(path: &str) -> &'static str {
+    let suffix = path.rsplit('.').next().unwrap_or(path);
+    match suffix {
+        "token" | "botToken" => "Bot authentication token",
+        "botId" => "Bot user/application ID",
+        "secret" | "signingSecret" => "Signing secret for request verification",
+        "channelId" => "Default channel or chat ID",
+        "webhookUrl" => "Incoming webhook URL",
+        "appId" => "Application identifier",
+        "allowedUsers" => "List of allowed user IDs",
+        "prefix" => "Command prefix character",
+        _ => "",
+    }
+}
+
 fn svc_icon(name: &str) -> &'static str {
     SERVICE_ICONS
         .iter()
@@ -9675,7 +9922,7 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(t.text_dim),
     )));
     items.push(Line::from(Span::styled(
-        "  e      edit raw config",
+        "  e      view config",
         Style::default().fg(t.text_dim),
     )));
     items.push(Line::from(Span::styled(
@@ -9762,7 +10009,7 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(t.accent),
             )));
             lines.push(Line::from(Span::styled(
-                "  [e] Edit raw config",
+                "  [e] View config",
                 Style::default().fg(t.accent),
             )));
             lines.push(Line::from(""));
@@ -9919,7 +10166,7 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(t.accent),
             )));
             lines.push(Line::from(Span::styled(
-                "  [e]     Edit raw config",
+                "  [e]     View config",
                 Style::default().fg(t.accent),
             )));
 
@@ -11108,7 +11355,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         ),
         ("  Tab", "Switch: Info ↔ Chat", nav_style),
         ("  m", "Pick active model for this agent", act_style),
-        ("  e", "View agent config (openclaw.json)", act_style),
+        ("  e", "View agent config (labeled form)", act_style),
         ("  d", "Run diagnostics", act_style),
         ("  D (Shift)", "Run diagnostics + auto-fix", act_style),
         ("  Enter", "Send direct message", act_style),
@@ -11632,16 +11879,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let rect = Rect::new(x, y, w, h);
                     let clear = Block::default().style(Style::default().bg(app.bg_density.bg()));
                     f.render_widget(clear, rect);
-                    let lines: Vec<Line> = config
-                        .lines()
-                        .map(|l| {
-                            Line::from(Span::styled(l.to_string(), Style::default().fg(t.text)))
-                        })
-                        .collect();
+
+                    let (title, lines) = if app.config_raw_mode || app.config_json.is_none() {
+                        // Raw mode: show the raw JSON text
+                        let raw_lines: Vec<Line> = config
+                            .lines()
+                            .map(|l| {
+                                Line::from(Span::styled(l.to_string(), Style::default().fg(t.text)))
+                            })
+                            .collect();
+                        (" openclaw.json (raw) — 'e' labeled view · Esc to close ".to_string(), raw_lines)
+                    } else {
+                        // Labeled form mode: parse JSON and render with labels + descriptions
+                        let form_lines = build_config_form_lines(app.config_json.as_ref().unwrap(), t);
+                        (" openclaw.json — 'e' raw view · ↑↓ scroll · Esc to close ".to_string(), form_lines)
+                    };
+
                     let p = Paragraph::new(lines).scroll((app.config_scroll, 0)).block(
                         Block::default()
                             .title(Span::styled(
-                                " openclaw.json — Esc to close ",
+                                title,
                                 Style::default().fg(t.accent).bold(),
                             ))
                             .borders(Borders::ALL)
@@ -12082,18 +12339,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 },
                                 Screen::AgentDetail if app.config_text.is_some() => {
                                     match key.code {
-                                        KeyCode::Esc => {
+                                        KeyCode::Esc | KeyCode::Char('q') => {
                                             app.config_text = None;
+                                            app.config_json = None;
                                         }
-                                        KeyCode::PageUp | KeyCode::Up => {
+                                        KeyCode::Char('e') => {
+                                            app.config_raw_mode = !app.config_raw_mode;
+                                            app.config_scroll = 0;
+                                        }
+                                        KeyCode::PageUp | KeyCode::Up | KeyCode::Char('k') => {
                                             app.config_scroll = app.config_scroll.saturating_sub(3);
                                         }
-                                        KeyCode::PageDown | KeyCode::Down => {
+                                        KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') => {
                                             app.config_scroll = app.config_scroll.saturating_add(3);
                                         }
-                                        _ => {
-                                            app.config_text = None;
-                                        }
+                                        _ => {}
                                     }
                                 }
                                 Screen::AgentDetail => match app.focus {
@@ -12200,12 +12460,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                         KeyCode::Char('e') => {
-                                            // Open raw config viewer
+                                            // Open labeled config viewer
                                             if let Some(ref config) = app.svc_config {
                                                 let pretty = serde_json::to_string_pretty(config)
                                                     .unwrap_or_default();
                                                 app.config_text = Some(pretty);
+                                                app.config_json = Some(config.clone());
                                                 app.config_scroll = 0;
+                                                app.config_raw_mode = false;
                                             }
                                         }
                                         KeyCode::PageUp => {
@@ -13943,9 +14205,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Receive config load results (non-blocking)
         if let Some(ref mut rx) = app.config_load_rx {
             if let Ok(result) = rx.try_recv() {
+                app.config_json = result
+                    .as_ref()
+                    .and_then(|s| serde_json::from_str(s).ok());
                 app.config_text = result;
                 app.config_scroll = 0;
-                app.toast("📋 Config loaded — PageUp/Down to scroll, Esc to close");
+                app.config_raw_mode = false;
+                app.toast("📋 Config loaded — PageUp/Down to scroll, 'e' for raw view, Esc to close");
             }
         }
 
