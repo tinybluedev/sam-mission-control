@@ -32,6 +32,92 @@ ok()   { spin_stop; echo -e "  ${GREEN}✓${RESET}  $1"; }
 fail() { spin_stop; echo -e "  ${RED}✗${RESET}  $1"; exit 1; }
 info() { echo -e "  ${DIM}·${RESET}  $1"; }
 
+# ── Animated Timeline (build/install) ──────────────────────────────
+TIMELINE_LABELS=(
+    "Compile release binary"
+    "Install binary"
+)
+TIMELINE_ETA_SECS=(240 20)
+TIMELINE_STATUS=("pending" "pending")
+TIMELINE_LINES=0
+
+fmt_eta() {
+    local sec="$1"
+    if [ "$sec" -lt 60 ]; then
+        printf "~%ss" "$sec"
+    else
+        printf "~%sm%02ss" $((sec / 60)) $((sec % 60))
+    fi
+}
+
+timeline_render() {
+    local frame="$1"
+    local active_idx="${2:-}"
+    local active_left="${3:-0}"
+    local idx dot eta
+
+    if [ -t 1 ] && [ "$TIMELINE_LINES" -gt 0 ]; then
+        printf "\033[%sA" "$TIMELINE_LINES"
+    fi
+
+    echo -e "  ${BOLD}Progress Timeline${RESET}"
+    for idx in "${!TIMELINE_LABELS[@]}"; do
+        case "${TIMELINE_STATUS[$idx]}" in
+            running)
+                dot="${CYAN}${SPIN_FRAMES[$((frame % 10))]}${RESET}"
+                eta="$(fmt_eta "$active_left") left"
+                ;;
+            done)
+                dot="${GREEN}●${RESET}"
+                eta="done"
+                ;;
+            fail)
+                dot="${RED}●${RESET}"
+                eta="failed"
+                ;;
+            *)
+                dot="${DIM}○${RESET}"
+                eta="$(fmt_eta "${TIMELINE_ETA_SECS[$idx]}")"
+                ;;
+        esac
+        echo -e "    ${dot} ${TIMELINE_LABELS[$idx]} ${DIM}(${eta})${RESET}"
+    done
+
+    TIMELINE_LINES=$(( ${#TIMELINE_LABELS[@]} + 1 ))
+}
+
+timeline_run() {
+    local idx="$1"
+    local eta="$2"
+    shift 2
+    local cmd=("$@")
+    local start now elapsed left frame=0
+
+    TIMELINE_STATUS[$idx]="running"
+    start=$(date +%s)
+    "${cmd[@]}" >> "$BUILD_LOG" 2>&1 &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        now=$(date +%s)
+        elapsed=$((now - start))
+        left=$((eta - elapsed))
+        if [ "$left" -lt 0 ]; then left=0; fi
+        timeline_render "$frame" "$idx" "$left"
+        sleep 0.1
+        frame=$((frame + 1))
+    done
+
+    if wait "$pid"; then
+        TIMELINE_STATUS[$idx]="done"
+        timeline_render "$frame" "$idx" 0
+        return 0
+    fi
+
+    TIMELINE_STATUS[$idx]="fail"
+    timeline_render "$frame" "$idx" 0
+    return 1
+}
+
 # ── Detect distro ────────────────────────────────────────────────
 detect_os() {
     local OS ARCH DISTRO
@@ -112,26 +198,26 @@ ok "Repository cloned"
 cd "$SAM_TMP/sam"
 
 # ── Build (silent, with animated progress) ───────────────────────
-spin_start "Compiling release binary (this takes 2–5 min on first run)..."
-if ! cargo build --release >> "$BUILD_LOG" 2>&1; then
-    spin_stop
+timeline_render 0
+if ! timeline_run 0 "${TIMELINE_ETA_SECS[0]}" cargo build --release; then
     echo -e "\n  ${RED}✗  Build failed.${RESET} Full log: ${BUILD_LOG}"
     echo ""
     tail -20 "$BUILD_LOG" | sed 's/^/     /'
     echo ""
     fail "Try: rustup update stable && re-run installer"
 fi
-ok "Binary compiled"
 
 # ── Install ──────────────────────────────────────────────────────
-spin_start "Installing to ${INSTALL_DIR}/${BIN_NAME}..."
 if [ -w "$INSTALL_DIR" ]; then
-    cp target/release/sam-mission-control "$INSTALL_DIR/$BIN_NAME"
+    if ! timeline_run 1 "${TIMELINE_ETA_SECS[1]}" cp target/release/sam-mission-control "$INSTALL_DIR/$BIN_NAME"; then
+        fail "Install failed — try: INSTALL_DIR=~/.local/bin bash install.sh"
+    fi
 else
-    if ! sudo cp target/release/sam-mission-control "$INSTALL_DIR/$BIN_NAME" >> "$BUILD_LOG" 2>&1; then
+    if ! timeline_run 1 "${TIMELINE_ETA_SECS[1]}" sudo cp target/release/sam-mission-control "$INSTALL_DIR/$BIN_NAME"; then
         fail "Install failed — try: INSTALL_DIR=~/.local/bin bash install.sh"
     fi
 fi
+echo ""
 ok "Installed: ${INSTALL_DIR}/${BIN_NAME}"
 
 # ── PATH check ───────────────────────────────────────────────────
