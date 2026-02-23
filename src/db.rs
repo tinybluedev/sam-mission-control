@@ -74,8 +74,8 @@ pub struct DbAgent {
     pub current_task_id: Option<i32>,
     pub gateway_port: i32,
     pub gateway_token: Option<String>,
-    pub gateway_pid: Option<i32>,
     pub ssh_user: Option<String>,
+    pub gateway_pid: Option<i32>,
 }
 
 /// Load all agents from `mc_fleet_status`, ordered by name.
@@ -148,7 +148,8 @@ pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error>
             current_task_id: r.get::<Option<i32>, _>(10).flatten(),
             gateway_port: r.get::<Option<i32>, _>(11).flatten().unwrap_or(18789),
             gateway_token: r.get::<Option<String>, _>(12).flatten(),
-            ssh_user: r.get::<Option<String>, _>(13).flatten(),
+            ssh_user: r.get::<Option<String>, _>(14).flatten(),
+            gateway_pid: r.get::<Option<i32>, _>(14).flatten(),
         })
         .collect();
     Ok(agents)
@@ -960,3 +961,33 @@ pub async fn load_spawned_agents(
         })
         .collect())
 }
+
+/// Append an entry to the audit log table.
+pub async fn append_audit_log(
+    pool: &Pool,
+    actor: &str,
+    action: &str,
+    target: &str,
+    detail: &str,
+) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    // Create table if not exists
+    conn.exec_drop(
+        "CREATE TABLE IF NOT EXISTS mc_audit_log (
+            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            ts DATETIME NOT NULL DEFAULT NOW(),
+            actor VARCHAR(128) NOT NULL,
+            action VARCHAR(64) NOT NULL,
+            target VARCHAR(128) NOT NULL,
+            detail TEXT
+        )",
+        (),
+    ).await?;
+    conn.exec_drop(
+        "INSERT INTO mc_audit_log (actor, action, target, detail) VALUES (?, ?, ?, ?)",
+        (actor, action, target, detail),
+    ).await?;
+    Ok(())
+}
+
