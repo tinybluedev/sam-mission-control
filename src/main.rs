@@ -8224,6 +8224,7 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             app.sort_mode.arrow()
         )
     };
+    let rows_empty = rows.is_empty();
     let table = Table::new(rows, widths).header(hrow).block(
         Block::default()
             .title(Span::styled(fleet_title, Style::default().fg(fb).bold()))
@@ -8234,6 +8235,48 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             .padding(Padding::new(1, 1, 0, 0)),
     );
     frame.render_widget(table, area);
+
+    if rows_empty {
+        let empty_lines = if app.agents.is_empty() {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  📡 No agents in fleet",
+                    Style::default().fg(t.accent).bold(),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Add agents to fleet.toml and restart SAM,",
+                    Style::default().fg(t.text_dim),
+                )),
+                Line::from(Span::styled(
+                    "  or press 'w' to launch the agent wizard.",
+                    Style::default().fg(t.text_dim),
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  🔍 No agents match the current filter",
+                    Style::default().fg(t.accent).bold(),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Try a different search term or press 'g' to change group filter.",
+                    Style::default().fg(t.text_dim),
+                )),
+            ]
+        };
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y + 3,
+            width: area.width.saturating_sub(4),
+            height: area.height.saturating_sub(4),
+        };
+        let empty = Paragraph::new(empty_lines);
+        frame.render_widget(empty, inner);
+    }
 }
 
 fn render_chat_panel(frame: &mut Frame, app: &App, area: Rect, active: bool, agent_mode: bool) {
@@ -9336,6 +9379,39 @@ fn render_fleet_stats(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(t.accent));
     frame.render_widget(block, area);
 
+    if agents.is_empty() {
+        let empty_lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  📊 No fleet data available",
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Fleet statistics require at least one agent in your fleet.",
+                Style::default().fg(t.text_dim),
+            )),
+            Line::from(Span::styled(
+                "  Add agents to fleet.toml and they will appear here after the next probe.",
+                Style::default().fg(t.text_dim),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  [Esc / $] close",
+                Style::default().fg(t.text_dim),
+            )),
+        ];
+        let inner_area = Rect {
+            x: area.x + 2,
+            y: area.y + 2,
+            width: area.width.saturating_sub(4),
+            height: area.height.saturating_sub(3),
+        };
+        let empty = ratatui::widgets::Paragraph::new(empty_lines);
+        frame.render_widget(empty, inner_area);
+        return;
+    }
+
     let inner = Layout::default()
         .direction(Direction::Horizontal)
         .margin(1)
@@ -10031,6 +10107,20 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
             "  Loading workspace...",
             Style::default().fg(t.pending),
         )));
+    } else if app.ws_files.is_empty() {
+        items.push(Line::from(Span::styled(
+            "  📂 No workspace files found",
+            Style::default().fg(t.accent).bold(),
+        )));
+        items.push(Line::from(""));
+        items.push(Line::from(Span::styled(
+            "  Workspace shows agent config files and cron jobs.",
+            Style::default().fg(t.text_dim),
+        )));
+        items.push(Line::from(Span::styled(
+            "  Select an online agent to load its workspace.",
+            Style::default().fg(t.text_dim),
+        )));
     }
 
     // Keybind hints
@@ -10326,6 +10416,7 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
         })
         .collect();
 
+    let nodes_empty = app.agents.is_empty();
     let table = Table::new(
         rows,
         [
@@ -10351,6 +10442,33 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
             .padding(Padding::new(1, 1, 0, 0)),
     );
     frame.render_widget(table, outer[1]);
+
+    if nodes_empty {
+        let empty_lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  🔒 No mesh nodes found",
+                Style::default().fg(t.accent).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  VPN Mesh shows Tailscale/Headscale connectivity across your fleet.",
+                Style::default().fg(t.text_dim),
+            )),
+            Line::from(Span::styled(
+                "  Add agents to fleet.toml to see their VPN status here.",
+                Style::default().fg(t.text_dim),
+            )),
+        ];
+        let inner = Rect {
+            x: outer[1].x + 2,
+            y: outer[1].y + 3,
+            width: outer[1].width.saturating_sub(4),
+            height: outer[1].height.saturating_sub(4),
+        };
+        let empty = Paragraph::new(empty_lines);
+        frame.render_widget(empty, inner);
+    }
 
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
@@ -10524,6 +10642,7 @@ fn render_task_board(frame: &mut Frame, app: &App) {
         })
         .collect();
 
+    let tasks_empty = app.tasks.is_empty();
     let table = Table::new(
         rows,
         [
@@ -10548,6 +10667,34 @@ fn render_task_board(frame: &mut Frame, app: &App) {
             .padding(Padding::new(1, 1, 0, 0)),
     );
     frame.render_widget(table, body[0]);
+
+    if tasks_empty {
+        let empty_lines = vec![
+            Line::from(""),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  📋 No tasks yet",
+                Style::default().fg(t.accent).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  The task board tracks work items for your fleet agents.",
+                Style::default().fg(t.text_dim),
+            )),
+            Line::from(Span::styled(
+                "  Press 'n' to create your first task.",
+                Style::default().fg(t.text_dim),
+            )),
+        ];
+        let inner = Rect {
+            x: body[0].x + 2,
+            y: body[0].y + 3,
+            width: body[0].width.saturating_sub(4),
+            height: body[0].height.saturating_sub(4),
+        };
+        let empty = Paragraph::new(empty_lines);
+        frame.render_widget(empty, inner);
+    }
 
     // Task detail (right side)
     let detail_lines = if let Some(task) = app.tasks.get(app.task_selected) {
