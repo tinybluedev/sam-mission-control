@@ -591,11 +591,15 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
     print_step(3, TOTAL, "Distributing SSH public key...");
     std::io::stdout().flush().ok();
     let home_dir = dirs::home_dir().unwrap_or_default();
-    let key_candidates = [
+    let mut key_candidates = Vec::new();
+    if let Ok(preferred) = std::env::var("SAM_SSH_PUBKEY") {
+        key_candidates.push(std::path::PathBuf::from(preferred));
+    }
+    key_candidates.extend([
         home_dir.join(".ssh/id_ed25519.pub"),
         home_dir.join(".ssh/id_rsa.pub"),
         home_dir.join(".ssh/id_ecdsa.pub"),
-    ];
+    ]);
     let pub_key = key_candidates.iter().find_map(|p| std::fs::read_to_string(p).ok());
     if let Some(key) = pub_key {
         let key = key.trim().to_string();
@@ -948,13 +952,164 @@ pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Resul
 }
 
 
+#[derive(Debug, Default)]
+struct InitSystemScan {
+    ssh_pub_keys: Vec<String>,
+    tailscale_ips: Vec<String>,
+    open_ports: Vec<u16>,
+    openclaw_version: Option<String>,
+}
+
+fn dedup_keep_order<T: Clone + Eq + std::hash::Hash>(items: Vec<T>) -> Vec<T> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if seen.insert(item.clone()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn parse_ipv4_candidates(raw: &str) -> Vec<String> {
+    raw.split_whitespace()
+        .filter_map(|token| token.parse::<std::net::Ipv4Addr>().ok().map(|ip| ip.to_string()))
+        .collect()
+}
+
+fn parse_open_ports(raw: &str) -> Vec<u16> {
+    use std::collections::BTreeSet;
+    let mut ports = BTreeSet::new();
+    for token in raw.split_whitespace() {
+        if let Some((_, tail)) = token.rsplit_once(':') {
+            let digits = tail.trim_matches(|c: char| !c.is_ascii_digit());
+            if let Ok(port) = digits.parse::<u16>() {
+                if port > 0 {
+                    ports.insert(port);
+                }
+            }
+        }
+    }
+    ports.into_iter().collect()
+}
+
+fn run_local_cmd(bin: &str, args: &[&str]) -> Option<String> {
+    std::process::Command::new(bin).args(args).output().ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+fn scan_init_system() -> InitSystemScan {
+    let mut scan = InitSystemScan::default();
+
+    if let Some(home) = dirs::home_dir() {
+        let ssh_dir = home.join(".ssh");
+        if let Ok(entries) = std::fs::read_dir(&ssh_dir) {
+            let mut keys: Vec<String> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("pub"))
+                .map(|p| p.display().to_string())
+                .collect();
+            keys.sort();
+            scan.ssh_pub_keys = keys;
+        }
+    }
+
+    let mut ips = Vec::new();
+    if let Some(ts_ips) = run_local_cmd("tailscale", &["ip", "-4"]) {
+        ips.extend(parse_ipv4_candidates(&ts_ips));
+    }
+    if let Some(host_ips) = run_local_cmd("hostname", &["-I"]) {
+        ips.extend(parse_ipv4_candidates(&host_ips));
+    }
+    scan.tailscale_ips = dedup_keep_order(ips);
+
+    let open_ports_raw = run_local_cmd("ss", &["-ltnH"])
+        .or_else(|| run_local_cmd("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN"]))
+        .or_else(|| run_local_cmd("netstat", &["-lnt"]));
+    if let Some(raw) = open_ports_raw {
+        scan.open_ports = parse_open_ports(&raw);
+    }
+
+    scan.openclaw_version = run_local_cmd("openclaw", &["--version"]);
+    scan
+}
+
+fn pick_detected_text(label: &str, detected: &[String], fallback: &str) -> String {
+    use std::io::{self, Write};
+    if detected.is_empty() {
+        print!("  {} [{}]: ", label, fallback);
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return fallback.to_string();
+        }
+        let value = input.trim();
+        return if value.is_empty() { fallback.to_string() } else { value.to_string() };
+    }
+
+    println!("  {} (detected):", label);
+    for (idx, value) in detected.iter().enumerate() {
+        println!("    {}) {}", idx + 1, value);
+    }
+    print!("  Select {} [1]: ", label.to_lowercase());
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return detected.first().cloned().unwrap_or_else(|| fallback.to_string());
+    }
+    let idx = input.trim().parse::<usize>().unwrap_or(1);
+    detected.get(idx.saturating_sub(1))
+        .or_else(|| detected.first())
+        .cloned()
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn pick_detected_port(label: &str, detected: &[u16], fallback: u16) -> u16 {
+    let options: Vec<String> = detected.iter().map(|p| p.to_string()).collect();
+    pick_detected_text(label, &options, &fallback.to_string())
+        .parse::<u16>()
+        .unwrap_or(fallback)
+}
+
 /// Full automated init — creates everything from scratch
 pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Option<&str>, db_pass: Option<&str>, db_name: Option<&str>, self_ip: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use mysql_async::prelude::*;
     use std::io::{self, Write};
+    const DEFAULT_MYSQL_PORT: u16 = 3306;
 
-        println!("\n   {} {}\n", c_bold_cyan("🩺"), c_bold("Fleet Doctor"));
+    println!("\n   {} {}\n", c_bold_cyan("🩺"), c_bold("Fleet Doctor"));
     print_divider();
+    println!();
+
+    println!("  {} Running live startup scan...", c_bold_cyan("🛰️"));
+    let scan = scan_init_system();
+    println!(
+        "    {} SSH keys: {}",
+        c_dim("•"),
+        if scan.ssh_pub_keys.is_empty() { "none found".to_string() } else { scan.ssh_pub_keys.join(", ") }
+    );
+    println!(
+        "    {} Tailscale/IP candidates: {}",
+        c_dim("•"),
+        if scan.tailscale_ips.is_empty() { "none detected".to_string() } else { scan.tailscale_ips.join(", ") }
+    );
+    println!(
+        "    {} OpenClaw: {}",
+        c_dim("•"),
+        scan.openclaw_version.clone().unwrap_or_else(|| "not installed locally".to_string())
+    );
+    println!(
+        "    {} Open ports: {}",
+        c_dim("•"),
+        if scan.open_ports.is_empty() {
+            "none detected".to_string()
+        } else {
+            scan.open_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+        }
+    );
     println!();
 
     let prompt = |label: &str, default: &str| -> String {
@@ -968,9 +1123,25 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         if v.is_empty() { default.to_string() } else { v }
     };
 
+    let env_path = std::path::Path::new(".env");
+    let selected_ssh_pubkey = if env_path.exists() {
+        None
+    } else {
+        scan.ssh_pub_keys.first().map(|first| {
+            pick_detected_text("SSH public key for onboarding", &scan.ssh_pub_keys, first)
+        })
+    };
+    let mut db_host_choices = vec!["127.0.0.1".to_string()];
+    db_host_choices.extend(scan.tailscale_ips.clone());
+    db_host_choices = dedup_keep_order(db_host_choices);
+    let mut db_port_choices = scan.open_ports.clone();
+    if !db_port_choices.contains(&DEFAULT_MYSQL_PORT) {
+        db_port_choices.insert(0, DEFAULT_MYSQL_PORT);
+    }
+
     // Interactive prompts for missing values
-    let db_host = db_host.map(|s| s.to_string()).unwrap_or_else(|| prompt("MySQL host", "127.0.0.1"));
-    let db_port = db_port.unwrap_or_else(|| prompt("MySQL port", "3306").parse().unwrap_or(3306));
+    let db_host = db_host.map(|s| s.to_string()).unwrap_or_else(|| pick_detected_text("MySQL host", &db_host_choices, "127.0.0.1"));
+    let db_port = db_port.unwrap_or_else(|| pick_detected_port("MySQL port", &db_port_choices, DEFAULT_MYSQL_PORT));
     let db_user = db_user.map(|s| s.to_string()).unwrap_or_else(|| prompt("MySQL user", "root"));
     let db_pass = db_pass.map(|s| s.to_string()).unwrap_or_else(|| {
         print!("  MySQL password: ");
@@ -983,10 +1154,14 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
     });
     let db_name = db_name.map(|s| s.to_string()).unwrap_or_else(|| prompt("Database name", "sam_fleet"));
     let self_ip = self_ip.map(|s| s.to_string()).unwrap_or_else(|| {
-        let detected = std::process::Command::new("hostname").arg("-I").output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("127.0.0.1").to_string())
-            .unwrap_or_else(|_| "127.0.0.1".into());
-        prompt("This machine's IP", &detected)
+        let detected = scan.tailscale_ips.first().cloned()
+            .or_else(|| run_local_cmd("hostname", &["-I"]).and_then(|o| parse_ipv4_candidates(&o).first().cloned()))
+            .unwrap_or_else(|| "127.0.0.1".into());
+        let mut ip_choices = scan.tailscale_ips.clone();
+        if !ip_choices.contains(&detected) {
+            ip_choices.insert(0, detected.clone());
+        }
+        pick_detected_text("This machine's IP", &ip_choices, &detected)
     });
 
     println!();
@@ -1083,12 +1258,15 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
     cfg.save()?;
 
     // Also write .env
-    let env_path = std::path::Path::new(".env");
     if !env_path.exists() {
-        std::fs::write(env_path, format!(
+        let mut env_content = format!(
             "SAM_DB_URL={}\nSAM_SELF_IP={}\nSAM_USER={}\n",
             url, self_ip, cfg.identity.user,
-        ))?;
+        );
+        if let Some(key_path) = selected_ssh_pubkey {
+            env_content.push_str(&format!("SAM_SSH_PUBKEY={}\n", key_path));
+        }
+        std::fs::write(env_path, env_content)?;
     }
     println!("✅ ~/.config/sam/config.toml");
 
@@ -1609,7 +1787,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{doctor_exit_code, parse_semver};
+    use super::{doctor_exit_code, parse_ipv4_candidates, parse_open_ports, parse_semver};
 
     #[test]
     fn parse_semver_extracts_version_token() {
@@ -1622,6 +1800,18 @@ mod cli_tests {
         assert_eq!(doctor_exit_code(4, 0, 0), 0);
         assert_eq!(doctor_exit_code(4, 1, 2), 1);
         assert_eq!(doctor_exit_code(4, 3, 3), 2);
+    }
+
+    #[test]
+    fn parse_ipv4_candidates_filters_non_ipv4_tokens() {
+        let parsed = parse_ipv4_candidates("100.64.0.2 127.0.0.1 not-an-ip");
+        assert_eq!(parsed, vec!["100.64.0.2".to_string(), "127.0.0.1".to_string()]);
+    }
+
+    #[test]
+    fn parse_open_ports_extracts_unique_ports() {
+        let parsed = parse_open_ports("LISTEN 0 128 0.0.0.0:22\nLISTEN 0 128 [::]:3306\nLISTEN 0 128 127.0.0.1:22");
+        assert_eq!(parsed, vec![22, 3306]);
     }
 }
 
