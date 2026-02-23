@@ -4383,10 +4383,14 @@ PY"#, escaped_model);
                     status: DiagStatus::Running,
                     detail: "installing...".into(),
                 });
+                // Smart install: use sudo only if npm prefix is a system dir, not user home
                 let install_cmd = if is_mac {
                     format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx)
                 } else {
-                    "sudo npm install -g openclaw@latest 2>&1 | tail -1".into()
+                    format!(
+                        "{}PREFIX=$(npm config get prefix 2>/dev/null); if echo "$PREFIX" | grep -qE '^/home/|^/Users/|.npm'; then npm install -g openclaw@latest 2>&1 | tail -1; else sudo npm install -g openclaw@latest 2>&1 | tail -1; fi",
+                        pfx
+                    )
                 };
                 let _ = tokio::time::timeout(
                     Duration::from_secs(120),
@@ -5056,7 +5060,11 @@ PY"#, escaped_model);
                 let npm_cmd = if is_mac {
                     format!("{}npm install -g openclaw@latest 2>&1", pfx)
                 } else {
-                    "sudo npm install -g openclaw@latest 2>&1".into()
+                    // Smart: no sudo if npm prefix is user-owned
+                    format!(
+                        "{}PREFIX=$(npm config get prefix 2>/dev/null); if echo "$PREFIX" | grep -qE '^/home/|^/Users/|.npm'; then npm install -g openclaw@latest 2>&1; else sudo npm install -g openclaw@latest 2>&1; fi",
+                        pfx
+                    )
                 };
                 let install_out = tokio::time::timeout(Duration::from_secs(120),
                     Command::new("ssh").args(ssh_args(&npm_cmd)).output()
