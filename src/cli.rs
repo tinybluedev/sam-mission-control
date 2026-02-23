@@ -15,27 +15,57 @@
 //! - [`Commands::Validate`] — validate remote openclaw.json schema
 //! - [`Commands::Version`] — print the binary version
 
+use crate::validate;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use crate::validate;
 
 // ── ANSI Color Helpers ──────────────────────────────────────────
-fn c_cyan(s: &str) -> String { format!("\x1b[36m{}\x1b[0m", s) }
-fn c_green(s: &str) -> String { format!("\x1b[32m{}\x1b[0m", s) }
-fn c_red(s: &str) -> String { format!("\x1b[31m{}\x1b[0m", s) }
-fn c_yellow(s: &str) -> String { format!("\x1b[33m{}\x1b[0m", s) }
-fn c_magenta(s: &str) -> String { format!("\x1b[35m{}\x1b[0m", s) }
-fn c_bold(s: &str) -> String { format!("\x1b[1m{}\x1b[0m", s) }
-fn c_dim(s: &str) -> String { format!("\x1b[2m{}\x1b[0m", s) }
-fn c_bold_cyan(s: &str) -> String { format!("\x1b[1;36m{}\x1b[0m", s) }
-fn c_bold_green(s: &str) -> String { format!("\x1b[1;32m{}\x1b[0m", s) }
-fn c_bold_red(s: &str) -> String { format!("\x1b[1;31m{}\x1b[0m", s) }
-fn c_bold_yellow(s: &str) -> String { format!("\x1b[1;33m{}\x1b[0m", s) }
-fn c_bold_magenta(s: &str) -> String { format!("\x1b[1;35m{}\x1b[0m", s) }
-fn c_bg_green(s: &str) -> String { format!("\x1b[42;30m {}  \x1b[0m", s) }
-fn c_bg_red(s: &str) -> String { format!("\x1b[41;37m {}  \x1b[0m", s) }
-fn c_bg_cyan(s: &str) -> String { format!("\x1b[46;30m {}  \x1b[0m", s) }
+fn c_cyan(s: &str) -> String {
+    format!("\x1b[36m{}\x1b[0m", s)
+}
+fn c_green(s: &str) -> String {
+    format!("\x1b[32m{}\x1b[0m", s)
+}
+fn c_red(s: &str) -> String {
+    format!("\x1b[31m{}\x1b[0m", s)
+}
+fn c_yellow(s: &str) -> String {
+    format!("\x1b[33m{}\x1b[0m", s)
+}
+fn c_magenta(s: &str) -> String {
+    format!("\x1b[35m{}\x1b[0m", s)
+}
+fn c_bold(s: &str) -> String {
+    format!("\x1b[1m{}\x1b[0m", s)
+}
+fn c_dim(s: &str) -> String {
+    format!("\x1b[2m{}\x1b[0m", s)
+}
+fn c_bold_cyan(s: &str) -> String {
+    format!("\x1b[1;36m{}\x1b[0m", s)
+}
+fn c_bold_green(s: &str) -> String {
+    format!("\x1b[1;32m{}\x1b[0m", s)
+}
+fn c_bold_red(s: &str) -> String {
+    format!("\x1b[1;31m{}\x1b[0m", s)
+}
+fn c_bold_yellow(s: &str) -> String {
+    format!("\x1b[1;33m{}\x1b[0m", s)
+}
+fn c_bold_magenta(s: &str) -> String {
+    format!("\x1b[1;35m{}\x1b[0m", s)
+}
+fn c_bg_green(s: &str) -> String {
+    format!("\x1b[42;30m {}  \x1b[0m", s)
+}
+fn c_bg_red(s: &str) -> String {
+    format!("\x1b[41;37m {}  \x1b[0m", s)
+}
+fn c_bg_cyan(s: &str) -> String {
+    format!("\x1b[46;30m {}  \x1b[0m", s)
+}
 
 const BANNER: &str = r#"
 
@@ -51,16 +81,22 @@ fn print_banner() {
 }
 
 fn print_divider() {
-    println!("   {}",c_dim("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    println!(
+        "   {}",
+        c_dim("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    );
 }
 
 fn print_step(n: usize, total: usize, msg: &str) {
     print!("   {} {} ", c_bold_cyan(&format!("[{}/{}]", n, total)), msg);
 }
 
-
 #[derive(Parser)]
-#[command(name = "sam", version, about = "S.A.M Mission Control — Fleet orchestration TUI")]
+#[command(
+    name = "sam",
+    version,
+    about = "S.A.M Mission Control — Fleet orchestration TUI"
+)]
 pub struct Cli {
     /// Path to config file
     #[arg(short, long, global = true)]
@@ -194,7 +230,14 @@ pub struct DatabaseConfig {
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
-        Self { url: None, host: None, port: None, user: None, password: None, database: None }
+        Self {
+            url: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            database: None,
+        }
     }
 }
 
@@ -215,14 +258,28 @@ pub struct TuiConfig {
 
 impl Default for TuiConfig {
     fn default() -> Self {
-        Self { theme: default_theme(), background: default_bg(), refresh_interval: default_refresh(), chat_poll_interval: default_chat_poll(), vim_mode: false }
+        Self {
+            theme: default_theme(),
+            background: default_bg(),
+            refresh_interval: default_refresh(),
+            chat_poll_interval: default_chat_poll(),
+            vim_mode: false,
+        }
     }
 }
 
-fn default_theme() -> String { "standard".into() }
-fn default_bg() -> String { "dark".into() }
-fn default_refresh() -> u64 { 30 }
-fn default_chat_poll() -> u64 { 3 }
+fn default_theme() -> String {
+    "standard".into()
+}
+fn default_bg() -> String {
+    "dark".into()
+}
+fn default_refresh() -> u64 {
+    30
+}
+fn default_chat_poll() -> u64 {
+    3
+}
 
 /// Fleet config path override from `[fleet]` in `config.toml`.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -238,10 +295,16 @@ pub struct IdentityConfig {
 }
 
 impl Default for IdentityConfig {
-    fn default() -> Self { Self { user: default_user() } }
+    fn default() -> Self {
+        Self {
+            user: default_user(),
+        }
+    }
 }
 
-fn default_user() -> String { "operator".into() }
+fn default_user() -> String {
+    "operator".into()
+}
 
 impl SamConfig {
     /// Load config from file, or return defaults
@@ -258,7 +321,9 @@ impl SamConfig {
         // Default paths
         let candidates = vec![
             PathBuf::from("config.toml"),
-            dirs::config_dir().unwrap_or_default().join("sam/config.toml"),
+            dirs::config_dir()
+                .unwrap_or_default()
+                .join("sam/config.toml"),
         ];
 
         for p in candidates {
@@ -299,19 +364,29 @@ impl SamConfig {
                 }
             }
             if let Some(h) = &self.database.host {
-                if std::env::var("SAM_DB_HOST").is_err() { std::env::set_var("SAM_DB_HOST", h); }
+                if std::env::var("SAM_DB_HOST").is_err() {
+                    std::env::set_var("SAM_DB_HOST", h);
+                }
             }
             if let Some(p) = &self.database.port {
-                if std::env::var("SAM_DB_PORT").is_err() { std::env::set_var("SAM_DB_PORT", p.to_string()); }
+                if std::env::var("SAM_DB_PORT").is_err() {
+                    std::env::set_var("SAM_DB_PORT", p.to_string());
+                }
             }
             if let Some(u) = &self.database.user {
-                if std::env::var("SAM_DB_USER").is_err() { std::env::set_var("SAM_DB_USER", u); }
+                if std::env::var("SAM_DB_USER").is_err() {
+                    std::env::set_var("SAM_DB_USER", u);
+                }
             }
             if let Some(p) = &self.database.password {
-                if std::env::var("SAM_DB_PASS").is_err() { std::env::set_var("SAM_DB_PASS", p); }
+                if std::env::var("SAM_DB_PASS").is_err() {
+                    std::env::set_var("SAM_DB_PASS", p);
+                }
             }
             if let Some(d) = &self.database.database {
-                if std::env::var("SAM_DB_NAME").is_err() { std::env::set_var("SAM_DB_NAME", d); }
+                if std::env::var("SAM_DB_NAME").is_err() {
+                    std::env::set_var("SAM_DB_NAME", d);
+                }
             }
             if std::env::var("SAM_USER").is_err() {
                 std::env::set_var("SAM_USER", &self.identity.user);
@@ -370,21 +445,33 @@ pub fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let host = input.trim();
-    cfg.database.host = Some(if host.is_empty() { "127.0.0.1".into() } else { host.into() });
+    cfg.database.host = Some(if host.is_empty() {
+        "127.0.0.1".into()
+    } else {
+        host.into()
+    });
 
     input.clear();
     print!("  MySQL port [3306]: ");
     io::stdout().flush()?;
     io::stdin().read_line(&mut input)?;
     let port = input.trim();
-    cfg.database.port = Some(if port.is_empty() { 3306 } else { port.parse().unwrap_or(3306) });
+    cfg.database.port = Some(if port.is_empty() {
+        3306
+    } else {
+        port.parse().unwrap_or(3306)
+    });
 
     input.clear();
     print!("  MySQL user [root]: ");
     io::stdout().flush()?;
     io::stdin().read_line(&mut input)?;
     let user = input.trim();
-    cfg.database.user = Some(if user.is_empty() { "root".into() } else { user.into() });
+    cfg.database.user = Some(if user.is_empty() {
+        "root".into()
+    } else {
+        user.into()
+    });
 
     input.clear();
     print!("  MySQL password: ");
@@ -397,7 +484,11 @@ pub fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
     io::stdout().flush()?;
     io::stdin().read_line(&mut input)?;
     let db = input.trim();
-    cfg.database.database = Some(if db.is_empty() { "sam_fleet".into() } else { db.into() });
+    cfg.database.database = Some(if db.is_empty() {
+        "sam_fleet".into()
+    } else {
+        db.into()
+    });
 
     // Identity
     println!("\n━━━ Identity ━━━");
@@ -406,7 +497,11 @@ pub fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
     io::stdout().flush()?;
     io::stdin().read_line(&mut input)?;
     let name = input.trim();
-    cfg.identity.user = if name.is_empty() { "operator".into() } else { name.into() };
+    cfg.identity.user = if name.is_empty() {
+        "operator".into()
+    } else {
+        name.into()
+    };
 
     // Theme
     println!("\n━━━ Theme ━━━");
@@ -416,13 +511,19 @@ pub fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
     io::stdout().flush()?;
     io::stdin().read_line(&mut input)?;
     let theme = input.trim();
-    cfg.tui.theme = if theme.is_empty() { "standard".into() } else { theme.into() };
+    cfg.tui.theme = if theme.is_empty() {
+        "standard".into()
+    } else {
+        theme.into()
+    };
 
     // Save
     println!();
     match cfg.save() {
         Ok(_) => {
-            let path = dirs::config_dir().unwrap_or_default().join("sam/config.toml");
+            let path = dirs::config_dir()
+                .unwrap_or_default()
+                .join("sam/config.toml");
             println!("✅ Config saved to {}", path.display());
             println!("   Permissions set to 0600 (owner read/write only)");
             println!("\n   Run `sam` to launch Mission Control.");
@@ -441,21 +542,40 @@ pub async fn print_status() -> Result<(), Box<dyn std::error::Error>> {
     print_banner();
     println!();
     print_divider();
-    println!("   {:<22} {:<14} {:<18} {}", c_bold("Agent"), c_bold("Status"), c_bold("Version"), c_bold("IP"));
+    println!(
+        "   {:<22} {:<14} {:<18} {}",
+        c_bold("Agent"),
+        c_bold("Status"),
+        c_bold("Version"),
+        c_bold("IP")
+    );
     print_divider();
 
     let mut online = 0;
     for a in &agents {
         let (icon, status_str) = match a.status.as_str() {
-            "online" => { online += 1; (c_green("●"), c_green("online")) },
-            "busy" => { online += 1; (c_yellow("◉"), c_yellow("busy")) },
+            "online" => {
+                online += 1;
+                (c_green("●"), c_green("online"))
+            }
+            "busy" => {
+                online += 1;
+                (c_yellow("◉"), c_yellow("busy"))
+            }
             "offline" => (c_red("○"), c_red("offline")),
             "error" => (c_bold_red("✖"), c_bold_red("error")),
             _ => (c_dim("?"), c_dim("unknown")),
         };
         let ver = a.oc_version.as_deref().unwrap_or("?");
-        let ver_str = if ver.starts_with("2026.2.21") { c_green(ver) } else if ver == "?" { c_dim(ver) } else { c_yellow(ver) };
-        println!("   {:<20} {} {:<22} {:<26} {}",
+        let ver_str = if ver.starts_with("2026.2.21") {
+            c_green(ver)
+        } else if ver == "?" {
+            c_dim(ver)
+        } else {
+            c_yellow(ver)
+        };
+        println!(
+            "   {:<20} {} {:<22} {:<26} {}",
             c_cyan(&a.agent_name),
             icon,
             status_str,
@@ -466,9 +586,18 @@ pub async fn print_status() -> Result<(), Box<dyn std::error::Error>> {
 
     print_divider();
     let summary = if online == agents.len() {
-        c_bold_green(&format!("   ✔ {}/{} online — all systems nominal", online, agents.len()))
+        c_bold_green(&format!(
+            "   ✔ {}/{} online — all systems nominal",
+            online,
+            agents.len()
+        ))
     } else {
-        c_bold_yellow(&format!("   ⚠ {}/{} online — {} offline", online, agents.len(), agents.len() - online))
+        c_bold_yellow(&format!(
+            "   ⚠ {}/{} online — {} offline",
+            online,
+            agents.len(),
+            agents.len() - online
+        ))
     };
     println!("{}\n", summary);
 
@@ -478,8 +607,7 @@ pub async fn print_status() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Send a chat message and wait for response (non-TUI)
 pub async fn send_chat(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
-    validate::validate_agent_name(agent)
-        .map_err(|e| format!("Invalid agent name: {}", e))?;
+    validate::validate_agent_name(agent).map_err(|e| format!("Invalid agent name: {}", e))?;
     let message = validate::sanitize_chat_message(message);
     if message.is_empty() {
         return Err("Message must not be empty".into());
@@ -508,7 +636,6 @@ pub async fn send_chat(agent: &str, message: &str) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-
 /// Onboard a new agent on a remote machine — full 10-step provisioning flow.
 ///
 /// Steps:
@@ -527,18 +654,19 @@ pub async fn send_chat(agent: &str, message: &str) -> Result<(), Box<dyn std::er
 ///
 /// Rollback: if steps 5–10 fail after OpenClaw has been installed, it is
 /// automatically removed before exiting.
-pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::process::Command;
-    use std::time::Duration;
+pub async fn run_onboard(
+    host: &str,
+    user: &str,
+    name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use crate::shell;
+    use std::time::Duration;
+    use tokio::process::Command;
 
-    validate::validate_ip_address(host)
-        .map_err(|e| format!("Invalid host: {}", e))?;
-    validate::validate_ssh_username(user)
-        .map_err(|e| format!("Invalid SSH user: {}", e))?;
+    validate::validate_ip_address(host).map_err(|e| format!("Invalid host: {}", e))?;
+    validate::validate_ssh_username(user).map_err(|e| format!("Invalid SSH user: {}", e))?;
     if let Some(n) = name {
-        validate::normalize_agent_name(n)
-            .map_err(|e| format!("Invalid agent name: {}", e))?;
+        validate::normalize_agent_name(n).map_err(|e| format!("Invalid agent name: {}", e))?;
     }
 
     const TOTAL: usize = 11;
@@ -551,10 +679,14 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
     let ssh_target = format!("{}@{}", user, host);
     let ssh_args = |cmd: &str| -> Vec<String> {
         vec![
-            "-o".into(), "ConnectTimeout=5".into(),
-            "-o".into(), "StrictHostKeyChecking=no".into(),
-            "-o".into(), "BatchMode=yes".into(),
-            ssh_target.clone(), cmd.into(),
+            "-o".into(),
+            "ConnectTimeout=5".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=no".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            ssh_target.clone(),
+            cmd.into(),
         ]
     };
 
@@ -562,16 +694,21 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
     print_step(1, TOTAL, "Testing SSH connection...");
     use std::io::Write;
     std::io::stdout().flush().ok();
-    let ssh_test = tokio::time::timeout(Duration::from_secs(8),
-        Command::new("ssh").args(ssh_args("hostname")).output()
-    ).await;
+    let ssh_test = tokio::time::timeout(
+        Duration::from_secs(8),
+        Command::new("ssh").args(ssh_args("hostname")).output(),
+    )
+    .await;
     match ssh_test {
         Ok(Ok(o)) if o.status.success() => {
             let hostname = String::from_utf8_lossy(&o.stdout).trim().to_string();
             println!("{}", c_bold_green(&format!("✅ {}", hostname)));
         }
         _ => {
-            println!("{}", c_bold_red(&format!("❌ Cannot reach {}@{}", user, host)));
+            println!(
+                "{}",
+                c_bold_red(&format!("❌ Cannot reach {}@{}", user, host))
+            );
             return Err("SSH connection failed — check host and key-based auth".into());
         }
     }
@@ -583,20 +720,31 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
         ". /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\" || sw_vers -productName 2>/dev/null || uname -s"
     )).output().await?;
     let os_name = String::from_utf8_lossy(&os_out.stdout).trim().to_string();
-    let is_mac = os_name.to_lowercase().contains("mac") || os_name.to_lowercase().contains("darwin");
-    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+    let is_mac =
+        os_name.to_lowercase().contains("mac") || os_name.to_lowercase().contains("darwin");
+    let pfx = if is_mac {
+        "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
+    } else {
+        ""
+    };
     println!("{}", c_bold_green(&format!("✅ {}", os_name)));
 
     // ── Step 3: Distribute SSH public key (optional) ─────────────────────
     print_step(3, TOTAL, "Distributing SSH public key...");
     std::io::stdout().flush().ok();
     let home_dir = dirs::home_dir().unwrap_or_default();
-    let key_candidates = [
+    let mut key_candidates = Vec::new();
+    if let Ok(preferred) = std::env::var("SAM_SSH_PUBKEY") {
+        key_candidates.push(std::path::PathBuf::from(preferred));
+    }
+    key_candidates.extend([
         home_dir.join(".ssh/id_ed25519.pub"),
         home_dir.join(".ssh/id_rsa.pub"),
         home_dir.join(".ssh/id_ecdsa.pub"),
-    ];
-    let pub_key = key_candidates.iter().find_map(|p| std::fs::read_to_string(p).ok());
+    ]);
+    let pub_key = key_candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok());
     if let Some(key) = pub_key {
         let key = key.trim().to_string();
         let install_key_cmd = format!(
@@ -605,7 +753,10 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
                || echo {k} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
             k = shell::escape(&key),
         );
-        let key_out = Command::new("ssh").args(ssh_args(&install_key_cmd)).output().await;
+        let key_out = Command::new("ssh")
+            .args(ssh_args(&install_key_cmd))
+            .output()
+            .await;
         match key_out {
             Ok(o) if o.status.success() => println!("{}", c_green("✅ public key installed")),
             _ => println!("{}", c_yellow("⚠️  could not install key — continuing")),
@@ -618,7 +769,10 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
     print_step(4, TOTAL, "Checking Node.js...");
     std::io::stdout().flush().ok();
     let node_check = format!("{}node --version 2>/dev/null || echo NOT_FOUND", pfx);
-    let node_out = Command::new("ssh").args(ssh_args(&node_check)).output().await?;
+    let node_out = Command::new("ssh")
+        .args(ssh_args(&node_check))
+        .output()
+        .await?;
     let node_ver = String::from_utf8_lossy(&node_out.stdout).trim().to_string();
     if node_ver.contains("NOT_FOUND") || node_ver.is_empty() {
         println!("{}", c_yellow("⚠️  not found — installing via NodeSource"));
@@ -630,10 +784,15 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
             "curl -fsSL https://rpm.nodesource.com/setup_lts.x | sudo bash - 2>&1 | tail -3 && sudo dnf install -y nodejs 2>&1 | tail -3 \
              || curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo bash - 2>&1 | tail -3 && sudo apt-get install -y nodejs 2>&1 | tail -3".into()
         };
-        let _ = tokio::time::timeout(Duration::from_secs(120),
-            Command::new("ssh").args(ssh_args(&install_node)).output()
-        ).await;
-        let recheck = Command::new("ssh").args(ssh_args(&node_check)).output().await?;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(120),
+            Command::new("ssh").args(ssh_args(&install_node)).output(),
+        )
+        .await;
+        let recheck = Command::new("ssh")
+            .args(ssh_args(&node_check))
+            .output()
+            .await?;
         let new_ver = String::from_utf8_lossy(&recheck.stdout).trim().to_string();
         if new_ver.contains("NOT_FOUND") || new_ver.is_empty() {
             println!("{}", c_bold_red("❌ Node.js install failed"));
@@ -647,21 +806,34 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
     // ── Step 5: Check / install OpenClaw ─────────────────────────────────
     print_step(5, TOTAL, "Checking OpenClaw...");
     std::io::stdout().flush().ok();
-    let oc_check = format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx);
-    let oc_out = Command::new("ssh").args(ssh_args(&oc_check)).output().await?;
+    let oc_check = format!(
+        "{}openclaw --version 2>/dev/null || echo NOT_INSTALLED",
+        pfx
+    );
+    let oc_out = Command::new("ssh")
+        .args(ssh_args(&oc_check))
+        .output()
+        .await?;
     let oc_ver = String::from_utf8_lossy(&oc_out.stdout).trim().to_string();
     let mut oc_installed_by_us = false;
     if oc_ver.contains("NOT_INSTALLED") || oc_ver.is_empty() {
-        println!("{}", c_yellow("⚠️  not installed — running npm install -g openclaw@latest"));
+        println!(
+            "{}",
+            c_yellow("⚠️  not installed — running npm install -g openclaw@latest")
+        );
         let npm_cmd = if is_mac {
             format!("{}npm install -g openclaw@latest 2>&1 | tail -3", pfx)
         } else {
             "sudo npm install -g openclaw@latest 2>&1 | tail -3".into()
         };
-        let install_out = tokio::time::timeout(Duration::from_secs(120),
-            Command::new("ssh").args(ssh_args(&npm_cmd)).output()
-        ).await;
-        let install_ok = install_out.as_ref().ok()
+        let install_out = tokio::time::timeout(
+            Duration::from_secs(120),
+            Command::new("ssh").args(ssh_args(&npm_cmd)).output(),
+        )
+        .await;
+        let install_ok = install_out
+            .as_ref()
+            .ok()
             .and_then(|r| r.as_ref().ok())
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -670,7 +842,10 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
             return Err("OpenClaw installation failed".into());
         }
         oc_installed_by_us = true;
-        let recheck = Command::new("ssh").args(ssh_args(&oc_check)).output().await?;
+        let recheck = Command::new("ssh")
+            .args(ssh_args(&oc_check))
+            .output()
+            .await?;
         let new_ver = String::from_utf8_lossy(&recheck.stdout).trim().to_string();
         println!("{}", c_bold_green(&format!("✅ installed {}", new_ver)));
     } else {
@@ -682,12 +857,22 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
         if oc_installed {
             use tokio::process::Command;
             eprintln!("  ⏪ Rolling back: uninstalling openclaw...");
-            let result = tokio::time::timeout(std::time::Duration::from_secs(30),
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
                 Command::new("ssh")
-                    .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                        ssh_target, &format!("{}sudo npm uninstall -g openclaw 2>/dev/null || true", pfx)])
-                    .output()
-            ).await;
+                    .args([
+                        "-o",
+                        "ConnectTimeout=5",
+                        "-o",
+                        "StrictHostKeyChecking=no",
+                        "-o",
+                        "BatchMode=yes",
+                        ssh_target,
+                        &format!("{}sudo npm uninstall -g openclaw 2>/dev/null || true", pfx),
+                    ])
+                    .output(),
+            )
+            .await;
             match result {
                 Ok(Ok(o)) if o.status.success() => eprintln!("  ✅ rollback: openclaw removed"),
                 Ok(Ok(o)) => eprintln!("  ⚠️  rollback: exit {}", o.status),
@@ -700,9 +885,11 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
     print_step(6, TOTAL, "Running openclaw init...");
     std::io::stdout().flush().ok();
     let init_cmd = format!("{}openclaw init --non-interactive 2>&1 | tail -5", pfx);
-    let init_out = tokio::time::timeout(Duration::from_secs(30),
-        Command::new("ssh").args(ssh_args(&init_cmd)).output()
-    ).await;
+    let init_out = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new("ssh").args(ssh_args(&init_cmd)).output(),
+    )
+    .await;
     match init_out {
         Ok(Ok(o)) if o.status.success() => println!("{}", c_green("✅ initialised")),
         Ok(Ok(o)) => {
@@ -710,7 +897,13 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
             if stderr.to_lowercase().contains("already") || stderr.is_empty() {
                 println!("{}", c_green("✅ already initialised"));
             } else {
-                println!("{}", c_yellow(&format!("⚠️  init warning (continuing): {}", stderr.chars().take(60).collect::<String>())));
+                println!(
+                    "{}",
+                    c_yellow(&format!(
+                        "⚠️  init warning (continuing): {}",
+                        stderr.chars().take(60).collect::<String>()
+                    ))
+                );
             }
         }
         _ => println!("{}", c_dim("⊘  init timed out — continuing")),
@@ -726,11 +919,28 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
     let agent_name = if let Some(n) = name {
         n.to_string()
     } else {
-        let hn_out = Command::new("ssh").args(ssh_args("hostname")).output().await?;
-        let raw = String::from_utf8_lossy(&hn_out.stdout).trim().to_lowercase()
-            .chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' }).collect::<String>();
+        let hn_out = Command::new("ssh")
+            .args(ssh_args("hostname"))
+            .output()
+            .await?;
+        let raw = String::from_utf8_lossy(&hn_out.stdout)
+            .trim()
+            .to_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
         // Collapse consecutive hyphens and trim leading/trailing hyphens
-        let collapsed = raw.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+        let collapsed = raw
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
         collapsed.trim_matches('-').to_string()
     };
 
@@ -757,7 +967,10 @@ print('ok')
         token = escaped_token,
         name = escaped_agent,
     );
-    let cfg_out = Command::new("ssh").args(ssh_args(&config_script)).output().await?;
+    let cfg_out = Command::new("ssh")
+        .args(ssh_args(&config_script))
+        .output()
+        .await?;
     let cfg_result = String::from_utf8_lossy(&cfg_out.stdout).trim().to_string();
     if cfg_result != "ok" {
         do_rollback(oc_installed_by_us, &ssh_target, pfx).await;
@@ -768,17 +981,28 @@ print('ok')
         "{}python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{{}}).get('port',18789))\"",
         pfx
     );
-    let port_out = Command::new("ssh").args(ssh_args(&port_cmd)).output().await?;
-    let port: i32 = String::from_utf8_lossy(&port_out.stdout).trim().parse().unwrap_or(18789);
-    println!("{}", c_bold_green(&format!("✅ bind=lan, chatCompletions, port={}", port)));
+    let port_out = Command::new("ssh")
+        .args(ssh_args(&port_cmd))
+        .output()
+        .await?;
+    let port: i32 = String::from_utf8_lossy(&port_out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(18789);
+    println!(
+        "{}",
+        c_bold_green(&format!("✅ bind=lan, chatCompletions, port={}", port))
+    );
 
     // ── Step 8: Start gateway ─────────────────────────────────────────────
     print_step(8, TOTAL, "Starting gateway...");
     std::io::stdout().flush().ok();
     let restart_cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
-    let _ = tokio::time::timeout(Duration::from_secs(15),
-        Command::new("ssh").args(ssh_args(&restart_cmd)).output()
-    ).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(15),
+        Command::new("ssh").args(ssh_args(&restart_cmd)).output(),
+    )
+    .await;
     println!("{}", c_green("✅ gateway restart requested"));
 
     // ── Step 9: Check / configure Tailscale ──────────────────────────────
@@ -788,21 +1012,42 @@ print('ok')
         "{}tailscale status --json 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('BackendState',''))\" || echo NOT_FOUND",
         pfx
     );
-    let ts_out = Command::new("ssh").args(ssh_args(&ts_cmd)).output().await.ok();
-    let ts_state = ts_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let ts_out = Command::new("ssh")
+        .args(ssh_args(&ts_cmd))
+        .output()
+        .await
+        .ok();
+    let ts_state = ts_out
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
     match ts_state.as_str() {
         "Running" => println!("{}", c_green("✅ Tailscale is running")),
         "NOT_FOUND" | "" => println!("{}", c_dim("⊘  Tailscale not installed — using direct IP")),
         other => {
             let ts_server = std::env::var("SAM_TAILSCALE_SERVER").unwrap_or_default();
             if !ts_server.is_empty() {
-                let ts_up_cmd = format!("{}sudo tailscale up --login-server={} 2>&1 | tail -3", pfx, shell::escape(&ts_server));
-                let _ = tokio::time::timeout(Duration::from_secs(30),
-                    Command::new("ssh").args(ssh_args(&ts_up_cmd)).output()
-                ).await;
-                println!("{}", c_yellow(&format!("🔧 ran tailscale up (was: {})", other)));
+                let ts_up_cmd = format!(
+                    "{}sudo tailscale up --login-server={} 2>&1 | tail -3",
+                    pfx,
+                    shell::escape(&ts_server)
+                );
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    Command::new("ssh").args(ssh_args(&ts_up_cmd)).output(),
+                )
+                .await;
+                println!(
+                    "{}",
+                    c_yellow(&format!("🔧 ran tailscale up (was: {})", other))
+                );
             } else {
-                println!("{}", c_yellow(&format!("⚠️  state={} — set SAM_TAILSCALE_SERVER to auto-join", other)));
+                println!(
+                    "{}",
+                    c_yellow(&format!(
+                        "⚠️  state={} — set SAM_TAILSCALE_SERVER to auto-join",
+                        other
+                    ))
+                );
             }
         }
     }
@@ -812,24 +1057,48 @@ print('ok')
     std::io::stdout().flush().ok();
     tokio::time::sleep(Duration::from_secs(3)).await;
     // SSH check
-    let ssh_ok = tokio::time::timeout(Duration::from_secs(6),
-        Command::new("ssh").args(ssh_args("echo ok")).output()
-    ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+    let ssh_ok = tokio::time::timeout(
+        Duration::from_secs(6),
+        Command::new("ssh").args(ssh_args("echo ok")).output(),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .map(|o| o.status.success())
+    .unwrap_or(false);
     // OC version
-    let oc_ver_out = Command::new("ssh").args(ssh_args(&format!("{}openclaw --version 2>/dev/null || echo unknown", pfx))).output().await.ok();
-    let final_oc_ver = oc_ver_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|| "unknown".into());
+    let oc_ver_out = Command::new("ssh")
+        .args(ssh_args(&format!(
+            "{}openclaw --version 2>/dev/null || echo unknown",
+            pfx
+        )))
+        .output()
+        .await
+        .ok();
+    let final_oc_ver = oc_ver_out
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
     // Gateway health
     let gw_url = format!("http://{}:{}/v1/models", host, port);
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
-    let gw_ok = client.get(&gw_url)
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let gw_ok = client
+        .get(&gw_url)
         .header("Authorization", format!("Bearer {}", token))
-        .send().await
+        .send()
+        .await
         .map(|r| r.status().is_success())
         .unwrap_or(false);
-    println!("  SSH: {}  OpenClaw: {}  Gateway: {}",
+    println!(
+        "  SSH: {}  OpenClaw: {}  Gateway: {}",
         if ssh_ok { c_green("✅") } else { c_red("✗") },
         c_green(&final_oc_ver),
-        if gw_ok { c_green("✅") } else { c_yellow("⚠ not yet responding") },
+        if gw_ok {
+            c_green("✅")
+        } else {
+            c_yellow("⚠ not yet responding")
+        },
     );
 
     // ── Step 11: Atomic DB registration ──────────────────────────────────
@@ -850,15 +1119,21 @@ print('ok')
            gateway_token=VALUES(gateway_token), \
            os_info=VALUES(os_info)",
         (&agent_name, host, final_status, port, &token, &os_name),
-    ).await?;
+    )
+    .await?;
     pool.disconnect().await?;
     println!("{}", c_bold_green("✅"));
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  {} added to fleet — all checks passed",
-        c_bold_green(&format!("✅ {} ({})", agent_name, os_name)));
+    println!(
+        "  {} added to fleet — all checks passed",
+        c_bold_green(&format!("✅ {} ({})", agent_name, os_name))
+    );
     println!("     Port: {}  |  Token: {}…", port, &token[..12]);
-    println!("     Run {} to see it in the fleet.\n", c_bold_cyan("`sam`"));
+    println!(
+        "     Run {} to see it in the fleet.\n",
+        c_bold_cyan("`sam`")
+    );
 
     Ok(())
 }
@@ -873,16 +1148,19 @@ fn random_hex_token(byte_len: usize) -> Result<String, Box<dyn std::error::Error
 }
 
 /// Deploy workspace file to agent(s)
-pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_deploy(
+    target: &str,
+    file: &str,
+    source: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::process::Command;
 
-    validate::validate_deploy_filename(file)
-        .map_err(|e| format!("Cannot deploy file: {}", e))?;
+    validate::validate_deploy_filename(file).map_err(|e| format!("Cannot deploy file: {}", e))?;
 
     // Resolve source file
-    let src_path = source.map(|s| s.to_string()).unwrap_or_else(|| {
-        format!("templates/{}", file)
-    });
+    let src_path = source
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("templates/{}", file));
 
     if !std::path::Path::new(&src_path).exists() {
         return Err(format!("Source file not found: {}", src_path).into());
@@ -912,15 +1190,27 @@ pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Resul
         // Determine workspace path
         let workspace_cmd = "python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('agents',{}).get('defaults',{}).get('workspace',os.path.expanduser('~/.openclaw/workspace')))\"";
 
-        let out = tokio::time::timeout(std::time::Duration::from_secs(5),
-            Command::new("ssh").args([
-                "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                &format!("admin@{}", ip), workspace_cmd
-            ]).output()
-        ).await;
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Command::new("ssh")
+                .args([
+                    "-o",
+                    "ConnectTimeout=3",
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "BatchMode=yes",
+                    &format!("admin@{}", ip),
+                    workspace_cmd,
+                ])
+                .output(),
+        )
+        .await;
 
         let workspace = match out {
-            Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Ok(Ok(o)) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
             _ => {
                 println!("❌ unreachable");
                 continue;
@@ -929,12 +1219,23 @@ pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Resul
 
         // SCP the file
         let dest = format!("admin@{}:{}/{}", ip, workspace, file);
-        let scp_out = tokio::time::timeout(std::time::Duration::from_secs(10),
-            Command::new("scp").args([
-                "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                "--", &src_path, &dest
-            ]).output()
-        ).await;
+        let scp_out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Command::new("scp")
+                .args([
+                    "-o",
+                    "ConnectTimeout=3",
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "BatchMode=yes",
+                    "--",
+                    &src_path,
+                    &dest,
+                ])
+                .output(),
+        )
+        .await;
 
         match scp_out {
             Ok(Ok(o)) if o.status.success() => println!("✅"),
@@ -947,14 +1248,203 @@ pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Resul
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct InitSystemScan {
+    ssh_pub_keys: Vec<String>,
+    tailscale_ips: Vec<String>,
+    open_ports: Vec<u16>,
+    openclaw_version: Option<String>,
+}
+
+fn dedup_keep_order<T: Clone + Eq + std::hash::Hash>(items: Vec<T>) -> Vec<T> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if seen.insert(item.clone()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn parse_ipv4_candidates(raw: &str) -> Vec<String> {
+    raw.split_whitespace()
+        .filter_map(|t| {
+            t.parse::<std::net::Ipv4Addr>()
+                .ok()
+                .map(|ip| ip.to_string())
+        })
+        .collect()
+}
+
+fn parse_open_ports(raw: &str) -> Vec<u16> {
+    use std::collections::BTreeSet;
+    let mut ports = BTreeSet::new();
+    for token in raw.split_whitespace() {
+        if let Some((_, tail)) = token.rsplit_once(':') {
+            let digits = tail.trim_matches(|c: char| !c.is_ascii_digit());
+            if let Ok(port) = digits.parse::<u16>() {
+                if port > 0 {
+                    ports.insert(port);
+                }
+            }
+        }
+    }
+    ports.into_iter().collect()
+}
+
+fn run_local_cmd(bin: &str, args: &[&str]) -> Option<String> {
+    std::process::Command::new(bin)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+fn scan_init_system() -> InitSystemScan {
+    let mut scan = InitSystemScan::default();
+
+    if let Some(home) = dirs::home_dir() {
+        let ssh_dir = home.join(".ssh");
+        if let Ok(entries) = std::fs::read_dir(&ssh_dir) {
+            let mut keys: Vec<String> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("pub"))
+                .map(|p| p.display().to_string())
+                .collect();
+            keys.sort();
+            scan.ssh_pub_keys = keys;
+        }
+    }
+
+    let mut ips = Vec::new();
+    if let Some(ts_ips) = run_local_cmd("tailscale", &["ip", "-4"]) {
+        ips.extend(parse_ipv4_candidates(&ts_ips));
+    }
+    if let Some(host_ips) = run_local_cmd("hostname", &["-I"]) {
+        ips.extend(parse_ipv4_candidates(&host_ips));
+    }
+    scan.tailscale_ips = dedup_keep_order(ips);
+
+    let open_ports_raw = run_local_cmd("ss", &["-ltnH"])
+        .or_else(|| run_local_cmd("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN"]))
+        .or_else(|| run_local_cmd("netstat", &["-lnt"]));
+    if let Some(raw) = open_ports_raw {
+        scan.open_ports = parse_open_ports(&raw);
+    }
+
+    scan.openclaw_version = run_local_cmd("openclaw", &["--version"]);
+    scan
+}
+
+fn pick_detected_text(label: &str, detected: &[String], fallback: &str) -> String {
+    use std::io::{self, Write};
+    if detected.is_empty() {
+        print!("  {} [{}]: ", label, fallback);
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return fallback.to_string();
+        }
+        let value = input.trim();
+        return if value.is_empty() {
+            fallback.to_string()
+        } else {
+            value.to_string()
+        };
+    }
+
+    println!("  {} (detected):", label);
+    for (idx, value) in detected.iter().enumerate() {
+        println!("    {}) {}", idx + 1, value);
+    }
+    print!("  Select {} [1]: ", label.to_lowercase());
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return detected
+            .first()
+            .cloned()
+            .unwrap_or_else(|| fallback.to_string());
+    }
+    let idx = input.trim().parse::<usize>().unwrap_or(1);
+    detected
+        .get(idx.saturating_sub(1))
+        .cloned()
+        .unwrap_or_else(|| {
+            detected
+                .first()
+                .cloned()
+                .unwrap_or_else(|| fallback.to_string())
+        })
+}
+
+fn pick_detected_port(label: &str, detected: &[u16], fallback: u16) -> u16 {
+    let options: Vec<String> = detected.iter().map(|p| p.to_string()).collect();
+    pick_detected_text(label, &options, &fallback.to_string())
+        .parse::<u16>()
+        .unwrap_or(fallback)
+}
 
 /// Full automated init — creates everything from scratch
-pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Option<&str>, db_pass: Option<&str>, db_name: Option<&str>, self_ip: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_init(
+    db_host: Option<&str>,
+    db_port: Option<u16>,
+    db_user: Option<&str>,
+    db_pass: Option<&str>,
+    db_name: Option<&str>,
+    self_ip: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use mysql_async::prelude::*;
     use std::io::{self, Write};
 
-        println!("\n   {} {}\n", c_bold_cyan("🩺"), c_bold("Fleet Doctor"));
+    println!("\n   {} {}\n", c_bold_cyan("🩺"), c_bold("Fleet Doctor"));
     print_divider();
+    println!();
+
+    println!("  {} Running live startup scan...", c_bold_cyan("🛰️"));
+    let scan = scan_init_system();
+    println!(
+        "    {} SSH keys: {}",
+        c_dim("•"),
+        if scan.ssh_pub_keys.is_empty() {
+            "none found".to_string()
+        } else {
+            scan.ssh_pub_keys.join(", ")
+        }
+    );
+    println!(
+        "    {} Tailscale/IP candidates: {}",
+        c_dim("•"),
+        if scan.tailscale_ips.is_empty() {
+            "none detected".to_string()
+        } else {
+            scan.tailscale_ips.join(", ")
+        }
+    );
+    println!(
+        "    {} OpenClaw: {}",
+        c_dim("•"),
+        scan.openclaw_version
+            .clone()
+            .unwrap_or_else(|| "not installed locally".to_string())
+    );
+    println!(
+        "    {} Open ports: {}",
+        c_dim("•"),
+        if scan.open_ports.is_empty() {
+            "none detected".to_string()
+        } else {
+            scan.open_ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
     println!();
 
     let prompt = |label: &str, default: &str| -> String {
@@ -968,10 +1458,34 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         if v.is_empty() { default.to_string() } else { v }
     };
 
+    let selected_ssh_pubkey = if scan.ssh_pub_keys.is_empty() {
+        None
+    } else {
+        Some(pick_detected_text(
+            "SSH public key for onboarding",
+            &scan.ssh_pub_keys,
+            &scan.ssh_pub_keys[0],
+        ))
+    };
+
+    let mut db_host_choices = vec!["127.0.0.1".to_string()];
+    db_host_choices.extend(scan.tailscale_ips.clone());
+    db_host_choices = dedup_keep_order(db_host_choices);
+
+    let mut db_port_choices = scan.open_ports.clone();
+    if !db_port_choices.contains(&3306) {
+        db_port_choices.insert(0, 3306);
+    }
+
     // Interactive prompts for missing values
-    let db_host = db_host.map(|s| s.to_string()).unwrap_or_else(|| prompt("MySQL host", "127.0.0.1"));
-    let db_port = db_port.unwrap_or_else(|| prompt("MySQL port", "3306").parse().unwrap_or(3306));
-    let db_user = db_user.map(|s| s.to_string()).unwrap_or_else(|| prompt("MySQL user", "root"));
+    let db_host = db_host
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| pick_detected_text("MySQL host", &db_host_choices, "127.0.0.1"));
+    let db_port =
+        db_port.unwrap_or_else(|| pick_detected_port("MySQL port", &db_port_choices, 3306));
+    let db_user = db_user
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| prompt("MySQL user", "root"));
     let db_pass = db_pass.map(|s| s.to_string()).unwrap_or_else(|| {
         print!("  MySQL password: ");
         let _ = io::stdout().flush();
@@ -981,12 +1495,20 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         }
         input.trim().to_string()
     });
-    let db_name = db_name.map(|s| s.to_string()).unwrap_or_else(|| prompt("Database name", "sam_fleet"));
+    let db_name = db_name
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| prompt("Database name", "sam_fleet"));
     let self_ip = self_ip.map(|s| s.to_string()).unwrap_or_else(|| {
-        let detected = std::process::Command::new("hostname").arg("-I").output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("127.0.0.1").to_string())
-            .unwrap_or_else(|_| "127.0.0.1".into());
-        prompt("This machine's IP", &detected)
+        let detected = scan
+            .tailscale_ips
+            .first()
+            .cloned()
+            .or_else(|| {
+                run_local_cmd("hostname", &["-I"])
+                    .and_then(|o| parse_ipv4_candidates(&o).first().cloned())
+            })
+            .unwrap_or_else(|| "127.0.0.1".into());
+        pick_detected_text("This machine's IP", &scan.tailscale_ips, &detected)
     });
 
     println!();
@@ -995,12 +1517,16 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
     print!("  [1/4] Connecting to MySQL... ");
     let url = crate::db::build_db_url(&db_host, &db_port.to_string(), &db_user, &db_pass, &db_name);
     let pool = mysql_async::Pool::new(url.as_str());
-    let mut conn = pool.get_conn().await.map_err(|e| crate::db::sanitize_error(&format!("DB connection failed: {}", e)))?;
+    let mut conn = pool
+        .get_conn()
+        .await
+        .map_err(|e| crate::db::sanitize_error(&format!("DB connection failed: {}", e)))?;
     println!("✅");
 
     // Step 2: Create tables
     print!("  [2/4] Creating tables... ");
-    conn.query_drop(r"
+    conn.query_drop(
+        r"
         CREATE TABLE IF NOT EXISTS mc_fleet_status (
             agent_name       VARCHAR(64) PRIMARY KEY,
             hostname         VARCHAR(128),
@@ -1019,8 +1545,11 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
             uptime_seconds   BIGINT DEFAULT 0,
             updated_at       DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         )
-    ").await?;
-    conn.query_drop(r"
+    ",
+    )
+    .await?;
+    conn.query_drop(
+        r"
         CREATE TABLE IF NOT EXISTS mc_chat (
             id           BIGINT AUTO_INCREMENT PRIMARY KEY,
             sender       VARCHAR(64) NOT NULL,
@@ -1035,8 +1564,11 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
             INDEX idx_created (created_at),
             INDEX idx_kind (kind)
         )
-    ").await?;
-    conn.query_drop(r"
+    ",
+    )
+    .await?;
+    conn.query_drop(
+        r"
         CREATE TABLE IF NOT EXISTS mc_task_routing (
             id              INT AUTO_INCREMENT PRIMARY KEY,
             task_description TEXT NOT NULL,
@@ -1049,8 +1581,11 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
             completed_at    DATETIME,
             result          TEXT
         )
-    ").await?;
-    conn.query_drop(r"
+    ",
+    )
+    .await?;
+    conn.query_drop(
+        r"
         CREATE TABLE IF NOT EXISTS mc_operations (
             id           BIGINT AUTO_INCREMENT PRIMARY KEY,
             agent_name   VARCHAR(64) NOT NULL,
@@ -1062,7 +1597,9 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
             INDEX idx_agent (agent_name),
             INDEX idx_created (created_at)
         )
-    ").await?;
+    ",
+    )
+    .await?;
     println!("✅ mc_fleet_status, mc_chat, mc_task_routing, mc_operations");
 
     // Step 3: Generate config
@@ -1078,23 +1615,30 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         },
         tui: TuiConfig::default(),
         fleet: FleetConfig::default(),
-        identity: IdentityConfig { user: whoami().unwrap_or_else(|| "operator".into()) },
+        identity: IdentityConfig {
+            user: whoami().unwrap_or_else(|| "operator".into()),
+        },
     };
     cfg.save()?;
 
     // Also write .env
     let env_path = std::path::Path::new(".env");
     if !env_path.exists() {
-        std::fs::write(env_path, format!(
+        let mut env_content = format!(
             "SAM_DB_URL={}\nSAM_SELF_IP={}\nSAM_USER={}\n",
             url, self_ip, cfg.identity.user,
-        ))?;
+        );
+        if let Some(key_path) = selected_ssh_pubkey {
+            env_content.push_str(&format!("SAM_SSH_PUBKEY={}\n", key_path));
+        }
+        std::fs::write(env_path, env_content)?;
     }
     println!("✅ ~/.config/sam/config.toml");
 
     // Step 4: Self-register
     print!("  [4/4] Registering this machine... ");
-    let hostname = std::process::Command::new("hostname").output()
+    let hostname = std::process::Command::new("hostname")
+        .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "localhost".into());
     conn.exec_drop(
@@ -1113,10 +1657,11 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
 }
 
 fn whoami() -> Option<String> {
-    std::process::Command::new("whoami").output().ok()
+    std::process::Command::new("whoami")
+        .output()
+        .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
-
 
 #[derive(Debug, Clone, Serialize)]
 struct FleetDoctorAgentResult {
@@ -1154,9 +1699,13 @@ fn parse_semver(raw: &str) -> Option<String> {
 
 fn doctor_exit_code(total_agents: usize, unhealthy_agents: usize, down_agents: usize) -> i32 {
     // down_agents * 2 > total_agents means "strictly more than 50% down".
-    if total_agents > 0 && (down_agents * 2) > total_agents { 2 }
-    else if unhealthy_agents > 0 { 1 }
-    else { 0 }
+    if total_agents > 0 && (down_agents * 2) > total_agents {
+        2
+    } else if unhealthy_agents > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Diagnose and auto-fix fleet issues
@@ -1177,14 +1726,20 @@ pub async fn run_doctor_fleet(
     let agents = crate::db::load_fleet(&pool).await?;
 
     let targets: Vec<crate::db::DbAgent> = if let Some(name) = agent_filter {
-        agents.iter().filter(|a| a.agent_name.contains(name)).cloned().collect()
+        agents
+            .iter()
+            .filter(|a| a.agent_name.contains(name))
+            .cloned()
+            .collect()
     } else {
         agents.clone()
     };
 
     let latest_oc_version = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        Command::new("npm").args(["view", "openclaw", "version", "--silent"]).output(),
+        Command::new("npm")
+            .args(["view", "openclaw", "version", "--silent"])
+            .output(),
     )
     .await
     .ok()
@@ -1194,8 +1749,7 @@ pub async fn run_doctor_fleet(
 
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        ?;
+        .build()?;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     for agent in targets {
@@ -1204,17 +1758,38 @@ pub async fn run_doctor_fleet(
         let http_client = http_client.clone();
         tokio::spawn(async move {
             let name = agent.agent_name.clone();
-            let ip = agent.tailscale_ip.clone().unwrap_or_else(|| "?".to_string());
+            let ip = agent
+                .tailscale_ip
+                .clone()
+                .unwrap_or_else(|| "?".to_string());
             let user = "admin";
-            let is_mac = agent.os_info.as_deref().unwrap_or("").to_lowercase().contains("mac");
-            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+            let is_mac = agent
+                .os_info
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("mac");
+            let pfx = if is_mac {
+                "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
+            } else {
+                ""
+            };
             let ssh_target = format!("{}@{}", user, ip);
             let mut fixed_actions = Vec::new();
 
             let ssh_reachable = tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
                 Command::new("ssh")
-                    .args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", &ssh_target, "echo ok"])
+                    .args([
+                        "-o",
+                        "ConnectTimeout=3",
+                        "-o",
+                        "StrictHostKeyChecking=no",
+                        "-o",
+                        "BatchMode=yes",
+                        &ssh_target,
+                        "echo ok",
+                    ])
                     .output(),
             )
             .await
@@ -1267,7 +1842,16 @@ pub async fn run_doctor_fleet(
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(120),
                         Command::new("ssh")
-                            .args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", &ssh_target, &cmd])
+                            .args([
+                                "-o",
+                                "ConnectTimeout=3",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "BatchMode=yes",
+                                &ssh_target,
+                                &cmd,
+                            ])
                             .output(),
                     )
                     .await;
@@ -1351,10 +1935,7 @@ pub async fn run_doctor_fleet(
     }
     results.sort_by(|a, b| a.agent.cmp(&b.agent));
 
-    let unhealthy_agents = results
-        .iter()
-        .filter(|r| !r.is_healthy())
-        .count();
+    let unhealthy_agents = results.iter().filter(|r| !r.is_healthy()).count();
     let down_agents = results.iter().filter(|r| !r.ssh_reachable).count();
     let exit_code = doctor_exit_code(results.len(), unhealthy_agents, down_agents);
 
@@ -1378,7 +1959,11 @@ pub async fn run_doctor_fleet(
                 "{:<20} ssh:{} gateway:{} oc:{}{}",
                 r.agent,
                 if r.ssh_reachable { "✓" } else { "✗" },
-                if r.gateway_api_reachable { "✓" } else { "✗" },
+                if r.gateway_api_reachable {
+                    "✓"
+                } else {
+                    "✗"
+                },
                 if r.oc_current { "✓" } else { "✗" },
                 if r.fixed_actions.is_empty() {
                     String::new()
@@ -1402,9 +1987,17 @@ pub async fn run_doctor_fleet(
                 "   {:<20} {:<7} {:<9} {:<7} {}",
                 r.agent,
                 if r.ssh_reachable { "✓" } else { "✗" },
-                if r.gateway_api_reachable { "✓" } else { "✗" },
+                if r.gateway_api_reachable {
+                    "✓"
+                } else {
+                    "✗"
+                },
                 if r.oc_current { "✓" } else { "✗" },
-                if r.oc_version.is_empty() { "unknown" } else { &r.oc_version }
+                if r.oc_version.is_empty() {
+                    "unknown"
+                } else {
+                    &r.oc_version
+                }
             );
         }
         print_divider();
@@ -1416,14 +2009,18 @@ pub async fn run_doctor_fleet(
     }
 
     let status = if exit_code == 0 { "pass" } else { "fail" };
-    let record_result = crate::db::record_fleet_doctor_run(&pool, status, &serde_json::to_string(&payload)?).await;
+    let record_result =
+        crate::db::record_fleet_doctor_run(&pool, status, &serde_json::to_string(&payload)?).await;
     let disconnect_result = pool.disconnect().await;
     record_result?;
     disconnect_result?;
     Ok(exit_code)
 }
 
-pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_doctor(
+    fix: bool,
+    agent_filter: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::process::Command;
 
     print_banner();
@@ -1432,7 +2029,10 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
     let agents = crate::db::load_fleet(&pool).await?;
 
     let targets: Vec<&crate::db::DbAgent> = if let Some(name) = agent_filter {
-        agents.iter().filter(|a| a.agent_name.contains(name)).collect()
+        agents
+            .iter()
+            .filter(|a| a.agent_name.contains(name))
+            .collect()
     } else {
         agents.iter().collect()
     };
@@ -1444,19 +2044,41 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
         let name = &agent.agent_name;
         let ip = agent.tailscale_ip.as_deref().unwrap_or("?");
         let user = if name.is_empty() { "admin" } else { "admin" };
-        let is_mac = agent.os_info.as_deref().unwrap_or("").to_lowercase().contains("mac");
-        let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+        let is_mac = agent
+            .os_info
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("mac");
+        let pfx = if is_mac {
+            "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
+        } else {
+            ""
+        };
 
         println!("  🔍 {} ({})", name, ip);
 
         // Check 1: SSH connectivity
         let ssh_ok = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            Command::new("ssh").args([
-                "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                &format!("{}@{}", user, ip), "echo ok"
-            ]).output()
-        ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+            Command::new("ssh")
+                .args([
+                    "-o",
+                    "ConnectTimeout=3",
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "BatchMode=yes",
+                    &format!("{}@{}", user, ip),
+                    "echo ok",
+                ])
+                .output(),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
         if !ssh_ok {
             println!("     ❌ SSH unreachable — skipping");
@@ -1466,22 +2088,52 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
         println!("     ✅ SSH");
 
         // Check 2: OpenClaw installed
-        let oc_out = Command::new("ssh").args([
-            "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-            &format!("{}@{}", user, ip),
-            &format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx)
-        ]).output().await.ok();
-        let oc_version = oc_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let oc_out = Command::new("ssh")
+            .args([
+                "-o",
+                "ConnectTimeout=3",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "BatchMode=yes",
+                &format!("{}@{}", user, ip),
+                &format!(
+                    "{}openclaw --version 2>/dev/null || echo NOT_INSTALLED",
+                    pfx
+                ),
+            ])
+            .output()
+            .await
+            .ok();
+        let oc_version = oc_out
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
         if oc_version.contains("NOT_INSTALLED") || oc_version.is_empty() {
             println!("     ❌ OpenClaw not installed");
             issues += 1;
             if fix {
                 print!("        🔧 Installing... ");
-                let cmd = if is_mac { format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx) }
-                          else { "sudo npm install -g openclaw@latest 2>&1 | tail -1".into() };
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(120),
-                    Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                        &format!("{}@{}", user, ip), &cmd]).output()).await;
+                let cmd = if is_mac {
+                    format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx)
+                } else {
+                    "sudo npm install -g openclaw@latest 2>&1 | tail -1".into()
+                };
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    Command::new("ssh")
+                        .args([
+                            "-o",
+                            "ConnectTimeout=3",
+                            "-o",
+                            "StrictHostKeyChecking=no",
+                            "-o",
+                            "BatchMode=yes",
+                            &format!("{}@{}", user, ip),
+                            &cmd,
+                        ])
+                        .output(),
+                )
+                .await;
                 println!("done");
                 fixed += 1;
             }
@@ -1490,25 +2142,53 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
         }
 
         // Check 3: Gateway running
-        let gw_out = Command::new("ssh").args([
-            "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-            &format!("{}@{}", user, ip), "ss -tlnp 2>/dev/null | grep 18789 | head -1"
-        ]).output().await.ok();
-        let gw_line = gw_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let gw_out = Command::new("ssh")
+            .args([
+                "-o",
+                "ConnectTimeout=3",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "BatchMode=yes",
+                &format!("{}@{}", user, ip),
+                "ss -tlnp 2>/dev/null | grep 18789 | head -1",
+            ])
+            .output()
+            .await
+            .ok();
+        let gw_line = gw_out
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
         if gw_line.is_empty() {
             println!("     ❌ Gateway not running");
             issues += 1;
             if fix {
                 print!("        🔧 Starting gateway... ");
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(15),
-                    Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                        &format!("{}@{}", user, ip),
-                        &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)]).output()).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    Command::new("ssh")
+                        .args([
+                            "-o",
+                            "ConnectTimeout=3",
+                            "-o",
+                            "StrictHostKeyChecking=no",
+                            "-o",
+                            "BatchMode=yes",
+                            &format!("{}@{}", user, ip),
+                            &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx),
+                        ])
+                        .output(),
+                )
+                .await;
                 println!("done");
                 fixed += 1;
             }
         } else {
-            let binding = if gw_line.contains("0.0.0.0") { "0.0.0.0 ✅" } else { "localhost ⚠️" };
+            let binding = if gw_line.contains("0.0.0.0") {
+                "0.0.0.0 ✅"
+            } else {
+                "localhost ⚠️"
+            };
             println!("     ✅ Gateway running ({})", binding);
 
             // Check 3b: Binding
@@ -1521,10 +2201,22 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
                         &format!("{}@{}", user, ip),
                         "python3 -c \"import json,os;p=os.path.expanduser('~/.openclaw/openclaw.json');c=json.load(open(p));c.setdefault('gateway',{})['bind']='lan';json.dump(c,open(p,'w'),indent=2);print('ok')\""
                     ]).output().await;
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(15),
-                        Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                            &format!("{}@{}", user, ip),
-                            &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx)]).output()).await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        Command::new("ssh")
+                            .args([
+                                "-o",
+                                "ConnectTimeout=3",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "BatchMode=yes",
+                                &format!("{}@{}", user, ip),
+                                &format!("{}openclaw gateway restart 2>&1 | tail -1", pfx),
+                            ])
+                            .output(),
+                    )
+                    .await;
                     println!("done");
                     fixed += 1;
                 }
@@ -1537,7 +2229,9 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
             &format!("{}@{}", user, ip),
             "python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{}).get('http',{}).get('endpoints',{}).get('chatCompletions',{}).get('enabled',False))\""
         ]).output().await.ok();
-        let cc_enabled = cc_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let cc_enabled = cc_out
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
         if cc_enabled != "True" {
             println!("     ❌ chatCompletions not enabled");
             issues += 1;
@@ -1564,11 +2258,17 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
                     &format!("{}@{}", user, ip),
                     "python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{}).get('auth',{}).get('token',''))\""
                 ]).output().await.ok();
-                let token = tok_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                let token = tok_out
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
                 if !token.is_empty() {
                     let mut conn = pool.get_conn().await?;
                     use mysql_async::prelude::*;
-                    conn.exec_drop("UPDATE mc_fleet_status SET gateway_token=? WHERE agent_name=?", (&token, name)).await?;
+                    conn.exec_drop(
+                        "UPDATE mc_fleet_status SET gateway_token=? WHERE agent_name=?",
+                        (&token, name),
+                    )
+                    .await?;
                     println!("done ({}...)", &token[..12.min(token.len())]);
                     fixed += 1;
                 } else {
@@ -1582,9 +2282,12 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
         // Check 6: HTTP API reachable
         let http_ok = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
-            .build().unwrap_or_default()
+            .build()
+            .unwrap_or_default()
             .get(&format!("http://{}:18789/", ip))
-            .send().await.is_ok();
+            .send()
+            .await
+            .is_ok();
         if http_ok {
             println!("     ✅ HTTP API reachable");
         } else {
@@ -1597,8 +2300,12 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
     pool.disconnect().await?;
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  {} agents checked, {} issues found, {} fixed",
-        targets.len(), issues, fixed);
+    println!(
+        "  {} agents checked, {} issues found, {} fixed",
+        targets.len(),
+        issues,
+        fixed
+    );
     if issues > 0 && !fix {
         println!("  Run `sam doctor --fix` to auto-repair");
     }
@@ -1609,7 +2316,7 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{doctor_exit_code, parse_semver};
+    use super::{doctor_exit_code, parse_ipv4_candidates, parse_open_ports, parse_semver};
 
     #[test]
     fn parse_semver_extracts_version_token() {
@@ -1623,6 +2330,23 @@ mod cli_tests {
         assert_eq!(doctor_exit_code(4, 1, 2), 1);
         assert_eq!(doctor_exit_code(4, 3, 3), 2);
     }
+
+    #[test]
+    fn parse_ipv4_candidates_filters_non_ipv4_tokens() {
+        let parsed = parse_ipv4_candidates("100.64.0.2 127.0.0.1 not-an-ip");
+        assert_eq!(
+            parsed,
+            vec!["100.64.0.2".to_string(), "127.0.0.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_open_ports_extracts_unique_ports() {
+        let parsed = parse_open_ports(
+            "LISTEN 0 128 0.0.0.0:22\nLISTEN 0 128 [::]:3306\nLISTEN 0 128 127.0.0.1:22",
+        );
+        assert_eq!(parsed, vec![22, 3306]);
+    }
 }
 
 /// Print operation history log (non-TUI)
@@ -1633,8 +2357,14 @@ pub async fn run_log(agent: Option<&str>, tail: u32) -> Result<(), Box<dyn std::
     print_banner();
     println!();
     print_divider();
-    println!("   {:<18} {:<14} {:<10} {:<10} {}",
-        c_bold("Time"), c_bold("Agent"), c_bold("Type"), c_bold("Status"), c_bold("Detail"));
+    println!(
+        "   {:<18} {:<14} {:<10} {:<10} {}",
+        c_bold("Time"),
+        c_bold("Agent"),
+        c_bold("Type"),
+        c_bold("Status"),
+        c_bold("Detail")
+    );
     print_divider();
 
     if ops.is_empty() {
@@ -1649,8 +2379,15 @@ pub async fn run_log(agent: Option<&str>, tail: u32) -> Result<(), Box<dyn std::
                 s => c_dim(s),
             };
             let detail = op.detail.as_deref().unwrap_or("—");
-            let detail_short: String = detail.lines().next().unwrap_or("—").chars().take(50).collect();
-            println!("   {:<16} {:<22} {:<18} {}  {}",
+            let detail_short: String = detail
+                .lines()
+                .next()
+                .unwrap_or("—")
+                .chars()
+                .take(50)
+                .collect();
+            println!(
+                "   {:<16} {:<22} {:<18} {}  {}",
                 c_dim(&op.created_at),
                 c_cyan(&op.agent_name),
                 c_magenta(&op.op_type),
@@ -1679,7 +2416,8 @@ mod tests {
 
     #[test]
     fn tui_vim_mode_reads_true_from_config() {
-        let cfg: SamConfig = toml::from_str("[tui]\nvim_mode = true\n").expect("config should parse");
+        let cfg: SamConfig =
+            toml::from_str("[tui]\nvim_mode = true\n").expect("config should parse");
         assert!(cfg.tui.vim_mode);
     }
 }
