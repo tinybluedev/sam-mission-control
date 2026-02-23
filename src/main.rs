@@ -7273,11 +7273,10 @@ fn fmt_hhmm(t: &str) -> String {
 }
 
 fn typing_dots(spinner_frame: usize) -> &'static str {
-    match spinner_frame % 4 {
-        0 => ".",
-        1 => "..",
-        2 => "...",
-        _ => "",
+    match spinner_frame % 3 {
+        0 => " .",
+        1 => " ..",
+        _ => " ...",
     }
 }
 
@@ -14230,10 +14229,10 @@ mod tests {
 
     #[test]
     fn typing_dots_cycles_for_chat_animation() {
-        assert_eq!(typing_dots(0), ".");
-        assert_eq!(typing_dots(1), "..");
-        assert_eq!(typing_dots(2), "...");
-        assert_eq!(typing_dots(3), "");
-        assert_eq!(typing_dots(4), ".");
+        assert_eq!(typing_dots(0), " .");
+        assert_eq!(typing_dots(1), " ..");
+        assert_eq!(typing_dots(2), " ...");
+        assert_eq!(typing_dots(3), " .");
+        assert_eq!(typing_dots(4), " ..");
     }
 }
