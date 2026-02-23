@@ -520,6 +520,12 @@ struct App {
     fleet_diag_done: bool,
     fleet_diag_results: Vec<FleetDiagResult>,
     fleet_diag_rx: Option<mpsc::UnboundedReceiver<FleetDiagMsg>>,
+    // Fleet changelog overlay
+    fleet_changelog_active: bool,
+    fleet_changelog_loading: bool,
+    fleet_changelog_scroll: u16,
+    fleet_changelog_rows: Vec<db::OperationRecord>,
+    fleet_changelog_rx: Option<mpsc::UnboundedReceiver<Vec<db::OperationRecord>>>,
     // Services (OpenClaw plugin management)
     svc_list: Vec<ServiceEntry>,
     svc_selected: usize,
@@ -5671,6 +5677,10 @@ PY",
         if let Some(rx) = &mut self.refresh_rx {
             while let Ok(r) = rx.try_recv() {
                 if r.index < self.agents.len() {
+                    let prev_status = self.agents[r.index].status.clone();
+                    let prev_os = self.agents[r.index].os.clone();
+                    let prev_kernel = self.agents[r.index].kernel.clone();
+                    let prev_oc = self.agents[r.index].oc_version.clone();
                     self.agents[r.index].status = r.status.clone();
                     if !r.os.is_empty() {
                         self.agents[r.index].os = r.os.clone();
@@ -7914,6 +7924,54 @@ fn render_fleet_diagnostics(frame: &mut Frame, app: &App) {
     frame.render_widget(diag, popup);
 }
 
+fn render_fleet_changelog(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let w = (area.width as f32 * 0.80) as u16;
+    let h = (area.height as f32 * 0.75) as u16;
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w.max(40), h.max(12));
+    let t = &app.theme;
+    frame.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = vec![];
+    if app.fleet_changelog_loading {
+        lines.push(Line::from(Span::styled(
+            "⏳ Loading fleet changelog…",
+            Style::default().fg(t.status_busy).bold(),
+        )));
+    } else if app.fleet_changelog_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No fleet changes recorded yet.",
+            Style::default().fg(t.text_dim),
+        )));
+    } else {
+        for op in &app.fleet_changelog_rows {
+            let detail = op.detail.as_deref().unwrap_or("—");
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", op.created_at), Style::default().fg(t.text_dim)),
+                Span::styled(format!("{:<16}", op.agent_name), Style::default().fg(t.accent).bold()),
+                Span::styled(detail.to_string(), Style::default().fg(t.text)),
+            ]));
+        }
+    }
+
+    let body = Paragraph::new(lines)
+        .scroll((app.fleet_changelog_scroll, 0))
+        .wrap(Wrap { trim: false })
+        .block(Block::default()
+            .title(Span::styled(
+                " Fleet Changelog — Esc=close  ↑↓/PgUp/PgDn=scroll ",
+                Style::default().fg(t.accent).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(t.border_type)
+            .border_style(Style::default().fg(t.accent))
+            .style(Style::default().bg(app.bg_density.bg()))
+            .padding(Padding::new(1, 1, 1, 0)));
+    frame.render_widget(body, popup);
+}
+
 fn render_diagnostics(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let area = frame.area();
@@ -9557,6 +9615,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("  G (Shift)", "Investigate gateway (selected)", act_style),
         ("  o", "OpenClaw version audit", act_style),
         ("  u", "Bulk update OpenClaw", act_style),
+        ("  L (Shift)", "Fleet changelog", act_style),
         ("", "", dim_style),
         // --- Agent Detail ---
         ("AGENT DETAIL", "", dim_style),
@@ -9989,8 +10048,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !updates.is_empty() {
             // Write to DB in background
             if let Some(pool) = &app.db_pool {
-                for (idx, _status, _os, _kern, _oc, lat) in &updates {
-                    let a = &app.agents[*idx];
+                for (idx, _status, _os, _kern, _oc, lat, change_detail) in updates {
+                    let a = &app.agents[idx];
                     let p = pool.clone();
                     let (name, st, os, kern, oc, latency) = (
                         a.db_name.clone(),
@@ -10025,6 +10084,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await;
                     });
+                    if let Some(detail) = change_detail {
+                        let p = pool.clone();
+                        let agent_name = a.db_name.clone();
+                        tokio::spawn(async move {
+                            if let Ok(op_id) = db::create_operation(&p, &agent_name, "fleet_change").await {
+                                let _ = db::complete_operation(&p, op_id, "pass", Some(&detail)).await;
+                            }
+                        });
+                    }
                 }
             }
             app.check_alerts();
@@ -12279,6 +12347,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             app.fleet_diag_done = true;
                         }
                     }
+                }
+            }
+        }
+
+        if app.fleet_changelog_active {
+            if let Some(ref mut rx) = app.fleet_changelog_rx {
+                if let Ok(rows) = rx.try_recv() {
+                    app.fleet_changelog_rows = rows;
+                    app.fleet_changelog_loading = false;
                 }
             }
         }
