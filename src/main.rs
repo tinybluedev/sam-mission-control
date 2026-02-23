@@ -784,6 +784,7 @@ struct App {
     task_input: String,
     task_input_active: bool,
     last_task_poll: Instant,
+    tasks_rx: Option<mpsc::UnboundedReceiver<Vec<db::Task>>>,
     // UI state
     spinner_frame: usize,
     sort_mode: SortMode,
@@ -1157,6 +1158,7 @@ impl App {
             task_input: String::new(),
             task_input_active: false,
             last_task_poll: Instant::now(),
+            tasks_rx: None,
             spawned_agents: vec![],
             show_splash: true,
             splash_start: Instant::now(),
@@ -13546,23 +13548,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.start_refresh();
         }
 
-        // Poll tasks every 5s when on task board
-        if app.screen == Screen::TaskBoard && app.last_task_poll.elapsed() > Duration::from_secs(5)
+        // Poll tasks every 5s when on task board — non-blocking background spawn
+        if app.screen == Screen::TaskBoard
+            && app.tasks_rx.is_none()
+            && app.last_task_poll.elapsed() > Duration::from_secs(5)
         {
             if let Some(pool) = &app.db_pool {
-                if let Ok(mut tasks) = db::load_tasks(pool, 50).await {
-                    if let Some(ref agent) = app.task_filter_agent {
-                        tasks.retain(|t| {
-                            t.assigned_agent
-                                .as_ref()
-                                .map(|a| a == agent)
-                                .unwrap_or(false)
-                        });
+                let (tx, rx) = mpsc::unbounded_channel();
+                app.tasks_rx = Some(rx);
+                app.last_task_poll = Instant::now();
+                let pool = pool.clone();
+                let filter = app.task_filter_agent.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tasks) = db::load_tasks(&pool, 50).await {
+                        if let Some(ref agent) = filter {
+                            tasks.retain(|t| {
+                                t.assigned_agent.as_ref().map(|a| a == agent).unwrap_or(false)
+                            });
+                        }
+                        let _ = tx.send(tasks);
                     }
-                    app.tasks = tasks;
-                }
+                });
             }
-            app.last_task_poll = Instant::now();
+        }
+        // Drain task results
+        if let Some(rx) = &mut app.tasks_rx {
+            if let Ok(tasks) = rx.try_recv() {
+                app.tasks = tasks;
+                app.tasks_rx = None;
+            }
         }
 
         // Receive diagnostic steps (non-blocking).
