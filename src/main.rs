@@ -52,6 +52,8 @@ struct Agent {
     cpu_pct: Option<f32>,
     ram_pct: Option<f32>,
     disk_pct: Option<f32>,
+    mem_free_mb: Option<i64>,
+    swap_mb: Option<i64>,
     gateway_port: i32,
     gateway_token: Option<String>,
     gateway_pid: Option<i32>,
@@ -250,6 +252,8 @@ struct ProbeResult {
     cpu_pct: Option<f32>,
     ram_pct: Option<f32>,
     disk_pct: Option<f32>,
+    mem_free_mb: Option<i64>,
+    swap_mb: Option<i64>,
     activity: String,
     context_pct: Option<f32>,
     gateway_status: GatewayStatus,
@@ -4107,6 +4111,127 @@ PY"#, escaped_model);
                 });
             }
 
+            // Step 8: RAM check — warn if < 1GB free
+            if !is_mac {
+                // Shell command to create a 2GB swap file (reused in steps 8 and 9)
+                let create_swap_cmd = "sudo fallocate -l 2G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048 2>/dev/null; sudo chmod 600 /swapfile; sudo mkswap /swapfile 2>/dev/null; sudo swapon /swapfile 2>/dev/null; grep -q /swapfile /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab; echo SWAP_CREATED";
+                let _ = tx.send(DiagStep { label: "RAM available".into(), status: DiagStatus::Running, detail: String::new() });
+                let mem_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), "free -m 2>/dev/null | awk '/^Mem:/{print (NF>=7)?$7:$4}' || echo ?"
+                ]).output().await;
+                let mem_free_str = mem_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+                let mem_free_mb = mem_free_str.parse::<i64>().ok();
+                let mem_ok = mem_free_mb.map(|m| m >= 1024).unwrap_or(true);
+                if !mem_ok && fix {
+                    if let Some(mfree) = mem_free_mb {
+                        let _ = tx.send(DiagStep { label: "RAM available".into(), status: DiagStatus::Running,
+                            detail: format!("{}MB free — creating 2GB swap file...", mfree) });
+                    }
+                    // Check if swap already exists; create 2GB swap file if not
+                    let swap_check = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), "free -m | awk '/^Swap:/{print $2}'"
+                    ]).output().await;
+                    let swap_total = swap_check.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().unwrap_or(0)).unwrap_or(0);
+                    let swap_fix_cmd = if swap_total == 0 { create_swap_cmd } else { "echo SWAP_EXISTS" };
+                    let swap_result = tokio::time::timeout(Duration::from_secs(60),
+                        Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                            &format!("{}@{}", user, host), swap_fix_cmd]).output()
+                    ).await.ok().and_then(|r| r.ok());
+                    let swap_created = swap_result.as_ref().map(|o| {
+                        let s = String::from_utf8_lossy(&o.stdout);
+                        s.contains("SWAP_CREATED") || s.contains("SWAP_EXISTS")
+                    }).unwrap_or(false);
+                    let _ = tx.send(DiagStep {
+                        label: "RAM available".into(),
+                        status: if swap_created { DiagStatus::Fixed } else { DiagStatus::Fail },
+                        detail: if swap_created { "swap file created — system has virtual memory buffer".into() }
+                            else { "could not create swap — check sudo permissions".into() },
+                    });
+                } else {
+                    let detail = match mem_free_mb {
+                        Some(m) if m >= 1024 => format!("{:.1}GB free", m as f32 / 1024.0),
+                        Some(m) => format!("{}MB free — below 1GB threshold", m),
+                        None => "could not read memory info".into(),
+                    };
+                    let _ = tx.send(DiagStep {
+                        label: "RAM available".into(),
+                        status: if mem_ok { DiagStatus::Pass } else { DiagStatus::Fail },
+                        detail,
+                    });
+                }
+
+                // Step 9: Swap check — warn if no swap
+                let _ = tx.send(DiagStep { label: "Swap configured".into(), status: DiagStatus::Running, detail: String::new() });
+                let swap_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), "free -m 2>/dev/null | awk '/^Swap:/{print $2}' || echo ?"
+                ]).output().await;
+                let swap_str = swap_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or("?".into());
+                let swap_mb_diag = swap_str.parse::<i64>().ok();
+                let has_swap = swap_mb_diag.map(|s| s > 0).unwrap_or(true);
+                if !has_swap && fix {
+                    let _ = tx.send(DiagStep { label: "Swap configured".into(), status: DiagStatus::Running, detail: "no swap — creating 2GB swap file...".into() });
+                    let swap_result = tokio::time::timeout(Duration::from_secs(60),
+                        Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                            &format!("{}@{}", user, host), create_swap_cmd]).output()
+                    ).await.ok().and_then(|r| r.ok());
+                    let created = swap_result.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("SWAP_CREATED")).unwrap_or(false);
+                    let _ = tx.send(DiagStep {
+                        label: "Swap configured".into(),
+                        status: if created { DiagStatus::Fixed } else { DiagStatus::Fail },
+                        detail: if created { "/swapfile (2GB) created and activated".into() }
+                            else { "swap creation failed — check sudo permissions and disk space".into() },
+                    });
+                } else {
+                    let detail = match swap_mb_diag {
+                        Some(s) if s > 0 => format!("{}MB swap available", s),
+                        Some(_) => "no swap — OOM kill risk on memory pressure".into(),
+                        None => "could not read swap info".into(),
+                    };
+                    let _ = tx.send(DiagStep {
+                        label: "Swap configured".into(),
+                        status: if has_swap { DiagStatus::Pass } else { DiagStatus::Fail },
+                        detail,
+                    });
+                }
+            }
+
+            // Step 10: Systemd service hardening (only on Linux)
+            if !is_mac {
+                let _ = tx.send(DiagStep { label: "Service hardening".into(), status: DiagStatus::Running, detail: String::new() });
+                let svc_check_cmd = r#"SVC=openclaw-gateway; FILE=$(systemctl cat $SVC 2>/dev/null | grep -v '^#' | tr '\n' '|'); HAS_RESTART=$(echo "$FILE" | grep -c 'Restart=always'); HAS_BURST=$(echo "$FILE" | grep -c 'StartLimitBurst'); HAS_KILL=$(echo "$FILE" | grep 'KillMode' | grep -c 'process'); HAS_MEM=$(echo "$FILE" | grep -c 'MemoryMax\|MemoryLimit'); echo "RESTART:$HAS_RESTART BURST:$HAS_BURST KILLMODE:$HAS_KILL MEMMAX:$HAS_MEM""#;
+                let svc_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                    &format!("{}@{}", user, host), svc_check_cmd
+                ]).output().await;
+                let svc_info = svc_out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                let restart_always = svc_info.contains("RESTART:1") || svc_info.contains("RESTART:2");
+                let has_burst = svc_info.contains("BURST:1") || svc_info.contains("BURST:2");
+                let kill_mode_process = svc_info.contains("KILLMODE:1") || svc_info.contains("KILLMODE:2");
+                let has_mem_max = svc_info.contains("MEMMAX:1") || svc_info.contains("MEMMAX:2");
+                let issues: Vec<&str> = [
+                    if restart_always && !has_burst { Some("no StartLimitBurst") } else { None },
+                    if kill_mode_process { Some("KillMode=process (orphans)") } else { None },
+                    if !has_mem_max { Some("no MemoryMax") } else { None },
+                ].iter().filter_map(|x| *x).collect();
+
+                if !issues.is_empty() && fix {
+                    let _ = tx.send(DiagStep { label: "Service hardening".into(), status: DiagStatus::Running, detail: "applying systemd drop-in...".into() });
+                    let dropin_cmd = r#"DROPIN=/etc/systemd/system/openclaw-gateway.service.d/mc-hardening.conf; sudo mkdir -p $(dirname $DROPIN); printf '[Service]\nKillMode=control-group\nMemoryMax=2G\nMemorySwapMax=512M\n[Unit]\nStartLimitBurst=3\nStartLimitIntervalSec=60\n' | sudo tee $DROPIN > /dev/null && sudo systemctl daemon-reload && echo APPLIED"#;
+                    let dropin_result = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                        &format!("{}@{}", user, host), dropin_cmd]).output().await;
+                    let applied = dropin_result.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("APPLIED")).unwrap_or(false);
+                    let _ = tx.send(DiagStep {
+                        label: "Service hardening".into(),
+                        status: if applied { DiagStatus::Fixed } else { DiagStatus::Fail },
+                        detail: if applied { "drop-in applied: KillMode=control-group, MemoryMax=2G, StartLimitBurst=3".into() }
+                            else { "drop-in failed — check sudo permissions".into() },
+                    });
+                } else if issues.is_empty() {
+                    let _ = tx.send(DiagStep { label: "Service hardening".into(), status: DiagStatus::Pass, detail: "KillMode, MemoryMax, and StartLimitBurst look good".into() });
+                } else {
+                    let _ = tx.send(DiagStep { label: "Service hardening".into(), status: DiagStatus::Fail, detail: format!("issues: {} — run D to auto-fix", issues.join(", ")) });
+                }
+            }
+
             // Done
             let _ = tx.send(DiagStep {
                 label: "DONE".into(),
@@ -5265,6 +5390,32 @@ PY",
                             agent: a.db_name.clone(),
                             emoji: a.emoji.clone(),
                             message: format!("{} RAM at {:.0}%", a.name, ram),
+                            severity: AlertSeverity::Warning,
+                        });
+                        self.alert_flash = Some(Instant::now());
+                    }
+                }
+            }
+            if let Some(mem_free) = a.mem_free_mb {
+                if mem_free < 1024 {
+                    let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("memory"));
+                    if !already {
+                        self.alerts.push(Alert {
+                            time: now.clone(), created_at: Instant::now(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
+                            message: format!("{} low memory: {}MB free", a.name, mem_free),
+                            severity: if mem_free < 256 { AlertSeverity::Critical } else { AlertSeverity::Warning },
+                        });
+                        self.alert_flash = Some(Instant::now());
+                    }
+                }
+            }
+            if let Some(swap) = a.swap_mb {
+                if swap == 0 {
+                    let already = self.alerts.iter().any(|al| al.agent == a.db_name && al.message.contains("swap"));
+                    if !already {
+                        self.alerts.push(Alert {
+                            time: now.clone(), created_at: Instant::now(), agent: a.db_name.clone(), emoji: a.emoji.clone(),
+                            message: format!("{} no swap configured — OOM risk", a.name),
                             severity: AlertSeverity::Warning,
                         });
                         self.alert_flash = Some(Instant::now());

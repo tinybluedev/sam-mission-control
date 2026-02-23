@@ -124,6 +124,18 @@ pub async fn run_migrations(pool: &Pool) -> Result<(), mysql_async::Error> {
     Ok(())
 }
 
+/// Update an agent's memory and swap metrics.
+pub async fn update_resource_metrics(
+    pool: &Pool, agent_name: &str, mem_free_mb: Option<i64>, swap_mb: Option<i64>,
+) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "UPDATE mc_fleet_status SET mem_free_mb=COALESCE(?,mem_free_mb), swap_mb=COALESCE(?,swap_mb), updated_at=NOW() WHERE agent_name=?",
+        (mem_free_mb, swap_mb, agent_name),
+    ).await?;
+    Ok(())
+}
+
 pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
     let rows: Vec<mysql_async::Row> = conn.query(
