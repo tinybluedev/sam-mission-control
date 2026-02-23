@@ -7277,7 +7277,7 @@ fn build_config_form_lines<'a>(config: &serde_json::Value, t: &Theme) -> Vec<Lin
                 let ctx_val = ctx.as_u64().unwrap_or(0);
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {:<20}", "agents.contextTokens"), label_style),
-                    Span::styled(format!("{}K", ctx_val / 1000), value_style),
+                    Span::styled(format!("{}", ctx_val), value_style),
                 ]));
                 lines.push(Line::from(Span::styled(format!("  {:<20}Maximum context window size in tokens", ""), desc_style)));
             }
@@ -11741,11 +11741,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Line::from(Span::styled(l.to_string(), Style::default().fg(t.text)))
                             })
                             .collect();
-                        (" openclaw.json (raw) — 'e' labeled view  Esc close ".to_string(), raw_lines)
+                        (" openclaw.json (raw) — 'e' labeled view · Esc to close ".to_string(), raw_lines)
                     } else {
                         // Labeled form mode: parse JSON and render with labels + descriptions
                         let form_lines = build_config_form_lines(app.config_json.as_ref().unwrap(), t);
-                        (" openclaw.json — 'e' raw view  ↑↓ scroll  Esc close ".to_string(), form_lines)
+                        (" openclaw.json — 'e' raw view · ↑↓ scroll · Esc to close ".to_string(), form_lines)
                     };
 
                     let p = Paragraph::new(lines).scroll((app.config_scroll, 0)).block(
@@ -12192,7 +12192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 },
                                 Screen::AgentDetail if app.config_text.is_some() => {
                                     match key.code {
-                                        KeyCode::Esc => {
+                                        KeyCode::Esc | KeyCode::Char('q') => {
                                             app.config_text = None;
                                             app.config_json = None;
                                         }
@@ -12205,10 +12205,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') => {
                                             app.config_scroll = app.config_scroll.saturating_add(3);
-                                        }
-                                        KeyCode::Char('q') => {
-                                            app.config_text = None;
-                                            app.config_json = None;
                                         }
                                         _ => {}
                                     }
