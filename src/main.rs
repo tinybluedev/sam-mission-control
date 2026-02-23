@@ -149,6 +149,20 @@ struct ChatLine {
     depth: u8,
 }
 
+#[derive(Clone, Debug)]
+struct BroadcastReplyRow {
+    agent: String,
+    status: String,
+    response: String,
+}
+
+#[derive(Clone, Debug)]
+struct BroadcastAggMsg {
+    agent: String,
+    status: String,
+    response: Option<String>,
+}
+
 #[derive(PartialEq, Clone)]
 enum Focus {
     Fleet,
@@ -1332,6 +1346,21 @@ impl App {
         &self.agent_chat_history
     }
 
+    fn apply_broadcast_msg(&mut self, msg: BroadcastAggMsg) {
+        if let Some(row) = self.broadcast_rows.iter_mut().find(|r| r.agent == msg.agent) {
+            row.status = msg.status;
+            if let Some(resp) = msg.response {
+                row.response = resp;
+            }
+            return;
+        }
+        self.broadcast_rows.push(BroadcastReplyRow {
+            agent: msg.agent,
+            status: msg.status,
+            response: msg.response.unwrap_or_default(),
+        });
+    }
+
     async fn send_message(&mut self) {
         if self.chat_input.trim().is_empty() {
             return;
@@ -1408,6 +1437,24 @@ impl App {
                 .await
                 .unwrap_or_default();
             let sys_prompt = self.build_system_prompt(None);
+            let use_overlay = agent_names.len() > 1;
+            let (broadcast_tx, broadcast_rx) = if use_overlay {
+                let (tx, rx) = mpsc::unbounded_channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            if use_overlay {
+                self.broadcast_active = true;
+                self.broadcast_title = Some(format!(" Broadcast Aggregation — {} agents ", agent_names.len()));
+                self.broadcast_rows = agent_names.iter().map(|name| BroadcastReplyRow {
+                    agent: name.clone(),
+                    status: "pending".into(),
+                    response: String::new(),
+                }).collect();
+                self.broadcast_scroll = 0;
+                self.broadcast_rx = broadcast_rx;
+            }
             // Fire streaming AI requests to targeted agents (or all if broadcast)
             for (i, agent) in self.agents.iter().enumerate() {
                 if targeted && !agent_names.contains(&agent.db_name) {
@@ -1421,17 +1468,22 @@ impl App {
                     let tok = tok.clone();
                     let msg = message.clone();
                     let pool = pool.clone();
-                    let msg_id = ids.get(i).copied().unwrap_or(0);
+                    let msg_id = id_by_agent.get(&agent.db_name).copied().unwrap_or(0);
                     let bcast_host = agent.host.clone();
                     let bcast_user = agent.ssh_user.clone();
+                    let bcast_agent = agent.db_name.clone();
                     let bcast_port = agent.gateway_port;
                     let sys_prompt = sys_prompt.clone();
+                    let bcast_tx = broadcast_tx.clone();
                     tokio::spawn(async move {
                         let client = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(120))
                             .build()
                             .unwrap_or_default();
                         let _ = db::update_chat_status(&pool, msg_id, "connecting").await;
+                        if let Some(tx) = &bcast_tx {
+                            let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "connecting".into(), response: None });
+                        }
                         let body = serde_json::json!({
                             "model": "openclaw:main",
                             "stream": true,
@@ -1458,6 +1510,9 @@ impl App {
                                     .to_string();
                                 if ct.contains("text/event-stream") || ct.contains("text/plain") {
                                     let _ = db::update_chat_status(&pool, msg_id, "thinking").await;
+                                    if let Some(tx) = &bcast_tx {
+                                        let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "thinking".into(), response: None });
+                                    }
                                     use futures_util::StreamExt;
                                     let mut stream = resp.bytes_stream();
                                     let mut full = String::new();
@@ -1499,8 +1554,14 @@ impl App {
                                         full = "(empty response)".into();
                                     }
                                     let _ = db::respond_to_chat(&pool, msg_id, &full).await;
+                                    if let Some(tx) = &bcast_tx {
+                                        let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "responded".into(), response: Some(full) });
+                                    }
                                 } else {
                                     let _ = db::update_chat_status(&pool, msg_id, "thinking").await;
+                                    if let Some(tx) = &bcast_tx {
+                                        let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "thinking".into(), response: None });
+                                    }
                                     match resp.json::<serde_json::Value>().await {
                                         Ok(j) => {
                                             let r = j["choices"][0]["message"]["content"]
@@ -1508,6 +1569,16 @@ impl App {
                                                 .unwrap_or("(no content)")
                                                 .to_string();
                                             let _ = db::respond_to_chat(&pool, msg_id, &r).await;
+                                            if let Some(tx) = &bcast_tx {
+                                                let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "responded".into(), response: Some(r) });
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let err = format!("Parse error: {}", e);
+                                            let _ = db::respond_to_chat(&pool, msg_id, &err).await;
+                                            if let Some(tx) = &bcast_tx {
+                                                let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: "failed".into(), response: Some(err) });
+                                            }
                                         }
                                         Err(e) => {
                                             let _ = db::respond_to_chat(
@@ -1568,6 +1639,10 @@ impl App {
                                     _ => "⚠ unreachable".into(),
                                 };
                                 let _ = db::respond_to_chat(&pool, msg_id, &response).await;
+                                if let Some(tx) = &bcast_tx {
+                                    let status = if response.contains("unreachable") { "failed" } else { "responded" };
+                                    let _ = tx.send(BroadcastAggMsg { agent: bcast_agent.clone(), status: status.into(), response: Some(response) });
+                                }
                             }
                         }
                     });
@@ -12644,6 +12719,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.ws_content = Some(content);
                 app.ws_content_scroll = 0;
             }
+        }
+        let mut broadcast_msgs = Vec::new();
+        if let Some(ref mut rx) = app.broadcast_rx {
+            while let Ok(msg) = rx.try_recv() {
+                broadcast_msgs.push(msg);
+            }
+        }
+        for msg in broadcast_msgs {
+            app.apply_broadcast_msg(msg);
         }
 
         if let Some(ref mut rx) = app.db_latency_rx {
