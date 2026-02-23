@@ -418,10 +418,16 @@ fn resource_bar(pct: Option<f32>, width: u16) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(empty),)
 }
 
-fn ssh_target(user: &str, host: &str) -> String { format!("{}@{}", user, host) }
+fn ssh_target(user: &str, host: &str) -> String {
+    format!("{}@{}", user, host)
+}
 
-fn ssh_jump_arg(jump_host: Option<&str>, jump_user: Option<&str>) -> Option<String> {
-    jump_host.map(|host| ssh_target(jump_user.unwrap_or("root"), host))
+fn ssh_jump_arg(
+    jump_host: Option<&str>,
+    jump_user: Option<&str>,
+    fallback_user: &str,
+) -> Option<String> {
+    jump_host.map(|host| ssh_target(jump_user.unwrap_or(fallback_user), host))
 }
 
 
@@ -2636,7 +2642,7 @@ PY"#, escaped_model);
                 "-o".to_string(),
                 "StrictHostKeyChecking=no".to_string(),
             ];
-            if let Some(jump) = ssh_jump_arg(jump_host, jump_user) {
+            if let Some(jump) = ssh_jump_arg(jump_host, jump_user, user) {
                 args.push("-J".to_string());
                 args.push(jump);
             }
@@ -3055,7 +3061,9 @@ PY"#, escaped_model);
             } else {
                 let mut cmd = tokio::process::Command::new("ssh");
                 cmd.args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"]);
-                if let Some(jump) = ssh_jump_arg(jump_host.as_deref(), jump_user.as_deref()) {
+                if let Some(jump) =
+                    ssh_jump_arg(jump_host.as_deref(), jump_user.as_deref(), &user)
+                {
                     cmd.args(["-J", &jump]);
                 }
                 cmd.args([&ssh_target(&user, &host), &remote_cmd])
@@ -6384,7 +6392,7 @@ async fn probe_agent(
             "-o".to_string(),
             "BatchMode=yes".to_string(),
         ];
-        if let Some(jump) = ssh_jump_arg(jump_host, jump_user) {
+        if let Some(jump) = ssh_jump_arg(jump_host, jump_user, user) {
             args.push("-J".to_string());
             args.push(jump);
         }
@@ -6511,7 +6519,7 @@ async fn probe_agent(
         "-o".to_string(),
         "BatchMode=yes".to_string(),
     ];
-    if let Some(jump) = ssh_jump_arg(jump_host, jump_user) {
+    if let Some(jump) = ssh_jump_arg(jump_host, jump_user, user) {
         args.push("-J".to_string());
         args.push(jump);
     }
