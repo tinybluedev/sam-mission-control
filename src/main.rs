@@ -3097,13 +3097,18 @@ PY"#, escaped_model);
             } else {
                 ""
             };
-            let install_cmd = if has_sudo_npm {
+            // Only use sudo if npm prefix is a system path (not user home dir)
+            // e.g. /usr/local, /usr — never sudo if prefix is /home/ or /Users/
+            let prefix_is_user_dir = npm_prefix.starts_with("/home/")
+                || npm_prefix.starts_with("/Users/")
+                || npm_prefix.contains("/.npm");
+            let install_cmd = if has_sudo_npm && !prefix_is_user_dir {
                 format!(
                     "{}sudo npm install -g openclaw@latest{} 2>&1; echo EXITCODE:$?:DONE",
                     pfx, ignore_scripts
                 )
             } else {
-                // No sudo or sudo npm broken — install to user prefix
+                // User-owned prefix — install directly (no sudo to avoid /root pollution)
                 format!(
                     "{}npm install -g openclaw@latest{} 2>&1; echo EXITCODE:$?:DONE",
                     pfx, ignore_scripts
