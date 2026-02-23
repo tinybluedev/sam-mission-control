@@ -7,6 +7,8 @@ display = "Hub Node"
 emoji = "🛰️"
 location = "Home"
 ssh_user = "admin"
+jump_host = "bastion.home"
+jump_user = "admin"
 
 [[agent]]
 name = "worker-1"

@@ -27,6 +27,8 @@ pub struct AgentConfig {
     pub emoji: Option<String>,
     pub location: Option<String>,
     pub ssh_user: Option<String>,
+    pub jump_host: Option<String>,
+    pub jump_user: Option<String>,
 }
 
 impl AgentConfig {
@@ -45,6 +47,15 @@ impl AgentConfig {
     /// Return the SSH username, defaulting to `"root"`.
     pub fn ssh_user(&self) -> &str {
         self.ssh_user.as_deref().unwrap_or("root")
+    }
+    /// Return the SSH jump host, if configured.
+    pub fn jump_host(&self) -> Option<&str> {
+        self.jump_host.as_deref().filter(|s| !s.trim().is_empty())
+    }
+    /// Return the SSH jump username, defaulting to the agent SSH user when omitted.
+    pub fn jump_user(&self) -> Option<&str> {
+        self.jump_host()
+            .map(|_| self.jump_user.as_deref().unwrap_or(self.ssh_user()))
     }
 }
 
@@ -119,6 +130,8 @@ mod tests {
             emoji: None,
             location: None,
             ssh_user: None,
+            jump_host: None,
+            jump_user: None,
         }
     }
 
@@ -137,5 +150,35 @@ mod tests {
         let agents = vec![agent("gpu-node", Some("GPU Node"))];
         assert_eq!(resolve_alias("gpu", &agents), "gpu-node");
         assert_eq!(resolve_alias("UNLISTED", &agents), "unlisted");
+    }
+
+    #[test]
+    fn jump_user_defaults_to_agent_ssh_user_when_jump_host_is_set() {
+        let cfg = AgentConfig {
+            name: "agent-a".into(),
+            display: None,
+            emoji: None,
+            location: None,
+            ssh_user: Some("ubuntu".into()),
+            jump_host: Some("bastion.internal".into()),
+            jump_user: None,
+        };
+        assert_eq!(cfg.jump_host(), Some("bastion.internal"));
+        assert_eq!(cfg.jump_user(), Some("ubuntu"));
+    }
+
+    #[test]
+    fn jump_user_is_none_without_jump_host() {
+        let cfg = AgentConfig {
+            name: "agent-a".into(),
+            display: None,
+            emoji: None,
+            location: None,
+            ssh_user: Some("ubuntu".into()),
+            jump_host: None,
+            jump_user: Some("bastion-user".into()),
+        };
+        assert_eq!(cfg.jump_host(), None);
+        assert_eq!(cfg.jump_user(), None);
     }
 }

@@ -46,6 +46,10 @@ struct Agent {
     last_seen: String,
     current_task: Option<String>,
     ssh_user: String,
+    #[serde(default)]
+    jump_host: Option<String>,
+    #[serde(default)]
+    jump_user: Option<String>,
     capabilities: Vec<String>,
     token_burn: i32,
     latency_ms: Option<u32>,
@@ -471,6 +475,18 @@ fn resource_bar(pct: Option<f32>, width: u16) -> String {
     let filled = ((p / 100.0) * width as f32) as usize;
     let empty = (width as usize).saturating_sub(filled);
     format!("{}{}", "█".repeat(filled), "░".repeat(empty),)
+}
+
+fn ssh_target(user: &str, host: &str) -> String {
+    format!("{}@{}", user, host)
+}
+
+fn ssh_jump_arg(
+    jump_host: Option<&str>,
+    jump_user: Option<&str>,
+    fallback_user: &str,
+) -> Option<String> {
+    jump_host.map(|host| ssh_target(jump_user.unwrap_or(fallback_user), host))
 }
 
 
@@ -907,6 +923,8 @@ impl App {
                         ssh_user: cfg
                             .map(|c| c.ssh_user().to_string())
                             .unwrap_or_else(|| "root".into()),
+                        jump_host: cfg.and_then(|c| c.jump_host().map(|s| s.to_string())),
+                        jump_user: cfg.and_then(|c| c.jump_user().map(|s| s.to_string())),
                         capabilities: caps,
                         token_burn: da.token_burn_today,
                         latency_ms: None,
@@ -2712,7 +2730,14 @@ PY"#, escaped_model);
     }
 
     /// Run diagnostics on focused agent (non-blocking, step-by-step)
-    async fn ssh_run(host: &str, user: &str, self_ip: &str, cmd: &str) -> String {
+    async fn ssh_run(
+        host: &str,
+        user: &str,
+        jump_host: Option<&str>,
+        jump_user: Option<&str>,
+        self_ip: &str,
+        cmd: &str,
+    ) -> String {
         let out = if host == "localhost" || host == self_ip {
             tokio::process::Command::new("bash")
                 .args(["-c", cmd])
@@ -2720,19 +2745,24 @@ PY"#, escaped_model);
                 .await
                 .ok()
         } else {
+            let mut args = vec![
+                "-o".to_string(),
+                "ConnectTimeout=5".to_string(),
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                "-o".to_string(),
+                "StrictHostKeyChecking=no".to_string(),
+            ];
+            if let Some(jump) = ssh_jump_arg(jump_host, jump_user, user) {
+                args.push("-J".to_string());
+                args.push(jump);
+            }
+            args.push(ssh_target(user, host));
+            args.push(cmd.to_string());
             tokio::time::timeout(
                 std::time::Duration::from_secs(15),
                 tokio::process::Command::new("ssh")
-                    .args([
-                        "-o",
-                        "ConnectTimeout=5",
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "StrictHostKeyChecking=no",
-                        &format!("{}@{}", user, host),
-                        cmd,
-                    ])
+                    .args(args)
                     .output(),
             )
             .await
@@ -2750,6 +2780,8 @@ PY"#, escaped_model);
         let agent = &self.agents[self.selected];
         let host = agent.host.clone();
         let user = agent.ssh_user.clone();
+        let jump_host = agent.jump_host.clone();
+        let jump_user = agent.jump_user.clone();
         let name = agent.db_name.clone();
         let is_mac = agent.os.to_lowercase().contains("mac");
         let self_ip = self.self_ip.clone();
@@ -2793,6 +2825,8 @@ PY"#, escaped_model);
             let cur = App::ssh_run(
                 &host,
                 &user,
+                jump_host.as_deref(),
+                jump_user.as_deref(),
                 &self_ip,
                 &format!(
                     "{}openclaw --version 2>/dev/null || echo '(not installed)'",
@@ -2817,7 +2851,15 @@ PY"#, escaped_model);
                 "{}node --version 2>/dev/null && npm --version 2>/dev/null && df -k $(npm config get prefix 2>/dev/null || echo /usr) | awk 'NR==2{{print $4}}' | xargs -I{{}} bash -c 'if [ {{}} -lt 512000 ]; then echo LOW_DISK; else echo OK_DISK; fi' 2>/dev/null || echo OK_DISK",
                 pfx
             );
-            let preflight_out = App::ssh_run(&host, &user, &self_ip, &preflight_cmd).await;
+            let preflight_out = App::ssh_run(
+                &host,
+                &user,
+                jump_host.as_deref(),
+                jump_user.as_deref(),
+                &self_ip,
+                &preflight_cmd,
+            )
+            .await;
             if preflight_out.contains("LOW_DISK") {
                 let _ = tx.send(DiagStep {
                     label: "Pre-flight checks".into(),
@@ -2835,6 +2877,8 @@ PY"#, escaped_model);
             let has_sudo_npm = App::ssh_run(
                 &host,
                 &user,
+                jump_host.as_deref(),
+                jump_user.as_deref(),
                 &self_ip,
                 &format!(
                     "{}sudo -n npm --version 2>/dev/null && echo HAS_SUDO_NPM || echo NO_SUDO_NPM",
@@ -2846,6 +2890,8 @@ PY"#, escaped_model);
             let npm_prefix = App::ssh_run(
                 &host,
                 &user,
+                jump_host.as_deref(),
+                jump_user.as_deref(),
                 &self_ip,
                 &format!("{}npm config get prefix 2>/dev/null", pfx),
             )
@@ -2855,6 +2901,8 @@ PY"#, escaped_model);
             let needs_ignore_scripts = App::ssh_run(
                 &host,
                 &user,
+                jump_host.as_deref(),
+                jump_user.as_deref(),
                 &self_ip,
                 &format!(
                     "{}gcc --version 2>/dev/null && echo HAS_GCC || echo NO_GCC",
@@ -3022,6 +3070,8 @@ PY"#, escaped_model);
             let new_v = App::ssh_run(
                 &host,
                 &user,
+                jump_host.as_deref(),
+                jump_user.as_deref(),
                 &self_ip,
                 &format!("{}openclaw --version 2>/dev/null || echo '?'", pfx),
             )
@@ -3042,7 +3092,15 @@ PY"#, escaped_model);
                 "{}openclaw gateway restart 2>&1 | tail -1 || ~/.npm-global/bin/openclaw gateway restart 2>&1 | tail -1 || systemctl --user restart openclaw-gateway 2>&1 | tail -1 || echo 'restart skipped - run manually'",
                 pfx
             );
-            let restart_msg = App::ssh_run(&host, &user, &self_ip, &restart_cmd).await;
+            let restart_msg = App::ssh_run(
+                &host,
+                &user,
+                jump_host.as_deref(),
+                jump_user.as_deref(),
+                &self_ip,
+                &restart_cmd,
+            )
+            .await;
             let restart_ok = !restart_msg.contains("skipped") && !restart_msg.is_empty();
             let _ = tx.send(DiagStep {
                 label: "Restarting gateway".into(),
@@ -3072,6 +3130,8 @@ PY"#, escaped_model);
         let agent = &self.agents[idx];
         let host = agent.host.clone();
         let user = agent.ssh_user.clone();
+        let jump_host = agent.jump_host.clone();
+        let jump_user = agent.jump_user.clone();
         let name = agent.db_name.clone();
         let self_ip = self.self_ip.clone();
         let pool_opt = self.db_pool.clone();
@@ -3110,11 +3170,14 @@ PY"#, escaped_model);
                     .stderr(std::process::Stdio::piped())
                     .spawn()
             } else {
-                tokio::process::Command::new("ssh")
-                    .args([
-                        "-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
-                        &format!("{}@{}", user, host), &remote_cmd,
-                    ])
+                let mut cmd = tokio::process::Command::new("ssh");
+                cmd.args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"]);
+                if let Some(jump) =
+                    ssh_jump_arg(jump_host.as_deref(), jump_user.as_deref(), &user)
+                {
+                    cmd.args(["-J", &jump]);
+                }
+                cmd.args([&ssh_target(&user, &host), &remote_cmd])
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
@@ -3152,7 +3215,15 @@ PY"#, escaped_model);
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
 
-            let pid_out = App::ssh_run(&host, &user, &self_ip, "pgrep -f 'openclaw.*gateway' | head -1").await;
+            let pid_out = App::ssh_run(
+                &host,
+                &user,
+                jump_host.as_deref(),
+                jump_user.as_deref(),
+                &self_ip,
+                "pgrep -f 'openclaw.*gateway' | head -1",
+            )
+            .await;
             let gw_pid = pid_out.trim().parse::<i32>().ok();
             if let Some(ref pool) = pool_opt {
                 let _ = db::update_gateway_pid(pool, &name, gw_pid).await;
@@ -6174,12 +6245,26 @@ PY",
         self.refresh_rx = Some(rx);
 
         for (i, a) in self.agents.iter().enumerate() {
-            let (host, user, sip) = (a.host.clone(), a.ssh_user.clone(), self.self_ip.clone());
+            let (host, user, jump_host, jump_user, sip) = (
+                a.host.clone(),
+                a.ssh_user.clone(),
+                a.jump_host.clone(),
+                a.jump_user.clone(),
+                self.self_ip.clone(),
+            );
             let tx = tx.clone();
             let full = self.refresh_cycle % 5 == 0; // full probe every 5th cycle
             tokio::spawn(async move {
                 let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx) =
-                    probe_agent(&host, &user, &sip, full).await;
+                    probe_agent(
+                        &host,
+                        &user,
+                        jump_host.as_deref(),
+                        jump_user.as_deref(),
+                        &sip,
+                        full,
+                    )
+                    .await;
                 let _ = tx.send(ProbeResult {
                     index: i,
                     status,
@@ -6425,6 +6510,8 @@ PY",
 async fn probe_agent(
     host: &str,
     user: &str,
+    jump_host: Option<&str>,
+    jump_user: Option<&str>,
     self_ip: &str,
     full: bool,
 ) -> (
@@ -6442,21 +6529,25 @@ async fn probe_agent(
     let start = Instant::now();
     // Fast probe: just SSH echo (connectivity + latency only)
     if !full && host != "localhost" && host != self_ip {
-        let tgt = format!("{}@{}", user, host);
+        let mut args = vec![
+            "-o".to_string(),
+            "ConnectTimeout=1".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=no".to_string(),
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+        ];
+        if let Some(jump) = ssh_jump_arg(jump_host, jump_user, user) {
+            args.push("-J".to_string());
+            args.push(jump);
+        }
+        args.push(ssh_target(user, host));
+        args.push("echo".to_string());
+        args.push("ok".to_string());
         let result = tokio::time::timeout(
             Duration::from_secs(3),
             Command::new("ssh")
-                .args([
-                    "-o",
-                    "ConnectTimeout=1",
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "BatchMode=yes",
-                    &tgt,
-                    "echo",
-                    "ok",
-                ])
+                .args(args)
                 .output(),
         )
         .await;
@@ -6564,23 +6655,27 @@ async fn probe_agent(
             None,
         );
     }
-    let tgt = format!("{}@{}", user, host);
     let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(openclaw --version 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); GWPID=$(pgrep -f 'openclaw.*gateway' 2>/dev/null | head -1 || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; echo "GWPID:$GWPID"; ACT=$(openclaw status --json 2>/dev/null || ~/.npm-global/bin/openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(openclaw status --json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
+    let mut args = vec![
+        "-o".to_string(),
+        "ConnectTimeout=2".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+    ];
+    if let Some(jump) = ssh_jump_arg(jump_host, jump_user, user) {
+        args.push("-J".to_string());
+        args.push(jump);
+    }
+    args.push(ssh_target(user, host));
+    args.push("bash".to_string());
+    args.push("-c".to_string());
+    args.push(script.to_string());
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new("ssh")
-            .args([
-                "-o",
-                "ConnectTimeout=2",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "BatchMode=yes",
-                &tgt,
-                "bash",
-                "-c",
-                script,
-            ])
+            .args(args)
             .output(),
     )
     .await;
@@ -10865,6 +10960,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mem_free_mb: None,
                         swap_mb: None,
                         ssh_user: cfg.map(|c| c.ssh_user().to_string()).unwrap_or_else(|| "root".into()),
+                        jump_host: cfg.and_then(|c| c.jump_host().map(|s| s.to_string())),
+                        jump_user: cfg.and_then(|c| c.jump_user().map(|s| s.to_string())),
                         capabilities: vec![],
                         token_burn: da.token_burn_today,
                         latency_ms: None,
@@ -11192,6 +11289,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             emoji: Some(app.wizard.emoji.clone()),
                                             location: Some(app.wizard.location_str().to_string()),
                                             ssh_user: Some(app.wizard.ssh_user.clone()),
+                                            jump_host: None,
+                                            jump_user: None,
                                         });
                                         // Add to agents vec
                                         app.agents.push(Agent {
@@ -11205,6 +11304,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             oc_version: String::new(), last_seen: String::new(),
                                             current_task: None,
                                             ssh_user: app.wizard.ssh_user.clone(),
+                                            jump_host: None,
+                                            jump_user: None,
                                             capabilities: vec![],
                                             token_burn: 0,
                                             latency_ms: None,
@@ -11230,6 +11331,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         emoji: Some(app.wizard.emoji.clone()),
                                         location: Some(app.wizard.location_str().to_string()),
                                         ssh_user: Some(app.wizard.ssh_user.clone()),
+                                        jump_host: None,
+                                        jump_user: None,
                                     });
                                     // Add to agents vec
                                     app.agents.push(Agent {
@@ -11245,6 +11348,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         last_seen: String::new(),
                                         current_task: None,
                                         ssh_user: app.wizard.ssh_user.clone(),
+                                        jump_host: None,
+                                        jump_user: None,
                                         capabilities: vec![],
                                         token_burn: 0,
                                         latency_ms: None,
@@ -13217,6 +13322,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 emoji: Some(pending.emoji.clone()),
                 location: Some(pending.location.clone()),
                 ssh_user: Some(pending.ssh_user.clone()),
+                jump_host: None,
+                jump_user: None,
             });
             let gw_token = commit.gateway_token.clone();
             let os_info = commit.os_info.clone();
@@ -13233,6 +13340,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_seen: String::new(),
                 current_task: None,
                 ssh_user: pending.ssh_user.clone(),
+                jump_host: None,
+                jump_user: None,
                 capabilities: vec![],
                 token_burn: 0,
                 latency_ms: None,
