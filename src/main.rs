@@ -1225,7 +1225,7 @@ impl App {
         }
     }
 
-    /// Returns indices into self.agents that match the current group_filter
+    /// Returns indices into self.agents that match the current group_filter and filter_text
     fn filtered_agent_indices(&self) -> Vec<usize> {
         self.agents
             .iter()
@@ -6582,6 +6582,28 @@ fn mini_bar_color(pct: Option<f32>, t: &Theme, warn: f32, crit: f32) -> Color {
         Some(_) => t.status_online,
         None => t.text_dim,
     }
+}
+
+/// Fuzzy match: returns byte-index positions in `text` of each character in `query`
+/// (in order, not necessarily adjacent). Case-insensitive.
+fn fuzzy_match(text: &str, query: &str) -> Option<Vec<usize>> {
+    if query.is_empty() { return Some(vec![]); }
+    let mut positions = Vec::with_capacity(query.len());
+    let mut text_chars = text.char_indices().peekable();
+    for qc in query.chars().flat_map(|c| c.to_lowercase()) {
+        loop {
+            match text_chars.next() {
+                Some((idx, tc)) => {
+                    if tc.to_lowercase().next() == Some(qc) {
+                        positions.push(idx);
+                        break;
+                    }
+                }
+                None => return None,
+            }
+        }
+    }
+    Some(positions)
 }
 
 fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool) {
