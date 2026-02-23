@@ -1161,9 +1161,10 @@ impl App {
             });
         }
 
-        // Detect first launch — no config file exists yet
-        let is_first_launch = !std::path::Path::new(&format!("{}/.sam/config.toml", std::env::var("HOME").unwrap_or_default())).exists()
-            && !std::path::Path::new(".env").exists();
+        // First launch = SAM_DB_URL not set anywhere (env, .env, config)
+        // If the var is present the user is already configured — never show wizard uninvited
+        let is_first_launch = std::env::var("SAM_DB_URL").is_err()
+            && std::env::var("SAM_SELF_IP").is_err();
 
         App {
             fleet_config: fleet_config.agent,
