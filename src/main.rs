@@ -445,6 +445,7 @@ const FLEET_SEARCH_TARGET_GLOBS: &str = "~/CLAUDE/clawd/ ~/.openclaw/";
 const FLEET_SEARCH_MAX_RESULTS: usize = 50;
 const FLEET_SEARCH_TIMEOUT_SECS: u64 = 10;
 const FLEET_SEARCH_ERROR_MAX_CHARS: usize = 120;
+const GATEWAY_CONFIRM_TIMEOUT_SECS: u64 = 5;
 
 fn summarize_fleet_search_output(output: &str) -> (usize, String) {
     let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -454,7 +455,7 @@ fn summarize_fleet_search_output(output: &str) -> (usize, String) {
 }
 
 // ── Gateway action type ────────────────────────────────────────────
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum GatewayAction { Start, Stop, Restart }
 
 // ── Audit pipeline ─────────────────────────────────────────────────
@@ -580,7 +581,6 @@ struct App {
     alerts: Vec<Alert>,
     alert_flash: Option<Instant>,
     alerts_scroll: u16,
-    gateway_confirm_at: Option<Instant>,
     gateway_action_confirm: Option<(usize, GatewayAction, Instant)>,
     // Diagnostics (inline doctor/fix)
     diag_active: bool,
@@ -930,7 +930,6 @@ impl App {
             alerts: vec![],
             alert_flash: None,
             alerts_scroll: 0,
-            gateway_confirm_at: None,
             multi_selected: HashSet::new(), // usize indices
             spinner_frame: 0,
             sort_mode: SortMode::Name,
@@ -3063,6 +3062,23 @@ PY"#, escaped_model);
                 detail: if action_ok && final_status { format!("Gateway {} complete", action_label) } else { format!("Gateway {} may have failed", action_label) },
             });
         });
+    }
+
+    fn request_gateway_action_confirm(&mut self, action: GatewayAction) {
+        if self.selected >= self.agents.len() {
+            return;
+        }
+        let (action_label, confirm_key) = match action {
+            GatewayAction::Start => ("start", "s"),
+            GatewayAction::Stop => ("stop", "x"),
+            GatewayAction::Restart => ("restart", "g"),
+        };
+        let agent_name = self.agents[self.selected].name.clone();
+        self.gateway_action_confirm = Some((self.selected, action, Instant::now()));
+        self.toast(&format!(
+            "⚠ Press {} again to {} gateway on {}",
+            confirm_key, action_label, agent_name
+        ));
     }
 
     fn start_diagnostics(&mut self, fix: bool) {
@@ -8088,6 +8104,48 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     // Agent chat
     render_chat_panel(frame, app, body[1], app.focus == Focus::AgentChat, true);
 
+    if let Some((idx, action, started_at)) = app.gateway_action_confirm {
+        if idx == app.selected
+            && started_at.elapsed().as_secs() < GATEWAY_CONFIRM_TIMEOUT_SECS
+        {
+            let (action_label, confirm_key) = match action {
+                GatewayAction::Start => ("start", "s"),
+                GatewayAction::Stop => ("stop", "x"),
+                GatewayAction::Restart => ("restart", "g"),
+            };
+            let agent_name = app
+                .agents
+                .get(idx)
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| "?".into());
+            let w = frame.area().width.min(62);
+            let h = frame.area().height.min(6);
+            let x = (frame.area().width.saturating_sub(w)) / 2;
+            let y = (frame.area().height.saturating_sub(h)) / 2;
+            let popup = Rect::new(x, y, w, h);
+            frame.render_widget(Clear, popup);
+            let modal = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Confirm {} gateway on {}?", action_label, agent_name),
+                    Style::default().fg(t.status_offline).bold(),
+                )),
+                Line::from(Span::styled(
+                    format!("  Press {} again to confirm, Esc to cancel", confirm_key),
+                    Style::default().fg(t.text_dim),
+                )),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(t.border_type)
+                    .border_style(Style::default().fg(t.status_offline))
+                    .style(Style::default().bg(app.bg_density.bg())),
+            );
+            frame.render_widget(modal, popup);
+        }
+    }
+
     // Footer
     render_footer(frame, app, chunks[2]);
 }
@@ -11001,6 +11059,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 _ => {}
                             }
                         } else {
+                            if let Some((idx, action, started_at)) = app.gateway_action_confirm {
+                                if started_at.elapsed().as_secs() >= GATEWAY_CONFIRM_TIMEOUT_SECS {
+                                    app.gateway_action_confirm = None;
+                                } else {
+                                    let confirm_key = match action {
+                                        GatewayAction::Start => 's',
+                                        GatewayAction::Stop => 'x',
+                                        GatewayAction::Restart => 'g',
+                                    };
+                                    match key.code {
+                                        KeyCode::Char(ch)
+                                            if ch == confirm_key && app.selected == idx =>
+                                        {
+                                            app.gateway_action_confirm = None;
+                                            app.start_gateway_action(action);
+                                        }
+                                        KeyCode::Esc => {
+                                            app.gateway_action_confirm = None;
+                                            app.toast("Gateway action cancelled");
+                                        }
+                                        _ => {}
+                                    }
+                                    continue;
+                                }
+                            }
                             match app.screen {
                                 Screen::SpawnManager => {
                                     if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
@@ -11080,42 +11163,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         KeyCode::Char('D') => app.start_diagnostics(true),
                                         KeyCode::Char('U') => app.start_oc_update(),
                                         KeyCode::Char('g') => {
-                                            // Restart gateway from services tab
-                                            if let Some(agent) = app.agents.get(app.selected) {
-                                                let host = agent.host.clone();
-                                                let user = agent.ssh_user.clone();
-                                                let name = agent.name.clone();
-                                                let is_mac =
-                                                    agent.os.to_lowercase().contains("mac");
-                                                app.toast(&format!(
-                                                    "🔄 Restarting gateway on {}...",
-                                                    name
-                                                ));
-                                                tokio::spawn(async move {
-                                                    let pfx = if is_mac {
-                                                        "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
-                                                    } else {
-                                                        ""
-                                                    };
-                                                    let cmd = format!(
-                                                        "{}openclaw gateway restart 2>&1 | tail -1",
-                                                        pfx
-                                                    );
-                                                    let _ = tokio::process::Command::new("ssh")
-                                                        .args([
-                                                            "-o",
-                                                            "ConnectTimeout=2",
-                                                            "-o",
-                                                            "StrictHostKeyChecking=no",
-                                                            "-o",
-                                                            "BatchMode=yes",
-                                                            &format!("{}@{}", user, host),
-                                                            &cmd,
-                                                        ])
-                                                        .output()
-                                                        .await;
-                                                });
-                                            }
+                                            app.request_gateway_action_confirm(
+                                                GatewayAction::Restart,
+                                            );
                                         }
                                         KeyCode::Char('l') => {
                                             // View gateway logs from services tab
@@ -12398,63 +12448,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     }
                                                 }
                                                 KeyCode::Char('g') => {
-                                                    // Restart gateway on focused agent — requires two presses within 5s
-                                                    if let Some(agent) =
-                                                        app.agents.get(app.selected)
-                                                    {
-                                                        let name = agent.name.clone();
-                                                        let confirmed = app
-                                                            .gateway_confirm_at
-                                                            .map(|t| t.elapsed().as_secs() < 5)
-                                                            .unwrap_or(false);
-                                                        if confirmed {
-                                                            app.gateway_confirm_at = None;
-                                                            let host = agent.host.clone();
-                                                            let user = agent.ssh_user.clone();
-                                                            let is_mac = agent
-                                                                .os
-                                                                .to_lowercase()
-                                                                .contains("mac");
-                                                            app.status_message = format!(
-                                                                "🔄 Restarting gateway on {}...",
-                                                                name
-                                                            );
-                                                            tokio::spawn(async move {
-                                                                let pfx = if is_mac {
-                                                                    "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
-                                                                } else {
-                                                                    ""
-                                                                };
-                                                                let cmd = format!(
-                                                                    "{}openclaw gateway restart 2>&1 | tail -1",
-                                                                    pfx
-                                                                );
-                                                                let _ =
-                                                                    tokio::process::Command::new(
-                                                                        "ssh",
-                                                                    )
-                                                                    .args([
-                                                                        "-o",
-                                                                        "ConnectTimeout=2",
-                                                                        "-o",
-                                                                        "StrictHostKeyChecking=no",
-                                                                        "-o",
-                                                                        "BatchMode=yes",
-                                                                        &format!(
-                                                                            "{}@{}",
-                                                                            user, host
-                                                                        ),
-                                                                        &cmd,
-                                                                    ])
-                                                                    .output()
-                                                                    .await;
-                                                            });
-                                                        } else {
-                                                            app.gateway_confirm_at =
-                                                                Some(Instant::now());
-                                                            app.toast(&format!("⚠ Press g again to restart gateway on {}", name));
-                                                        }
-                                                    }
+                                                    app.request_gateway_action_confirm(
+                                                        GatewayAction::Restart,
+                                                    );
                                                 }
                                                 KeyCode::Char('w') => {
                                                     app.screen = Screen::Alerts;
