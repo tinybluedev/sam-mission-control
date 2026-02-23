@@ -158,6 +158,12 @@ pub enum Commands {
         #[arg(long, default_value = "20")]
         tail: u32,
     },
+    /// Validate openclaw.json schema on one or all agents
+    Validate {
+        /// Check only this agent (omit to validate all)
+        #[arg(short, long)]
+        agent: Option<String>,
+    },
     /// Run scheduled-operations executor without launching TUI
     Daemon,
 }
@@ -1676,4 +1682,33 @@ mod tests {
         let cfg: SamConfig = toml::from_str("[tui]\nvim_mode = true\n").expect("config should parse");
         assert!(cfg.tui.vim_mode);
     }
+}
+
+/// Validate openclaw.json on the specified agent (or all agents).
+pub async fn run_validate(agent: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::config;
+    let fleet = config::load_fleet_config().map_err(|e| format!("{}", e))?;
+    let targets: Vec<&config::AgentConfig> = if let Some(name) = agent {
+        fleet.agent.iter().filter(|a| a.name == name).collect()
+    } else {
+        fleet.agent.iter().collect()
+    };
+    if targets.is_empty() {
+        eprintln!("No matching agents found");
+        return Ok(());
+    }
+    for ag in targets {
+        let user = ag.ssh_user.as_deref().unwrap_or("papasmurf");
+        let host = &ag.name;
+        let result = tokio::process::Command::new("ssh")
+            .args(["-o","ConnectTimeout=5","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                &format!("{}@{}", user, host),
+                "python3 -c \"import json,sys; d=json.load(open(\\\"$HOME/.openclaw/openclaw.json\\\")); print('ok: model=' + str(d.get('agents',{}).get('defaults',{}).get('model','?')))\" 2>&1"])
+            .output().await;
+        match result {
+            Ok(o) => println!("{}: {}", ag.name, String::from_utf8_lossy(&o.stdout).trim()),
+            Err(e) => println!("{}: SSH failed — {}", ag.name, e),
+        }
+    }
+    Ok(())
 }

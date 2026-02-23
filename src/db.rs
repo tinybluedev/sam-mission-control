@@ -799,6 +799,18 @@ pub struct Operation {
     pub output: Option<String>,
 }
 
+
+/// A scheduled operation row from mc_scheduled_ops.
+#[derive(Debug, Clone)]
+pub struct ScheduledOp {
+    pub id: i64,
+    pub scheduled_at: String,
+    pub op_type: String,
+    pub target: String,
+    pub params_json: String,
+    pub status: String,
+}
+
 /// A row from mc_operations, used by `sam log`
 pub struct OperationRecord {
     pub id: u64,
