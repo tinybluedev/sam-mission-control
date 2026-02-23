@@ -696,6 +696,11 @@ struct App {
     dashboard_divider_area: ratatui::layout::Rect,
     detail_divider_area: ratatui::layout::Rect,
     // Audit log
+    // Fleet stats overlay
+    stats_active: bool,
+    // Chat export dialog
+    export_dialog_active: bool,
+    export_format_idx: usize, // 0=markdown,1=json,2=txt
     // Fleet search
     fleet_search_active: bool,
     fleet_search_running: bool,
@@ -1001,6 +1006,9 @@ impl App {
             svc_panel_name: None,
             svc_panel_outputs: HashMap::new(),
             svc_panel_errors: HashMap::new(),
+            stats_active: false,
+            export_dialog_active: false,
+            export_format_idx: 0,
             fleet_search_active: false,
             fleet_search_running: false,
             fleet_search_query: String::new(),
@@ -8623,6 +8631,202 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
                 .style(Style::default().bg(app.bg_density.bg())),
         );
     frame.render_widget(diag, popup);
+}
+
+
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+fn render_fleet_stats(frame: &mut Frame, app: &App) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::widgets::{Block, Borders, Gauge, Row, Table};
+    use ratatui::style::{Style, Modifier};
+    let t = &app.theme;
+    let area = centered_rect(80, 88, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let agents = &app.agents;
+    let total = agents.len();
+    let online = agents.iter().filter(|a| matches!(a.status, AgentStatus::Online | AgentStatus::Busy)).count();
+    let offline = agents.iter().filter(|a| matches!(a.status, AgentStatus::Offline | AgentStatus::Unknown)).count();
+
+    // Version breakdown
+    let latest = &app.latest_oc_version;
+    let current = agents.iter().filter(|a| !a.oc_version.is_empty() && &a.oc_version == latest).count();
+    let outdated = agents.iter().filter(|a| !a.oc_version.is_empty() && &a.oc_version != latest).count();
+    let unknown_ver = agents.iter().filter(|a| a.oc_version.is_empty()).count();
+
+    // OS breakdown
+    let mut os_map: std::collections::BTreeMap<String, usize> = Default::default();
+    for a in agents {
+        let os = if a.os.to_lowercase().contains("macos") || a.os.to_lowercase().contains("darwin") { "macOS" }
+                 else if a.os.to_lowercase().contains("arch") { "Arch Linux" }
+                 else if a.os.to_lowercase().contains("ubuntu") { "Ubuntu" }
+                 else if a.os.to_lowercase().contains("debian") { "Debian" }
+                 else if a.os.to_lowercase().contains("fedora") { "Fedora" }
+                 else if a.os.to_lowercase().contains("alma") { "AlmaLinux" }
+                 else if a.os.to_lowercase().contains("android") { "Android" }
+                 else if a.os.is_empty() { "unknown" }
+                 else { "Linux" };
+        *os_map.entry(os.to_string()).or_insert(0) += 1;
+    }
+
+    // Location breakdown
+    let home = agents.iter().filter(|a| a.location == "Home").count();
+    let sm = agents.iter().filter(|a| a.location == "SM" || a.location == "Strange Music").count();
+    let mobile = agents.iter().filter(|a| a.location == "Mobile").count();
+    let vps = agents.iter().filter(|a| a.location == "VPS").count();
+
+    // Latency stats
+    let latencies: Vec<u32> = agents.iter().filter_map(|a| a.latency_ms).collect();
+    let avg_lat = if latencies.is_empty() { 0 } else { latencies.iter().sum::<u32>() / latencies.len() as u32 };
+    let max_lat = latencies.iter().max().copied().unwrap_or(0);
+
+    // CPU/RAM averages
+    let cpus: Vec<f32> = agents.iter().filter_map(|a| a.cpu_pct).collect();
+    let rams: Vec<f32> = agents.iter().filter_map(|a| a.ram_pct).collect();
+    let avg_cpu = if cpus.is_empty() { 0.0 } else { cpus.iter().sum::<f32>() / cpus.len() as f32 };
+    let avg_ram = if rams.is_empty() { 0.0 } else { rams.iter().sum::<f32>() / rams.len() as f32 };
+
+    // Token burn top agents
+    let mut top_burners: Vec<(&str, i32)> = agents.iter()
+        .filter(|a| a.token_burn > 0)
+        .map(|a| (a.name.as_str(), a.token_burn))
+        .collect();
+    top_burners.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Build display
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    let block = Block::default()
+        .title(Span::styled(" 📊 Fleet Statistics ", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.accent));
+    frame.render_widget(block, area);
+
+    let inner = Layout::default()
+        .direction(Direction::Horizontal)
+        .margin(1)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    // Left column
+    let mut left_lines = vec![
+        Line::from(vec![Span::styled("● FLEET HEALTH", Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![
+            Span::raw("  Total agents : "), Span::styled(format!("{}", total), Style::default().fg(t.accent)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Online       : "),
+            Span::styled(format!("{}", online), Style::default().fg(Color::Green)),
+            Span::raw(format!(" ({:.0}%)", if total>0 { online as f32/total as f32*100.0 } else { 0.0 })),
+        ]),
+        Line::from(vec![
+            Span::raw("  Offline      : "),
+            Span::styled(format!("{}", offline), Style::default().fg(if offline > 0 { Color::Red } else { Color::Green })),
+        ]),
+        Line::from(vec![Span::raw("")]),
+        Line::from(vec![Span::styled("● OPENCLAW VERSIONS", Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![
+            Span::raw("  Current      : "), Span::styled(format!("{}", current), Style::default().fg(Color::Green)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Outdated     : "), Span::styled(format!("{}", outdated), Style::default().fg(if outdated > 0 { Color::Yellow } else { Color::Green })),
+        ]),
+        Line::from(vec![
+            Span::raw("  Unknown      : "), Span::styled(format!("{}", unknown_ver), Style::default().fg(t.text_dim)),
+        ]),
+        Line::from(vec![Span::raw("")]),
+        Line::from(vec![Span::styled("● LOCATIONS", Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::raw(format!("  Home: {}  SM: {}  Mobile: {}  VPS: {}", home, sm, mobile, vps))]),
+    ];
+
+    // Right column
+    let mut right_lines = vec![
+        Line::from(vec![Span::styled("● PERFORMANCE", Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::raw(format!("  Avg latency   : {}ms (max {}ms)", avg_lat, max_lat))]),
+        Line::from(vec![
+            Span::raw("  Avg CPU       : "),
+            Span::styled(format!("{:.1}%", avg_cpu), Style::default().fg(if avg_cpu > 80.0 { Color::Red } else if avg_cpu > 60.0 { Color::Yellow } else { Color::Green })),
+        ]),
+        Line::from(vec![
+            Span::raw("  Avg RAM       : "),
+            Span::styled(format!("{:.1}%", avg_ram), Style::default().fg(if avg_ram > 80.0 { Color::Red } else if avg_ram > 60.0 { Color::Yellow } else { Color::Green })),
+        ]),
+        Line::from(vec![Span::raw("")]),
+        Line::from(vec![Span::styled("● OS BREAKDOWN", Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD))]),
+    ];
+    for (os, count) in &os_map {
+        right_lines.push(Line::from(vec![Span::raw(format!("  {:12} : {}", os, count))]));
+    }
+    if !top_burners.is_empty() {
+        right_lines.push(Line::from(vec![Span::raw("")]));
+        right_lines.push(Line::from(vec![Span::styled("● TOKEN BURN TODAY", Style::default().fg(t.text_dim).add_modifier(Modifier::BOLD))]));
+        for (name, tokens) in top_burners.iter().take(5) {
+            right_lines.push(Line::from(vec![Span::raw(format!("  {:12} : {}k", &name[..name.len().min(12)], tokens/1000))]));
+        }
+    }
+    right_lines.push(Line::from(vec![Span::raw("")]));
+    right_lines.push(Line::from(vec![Span::styled("  [Esc / $] close", Style::default().fg(t.text_dim))]));
+
+    let left_para = ratatui::widgets::Paragraph::new(left_lines)
+        .style(Style::default().fg(t.text));
+    let right_para = ratatui::widgets::Paragraph::new(right_lines)
+        .style(Style::default().fg(t.text));
+    frame.render_widget(left_para, inner[0]);
+    frame.render_widget(right_para, inner[1]);
+}
+
+fn render_export_dialog(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = centered_rect(50, 30, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let block = Block::default()
+        .title(Span::styled(" 💾 Export Chat History ", Style::default().fg(t.accent).add_modifier(ratatui::style::Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.accent));
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled("  Select format:", Style::default().fg(t.text_dim))),
+        Line::from(Span::raw("")),
+    ];
+    let formats = ["[1] Markdown (.md)", "[2] JSON (.json)", "[3] Plain text (.txt)"];
+    for (i, f) in formats.iter().enumerate() {
+        let style = if i == app.export_format_idx {
+            Style::default().fg(t.accent).add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            Style::default().fg(t.text)
+        };
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled(*f, style)]));
+    }
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(Span::styled("  [Enter] export  [Esc] cancel", Style::default().fg(t.text_dim))));
+    let para = ratatui::widgets::Paragraph::new(lines)
+        .style(Style::default().fg(t.text));
+    let inner = area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 });
+    frame.render_widget(para, inner);
 }
 
 fn render_fleet_search(frame: &mut Frame, app: &App) {
