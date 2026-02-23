@@ -6921,7 +6921,7 @@ async fn probe_agent(
     ssh_args.push(script.to_string());
     let args = ssh_args;
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(25),  // full probe — slow agents need more time
         Command::new("ssh")
             .args(args)
             .output(),
@@ -8780,12 +8780,15 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
 
     let model_value = if app.agent_model_agent.as_deref() == Some(a.db_name.as_str()) {
         if app.agent_model_loading {
-            "loading…".to_string()
+            "⠋ fetching…".to_string()
         } else {
             app.agent_model.clone().unwrap_or_else(|| "not set".into())
         }
+    } else if app.agent_model_loading {
+        "⠋ fetching…".to_string()
     } else {
-        "loading…".to_string()
+        // Not yet queried — trigger load and show placeholder
+        "—".to_string()
     };
     let note_value = if app.agent_note_editing {
         format!("{}▌", app.agent_note_buffer)
@@ -8835,7 +8838,7 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
         (
             "CPU Model",
             if a.hw_cpu_model.is_empty() {
-                "—".into()
+                "— (next probe)".into()
             } else {
                 truncate_str(&a.hw_cpu_model, HW_DETAIL_TRUNCATE_CHARS)
             },
