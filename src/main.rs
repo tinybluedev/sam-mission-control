@@ -5139,6 +5139,33 @@ print('ok')
         } // Can't toggle these
         let new_state = !svc.enabled;
         let name = svc.name.clone();
+        let mut proposed = self.svc_config.clone().unwrap_or_else(|| serde_json::json!({}));
+        if let Some(root) = proposed.as_object_mut() {
+            let plugins = root.entry("plugins").or_insert_with(|| serde_json::json!({}));
+            if let Some(plugins_obj) = plugins.as_object_mut() {
+                let entries = plugins_obj.entry("entries").or_insert_with(|| serde_json::json!([]));
+                if let Some(entries_arr) = entries.as_array_mut() {
+                    let mut found = false;
+                    for item in entries_arr.iter_mut() {
+                        if item.get("name").and_then(|v| v.as_str()) == Some(name.as_str()) {
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("enabled".into(), serde_json::Value::Bool(new_state));
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        entries_arr.push(serde_json::json!({ "name": name.clone(), "enabled": new_state }));
+                    }
+                }
+            }
+        }
+        let validation_errors = validate::validate_openclaw_config(&proposed);
+        if !validation_errors.is_empty() {
+            self.toast(&format!("❌ Config validation failed: {}", validation_errors[0]));
+            return;
+        }
         let agent = &self.agents[self.selected];
         let host = agent.host.clone();
         let user = agent.ssh_user.clone();
@@ -5148,8 +5175,20 @@ print('ok')
             r#"python3 -c "
 import json
 with open('$HOME/.openclaw/openclaw.json'.replace('$HOME', __import__('os').path.expanduser('~'))) as f:
-    d = json.load(f)
-d.setdefault('plugins', {{}}).setdefault('entries', {{}}).setdefault('{}', {{}})['enabled'] = {}
+d = json.load(f)
+plugins = d.setdefault('plugins', {{}})
+entries = plugins.setdefault('entries', [])
+if isinstance(entries, dict):
+    entries = [dict(v if isinstance(v, dict) else {{}}, name=k) for k, v in entries.items()]
+    plugins['entries'] = entries
+done = False
+for e in entries:
+    if isinstance(e, dict) and e.get('name') == '{}':
+        e['enabled'] = {}
+        done = True
+        break
+if not done:
+    entries.append({{'name': '{}', 'enabled': {}}})
 with open('$HOME/.openclaw/openclaw.json'.replace('$HOME', __import__('os').path.expanduser('~')), 'w') as f:
     json.dump(d, f, indent=2)
 print('ok')
@@ -9897,6 +9936,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 tokio::time::sleep(Duration::from_secs(SCHEDULE_CHECK_INTERVAL_SECS)).await;
             }
+        }
+        Some(cli::Commands::Validate { agent }) => {
+            return cli::run_validate(agent.as_deref()).await.map_err(|e| e.into());
         }
         Some(cli::Commands::Version) => {
             println!("sam v{}", env!("CARGO_PKG_VERSION"));

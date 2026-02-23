@@ -12,6 +12,7 @@
 //! - [`Commands::Setup`] — regenerate `config.toml`
 //! - [`Commands::Onboard`] — provision a new agent over SSH
 //! - [`Commands::Deploy`] — push a file to an agent's workspace
+//! - [`Commands::Validate`] — validate remote openclaw.json schema
 //! - [`Commands::Version`] — print the binary version
 
 use clap::{Parser, Subcommand};
