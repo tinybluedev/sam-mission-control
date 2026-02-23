@@ -1126,27 +1126,10 @@ impl App {
             let (audit_result_tx, _audit_result_rx) = mpsc::unbounded_channel::<AuditResult>();
             tokio::spawn(async move {
                 while let Some(evt) = audit_input_rx.recv().await {
-                    let result = db::append_audit_log(
-                        &audit_pool,
-                        &evt.actor,
-                        &evt.action,
-                        &evt.target,
-                        &evt.detail,
-                    )
-                    .await;
+                    let result = db::append_audit_log(&audit_pool, &evt.actor, &evt.action, &evt.target, &evt.detail).await;
                     let send_result = match result {
-                        Ok(()) => audit_result_tx.send(AuditResult {
-                            ok: true,
-                            action: evt.action,
-                            target: evt.target,
-                            error: None,
-                        }),
-                        Err(e) => audit_result_tx.send(AuditResult {
-                            ok: false,
-                            action: evt.action,
-                            target: evt.target,
-                            error: Some(db::sanitize_error(&e.to_string())),
-                        }),
+                        Ok(()) => audit_result_tx.send(AuditResult { ok: true, action: evt.action, target: evt.target, error: None }),
+                        Err(e) => audit_result_tx.send(AuditResult { ok: false, action: evt.action, target: evt.target, error: Some(db::sanitize_error(&e.to_string())) }),
                     };
                     if let Err(e) = send_result {
                         eprintln!("audit result channel send failed: {}", e);
@@ -11724,7 +11707,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(cli::Commands::Daemon) => {
             if !db::mysql_enabled() {
-                eprintln!("DB daemon mode requires SAM_DB_MODE=mysql. Current mode skips DB operations.");
+                eprintln!(
+                    "DB daemon mode requires SAM_DB_MODE=mysql. Current mode: {}",
+                    db::db_mode()
+                );
                 return Ok(());
             }
             let fleet_config = config::load_fleet_config().map_err(|e| format!("Error: {}", e))?;

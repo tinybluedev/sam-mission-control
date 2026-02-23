@@ -989,7 +989,7 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         if v.is_empty() { default.to_string() } else { v }
     };
 
-    let write_env_if_missing = |mode: &str, cfg: &SamConfig, self_ip: &str| -> Result<(), Box<dyn std::error::Error>> {
+    let write_env_file_if_missing = |mode: &str, cfg: &SamConfig, self_ip: &str| -> Result<(), Box<dyn std::error::Error>> {
         let env_path = std::path::Path::new(".env");
         if !env_path.exists() {
             let sqlite_path = cfg.database.sqlite_path.as_deref().unwrap_or("");
@@ -1025,7 +1025,7 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
             identity: IdentityConfig { user: whoami().unwrap_or_else(|| "operator".into()) },
         };
         cfg.save()?;
-        write_env_if_missing(mode, &cfg, self_ip)?;
+        write_env_file_if_missing(mode, &cfg, self_ip)?;
         Ok(())
     };
 
@@ -1038,7 +1038,7 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         "yes".to_string()
     } else {
         prompt(
-            "Want persistent fleet memory? (yes=guided MySQL / no=SQLite embedded / skip=memory only)",
+            "Enable persistent fleet storage? (yes/y=guided MySQL / no/n=SQLite embedded / memory/m=memory only)",
             "yes",
         )
         .to_lowercase()
@@ -1051,14 +1051,17 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         prompt("This machine's IP", &detected)
     });
 
-    if persistence_choice == "skip" || persistence_choice == "s" {
+    if matches!(
+        persistence_choice.as_str(),
+        "skip" | "s" | "memory" | "m"
+    ) {
         save_non_mysql_config("memory", None, &self_ip)?;
         println!("\n  ✅ Memory-only mode enabled.");
         println!("  ℹ️ Fleet data is runtime-only (not persisted across restarts).");
         println!("  ✅ Ready! Run `sam` to launch Mission Control.\n");
         return Ok(());
     }
-    if persistence_choice == "no" || persistence_choice == "n" {
+    if matches!(persistence_choice.as_str(), "no" | "n") {
         let default_sqlite = dirs::data_local_dir()
             .unwrap_or_else(|| dirs::config_dir().unwrap_or_default())
             .join("sam/fleet.sqlite");
@@ -1068,7 +1071,7 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
         }
         let _ = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
             .open(&sqlite_path)?;
         save_non_mysql_config("sqlite", Some(sqlite_path.clone()), &self_ip)?;
         println!("\n  ✅ SQLite embedded mode selected.");
@@ -1107,6 +1110,9 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
                 crate::db::sanitize_error(&format!("DB connection failed: {}", e))
             );
             save_non_mysql_config("memory", None, &self_ip)?;
+            println!(
+                "  ℹ️ MySQL configuration was not saved. To use MySQL, ensure the database is running and re-run `sam init`."
+            );
             println!("  ✅ Ready! Run `sam` to launch Mission Control.\n");
             return Ok(());
         }
@@ -1200,7 +1206,7 @@ pub async fn run_init(db_host: Option<&str>, db_port: Option<u16>, db_user: Opti
     cfg.save()?;
 
     // Also write .env
-    write_env_if_missing("mysql", &cfg, &self_ip)?;
+    write_env_file_if_missing("mysql", &cfg, &self_ip)?;
     println!("✅ ~/.config/sam/config.toml");
 
     // Step 4: Self-register

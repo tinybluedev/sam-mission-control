@@ -39,7 +39,7 @@ pub fn db_mode() -> String {
 }
 
 pub fn mysql_enabled() -> bool {
-    matches!(db_mode().as_str(), "" | "mysql")
+    db_mode() == "mysql"
 }
 
 /// Build a MySQL connection URL from individual components, percent-encoding
@@ -482,6 +482,7 @@ pub async fn update_chat_partial(
 #[cfg(test)]
 mod tests {
     use super::*;
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn build_url_basic() {
@@ -643,6 +644,7 @@ mod tests {
 
     #[test]
     fn mysql_enabled_defaults_true() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         unsafe {
             std::env::remove_var("SAM_DB_MODE");
         }
@@ -651,6 +653,7 @@ mod tests {
 
     #[test]
     fn mysql_enabled_false_for_non_mysql_modes() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         unsafe {
             std::env::set_var("SAM_DB_MODE", "memory");
         }
