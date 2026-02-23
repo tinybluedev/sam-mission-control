@@ -161,7 +161,7 @@ pub async fn load_fleet(pool: &Pool) -> Result<Vec<DbAgent>, mysql_async::Error>
             gateway_port: r.get::<Option<i32>, _>(11).flatten().unwrap_or(18789),
             gateway_token: r.get::<Option<String>, _>(12).flatten(),
             ssh_user: r.get::<Option<String>, _>(14).flatten(),
-            gateway_pid: r.get::<Option<i32>, _>(14).flatten(),
+            gateway_pid: r.get::<Option<i32>, _>(13).flatten(),
         })
         .collect();
     Ok(agents)
