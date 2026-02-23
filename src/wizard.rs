@@ -9,6 +9,15 @@ use ratatui::widgets::*;
 use crate::theme::Theme;
 use crate::validate;
 
+/// Which provisioning mode the wizard uses when Confirm is submitted.
+#[derive(PartialEq, Clone)]
+pub enum WizardMode {
+    /// Register in the DB only — no SSH provisioning.
+    AddAgent,
+    /// Full 10-step SSH provisioning before adding to DB.
+    FullOnboard,
+}
+
 #[derive(PartialEq, Clone)]
 pub enum WizardStep {
     AgentName,
@@ -83,7 +92,15 @@ impl WizardStep {
             Self::Host => "Tailscale IP (100.x.x.x) or plain hostname",
             Self::SshUser => "SSH username on the remote host (default: papasmurf)",
             Self::Location => "← → or any key to cycle: Home / SM / VPS / Mobile",
-            Self::Confirm => "Tab to test SSH connection before confirming",
+            Self::Confirm => "Enter to begin full provisioning  •  Tab to test SSH first  •  Esc to go back",
+        }
+    }
+
+    /// Confirm-step hint when wizard is in AddAgent (DB-only) mode.
+    pub fn hint_add_agent(&self) -> &str {
+        match self {
+            Self::Confirm => "Enter to add to fleet (no SSH provisioning)  •  Tab to test SSH  •  Esc to go back",
+            _ => self.hint(),
         }
     }
 }
@@ -91,6 +108,7 @@ impl WizardStep {
 pub struct AgentWizard {
     pub active: bool,
     pub step: WizardStep,
+    pub mode: WizardMode,
     pub agent_name: String,
     pub display_name: String,
     pub emoji: String,
@@ -109,6 +127,7 @@ impl AgentWizard {
         Self {
             active: false,
             step: WizardStep::AgentName,
+            mode: WizardMode::FullOnboard,
             agent_name: String::new(),
             display_name: String::new(),
             emoji: "🤖".into(),
@@ -319,7 +338,11 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
 
     // Hint line for the current step
     lines.push(Line::from(""));
-    let hint = wizard.step.hint();
+    let hint = if wizard.mode == WizardMode::AddAgent {
+        wizard.step.hint_add_agent()
+    } else {
+        wizard.step.hint()
+    };
     if !hint.is_empty() {
         lines.push(Line::from(vec![
             Span::raw("    "),
@@ -329,8 +352,12 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
 
     // Confirm step shows summary
     if wizard.step == WizardStep::Confirm {
-        lines.push(Line::from(Span::styled("    ━━━ Ready to create ━━━", Style::default().fg(t.status_online).bold())));
-        lines.push(Line::from(Span::styled("    Press Enter to confirm, Esc to go back", Style::default().fg(t.text_dim))));
+        let ready_label = if wizard.mode == WizardMode::FullOnboard {
+            "    ━━━ Ready to provision ━━━"
+        } else {
+            "    ━━━ Ready to create ━━━"
+        };
+        lines.push(Line::from(Span::styled(ready_label, Style::default().fg(t.status_online).bold())));
 
         if let Some(result) = &wizard.ssh_result {
             lines.push(Line::from(""));
@@ -366,7 +393,10 @@ pub fn render_wizard(frame: &mut Frame, wizard: &AgentWizard, t: &Theme, bg: Col
 
     // Footer
     let footer_text = match wizard.step {
-        WizardStep::Confirm => "Enter=create │ Esc=back │ Tab=test SSH",
+        WizardStep::Confirm if wizard.mode == WizardMode::FullOnboard =>
+            "Enter=provision │ Esc=back │ Tab=test SSH",
+        WizardStep::Confirm =>
+            "Enter=create │ Esc=back │ Tab=test SSH",
         _ => "Enter=next │ Esc=back/cancel │ Tab=skip",
     };
     let footer = Paragraph::new(Line::from(vec![
