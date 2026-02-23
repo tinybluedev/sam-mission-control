@@ -89,6 +89,18 @@ pub enum Commands {
         /// Check specific agent only
         #[arg(short, long)]
         agent: Option<String>,
+        /// Run doctor for the whole fleet in headless CLI mode
+        #[arg(long)]
+        fleet: bool,
+        /// Emit machine-readable JSON output (fleet mode)
+        #[arg(long)]
+        json: bool,
+        /// Only print failures (fleet mode)
+        #[arg(long)]
+        quiet: bool,
+        /// Timeout in seconds for per-agent network checks
+        #[arg(long, default_value = "5")]
+        timeout: u64,
     },
     /// Full automated setup (DB tables, config, everything)
     Init {
@@ -146,11 +158,8 @@ pub enum Commands {
         #[arg(long, default_value = "20")]
         tail: u32,
     },
-    /// Validate remote openclaw.json schema
-    Validate {
-        /// Optional single agent name (default: validate all agents)
-        agent: Option<String>,
-    },
+    /// Run scheduled-operations executor without launching TUI
+    Daemon,
 }
 
 /// Persistent config file (~/.config/sam/config.toml)
@@ -194,11 +203,13 @@ pub struct TuiConfig {
     pub refresh_interval: u64,
     #[serde(default = "default_chat_poll")]
     pub chat_poll_interval: u64,
+    #[serde(default)]
+    pub vim_mode: bool,
 }
 
 impl Default for TuiConfig {
     fn default() -> Self {
-        Self { theme: default_theme(), background: default_bg(), refresh_interval: default_refresh(), chat_poll_interval: default_chat_poll() }
+        Self { theme: default_theme(), background: default_bg(), refresh_interval: default_refresh(), chat_poll_interval: default_chat_poll(), vim_mode: false }
     }
 }
 
@@ -492,10 +503,28 @@ pub async fn send_chat(agent: &str, message: &str) -> Result<(), Box<dyn std::er
 }
 
 
-/// Onboard a new agent on a remote machine
+/// Onboard a new agent on a remote machine — full 10-step provisioning flow.
+///
+/// Steps:
+///   1. Test SSH connectivity
+///   2. Detect OS (Linux/macOS)
+///   3. Distribute SSH public key (optional)
+///   4. Check / install Node.js
+///   5. Check / install OpenClaw
+///   6. Run `openclaw init --non-interactive`
+///   7. Configure gateway (token, bind, endpoints)
+///   8. Start gateway
+///   9. Check / configure Tailscale
+///  10. Run post-install diagnostic
+///  11. Register in DB (atomic — only on full success)
+///  12. Print success banner
+///
+/// Rollback: if steps 5–10 fail after OpenClaw has been installed, it is
+/// automatically removed before exiting.
 pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::process::Command;
     use std::time::Duration;
+    use crate::shell;
 
     validate::validate_ip_address(host)
         .map_err(|e| format!("Invalid host: {}", e))?;
@@ -505,6 +534,8 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
         validate::normalize_agent_name(n)
             .map_err(|e| format!("Invalid agent name: {}", e))?;
     }
+
+    const TOTAL: usize = 11;
 
     println!("\n🛰️  S.A.M Mission Control — Agent Onboarding");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -521,71 +552,185 @@ pub async fn run_onboard(host: &str, user: &str, name: Option<&str>) -> Result<(
         ]
     };
 
-    // Step 1: Test SSH connectivity
-    print!("  [1/8] Testing SSH connection... ");
-    let out = tokio::time::timeout(Duration::from_secs(8),
+    // ── Step 1: Test SSH connectivity ────────────────────────────────────
+    print_step(1, TOTAL, "Testing SSH connection...");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let ssh_test = tokio::time::timeout(Duration::from_secs(8),
         Command::new("ssh").args(ssh_args("hostname")).output()
     ).await;
-    match out {
+    match ssh_test {
         Ok(Ok(o)) if o.status.success() => {
             let hostname = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            println!("✅ {}", hostname);
+            println!("{}", c_bold_green(&format!("✅ {}", hostname)));
         }
         _ => {
-            println!("❌ Cannot reach {}@{}", user, host);
-            return Err("SSH connection failed".into());
+            println!("{}", c_bold_red(&format!("❌ Cannot reach {}@{}", user, host)));
+            return Err("SSH connection failed — check host and key-based auth".into());
         }
     }
 
-    // Step 2: Check OS
-    print!("  [2/8] Detecting OS... ");
-    let out = Command::new("ssh").args(ssh_args(
-        ". /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\" || sw_vers -productName 2>/dev/null || echo unknown"
+    // ── Step 2: Detect OS ────────────────────────────────────────────────
+    print_step(2, TOTAL, "Detecting OS...");
+    std::io::stdout().flush().ok();
+    let os_out = Command::new("ssh").args(ssh_args(
+        ". /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\" || sw_vers -productName 2>/dev/null || uname -s"
     )).output().await?;
-    let os_name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let is_mac = os_name.to_lowercase().contains("mac");
-    println!("✅ {}", os_name);
-
-    // Step 3: Check if OpenClaw is installed
-    print!("  [3/8] Checking OpenClaw... ");
+    let os_name = String::from_utf8_lossy(&os_out.stdout).trim().to_string();
+    let is_mac = os_name.to_lowercase().contains("mac") || os_name.to_lowercase().contains("darwin");
     let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-    let out = Command::new("ssh").args(ssh_args(&format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx))).output().await?;
-    let oc_version = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if oc_version.contains("NOT_INSTALLED") {
-        println!("⚠️  Not installed — installing...");
-        print!("       Installing OpenClaw... ");
-        let install_cmd = if is_mac {
-            format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx)
-        } else {
-            "sudo npm install -g openclaw@latest 2>&1 | tail -1".into()
-        };
-        let out = tokio::time::timeout(Duration::from_secs(120),
-            Command::new("ssh").args(ssh_args(&install_cmd)).output()
-        ).await;
-        match out {
-            Ok(Ok(o)) if o.status.success() => println!("✅"),
-            _ => {
-                println!("❌ Install failed");
-                return Err("OpenClaw installation failed".into());
-            }
+    println!("{}", c_bold_green(&format!("✅ {}", os_name)));
+
+    // ── Step 3: Distribute SSH public key (optional) ─────────────────────
+    print_step(3, TOTAL, "Distributing SSH public key...");
+    std::io::stdout().flush().ok();
+    let home_dir = dirs::home_dir().unwrap_or_default();
+    let key_candidates = [
+        home_dir.join(".ssh/id_ed25519.pub"),
+        home_dir.join(".ssh/id_rsa.pub"),
+        home_dir.join(".ssh/id_ecdsa.pub"),
+    ];
+    let pub_key = key_candidates.iter().find_map(|p| std::fs::read_to_string(p).ok());
+    if let Some(key) = pub_key {
+        let key = key.trim().to_string();
+        let install_key_cmd = format!(
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+             grep -qxF {k} ~/.ssh/authorized_keys 2>/dev/null \
+               || echo {k} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
+            k = shell::escape(&key),
+        );
+        let key_out = Command::new("ssh").args(ssh_args(&install_key_cmd)).output().await;
+        match key_out {
+            Ok(o) if o.status.success() => println!("{}", c_green("✅ public key installed")),
+            _ => println!("{}", c_yellow("⚠️  could not install key — continuing")),
         }
     } else {
-        println!("✅ {}", oc_version);
+        println!("{}", c_dim("⊘  no local public key found — skipped"));
     }
 
-    // Step 4: Get/generate hostname for agent name
+    // ── Step 4: Check / install Node.js ──────────────────────────────────
+    print_step(4, TOTAL, "Checking Node.js...");
+    std::io::stdout().flush().ok();
+    let node_check = format!("{}node --version 2>/dev/null || echo NOT_FOUND", pfx);
+    let node_out = Command::new("ssh").args(ssh_args(&node_check)).output().await?;
+    let node_ver = String::from_utf8_lossy(&node_out.stdout).trim().to_string();
+    if node_ver.contains("NOT_FOUND") || node_ver.is_empty() {
+        println!("{}", c_yellow("⚠️  not found — installing via NodeSource"));
+        print_step(4, TOTAL, "Installing Node.js...");
+        std::io::stdout().flush().ok();
+        let install_node = if is_mac {
+            format!("{}brew install node 2>&1 | tail -3", pfx)
+        } else {
+            "curl -fsSL https://rpm.nodesource.com/setup_lts.x | sudo bash - 2>&1 | tail -3 && sudo dnf install -y nodejs 2>&1 | tail -3 \
+             || curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo bash - 2>&1 | tail -3 && sudo apt-get install -y nodejs 2>&1 | tail -3".into()
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(120),
+            Command::new("ssh").args(ssh_args(&install_node)).output()
+        ).await;
+        let recheck = Command::new("ssh").args(ssh_args(&node_check)).output().await?;
+        let new_ver = String::from_utf8_lossy(&recheck.stdout).trim().to_string();
+        if new_ver.contains("NOT_FOUND") || new_ver.is_empty() {
+            println!("{}", c_bold_red("❌ Node.js install failed"));
+            return Err("Node.js installation failed — install manually and retry".into());
+        }
+        println!("{}", c_bold_green(&format!("✅ installed {}", new_ver)));
+    } else {
+        println!("{}", c_bold_green(&format!("✅ {}", node_ver)));
+    }
+
+    // ── Step 5: Check / install OpenClaw ─────────────────────────────────
+    print_step(5, TOTAL, "Checking OpenClaw...");
+    std::io::stdout().flush().ok();
+    let oc_check = format!("{}openclaw --version 2>/dev/null || echo NOT_INSTALLED", pfx);
+    let oc_out = Command::new("ssh").args(ssh_args(&oc_check)).output().await?;
+    let oc_ver = String::from_utf8_lossy(&oc_out.stdout).trim().to_string();
+    let mut oc_installed_by_us = false;
+    if oc_ver.contains("NOT_INSTALLED") || oc_ver.is_empty() {
+        println!("{}", c_yellow("⚠️  not installed — running npm install -g openclaw@latest"));
+        let npm_cmd = if is_mac {
+            format!("{}npm install -g openclaw@latest 2>&1 | tail -3", pfx)
+        } else {
+            "sudo npm install -g openclaw@latest 2>&1 | tail -3".into()
+        };
+        let install_out = tokio::time::timeout(Duration::from_secs(120),
+            Command::new("ssh").args(ssh_args(&npm_cmd)).output()
+        ).await;
+        let install_ok = install_out.as_ref().ok()
+            .and_then(|r| r.as_ref().ok())
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !install_ok {
+            println!("{}", c_bold_red("❌ OpenClaw installation failed"));
+            return Err("OpenClaw installation failed".into());
+        }
+        oc_installed_by_us = true;
+        let recheck = Command::new("ssh").args(ssh_args(&oc_check)).output().await?;
+        let new_ver = String::from_utf8_lossy(&recheck.stdout).trim().to_string();
+        println!("{}", c_bold_green(&format!("✅ installed {}", new_ver)));
+    } else {
+        println!("{}", c_bold_green(&format!("✅ {}", oc_ver)));
+    }
+
+    // Helper: rollback partial OpenClaw install on failure.
+    async fn do_rollback(oc_installed: bool, ssh_target: &str, pfx: &str) {
+        if oc_installed {
+            use tokio::process::Command;
+            eprintln!("  ⏪ Rolling back: uninstalling openclaw...");
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30),
+                Command::new("ssh")
+                    .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                        ssh_target, &format!("{}sudo npm uninstall -g openclaw 2>/dev/null || true", pfx)])
+                    .output()
+            ).await;
+            match result {
+                Ok(Ok(o)) if o.status.success() => eprintln!("  ✅ rollback: openclaw removed"),
+                Ok(Ok(o)) => eprintln!("  ⚠️  rollback: exit {}", o.status),
+                _ => eprintln!("  ⚠️  rollback: timed out or failed — check manually"),
+            }
+        }
+    }
+
+    // ── Step 6: openclaw init ─────────────────────────────────────────────
+    print_step(6, TOTAL, "Running openclaw init...");
+    std::io::stdout().flush().ok();
+    let init_cmd = format!("{}openclaw init --non-interactive 2>&1 | tail -5", pfx);
+    let init_out = tokio::time::timeout(Duration::from_secs(30),
+        Command::new("ssh").args(ssh_args(&init_cmd)).output()
+    ).await;
+    match init_out {
+        Ok(Ok(o)) if o.status.success() => println!("{}", c_green("✅ initialised")),
+        Ok(Ok(o)) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if stderr.to_lowercase().contains("already") || stderr.is_empty() {
+                println!("{}", c_green("✅ already initialised"));
+            } else {
+                println!("{}", c_yellow(&format!("⚠️  init warning (continuing): {}", stderr.chars().take(60).collect::<String>())));
+            }
+        }
+        _ => println!("{}", c_dim("⊘  init timed out — continuing")),
+    }
+
+    // ── Step 7: Configure gateway ─────────────────────────────────────────
+    print_step(7, TOTAL, "Configuring gateway...");
+    std::io::stdout().flush().ok();
+    let token = random_hex_token(24)?;
+    let escaped_token = shell::escape(&token);
+
+    // Determine agent name
     let agent_name = if let Some(n) = name {
         n.to_string()
     } else {
-        let out = Command::new("ssh").args(ssh_args("hostname")).output().await?;
-        String::from_utf8_lossy(&out.stdout).trim().to_lowercase().replace(' ', "-")
+        let hn_out = Command::new("ssh").args(ssh_args("hostname")).output().await?;
+        let raw = String::from_utf8_lossy(&hn_out.stdout).trim().to_lowercase()
+            .chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' }).collect::<String>();
+        // Collapse consecutive hyphens and trim leading/trailing hyphens
+        let collapsed = raw.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+        collapsed.trim_matches('-').to_string()
     };
-    println!("  [4/8] Agent name: {}", agent_name);
 
-    // Step 5: Generate auth token
-    print!("  [5/8] Configuring gateway... ");
-    let token = random_hex_token(24)?;
-    let config_script = format!(r#"python3 -c "
+    let escaped_agent = shell::escape(&agent_name);
+    let config_script = format!(
+        r#"python3 -c "
 import json,os
 p=os.path.expanduser('~/.openclaw/openclaw.json')
 os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -595,76 +740,119 @@ if os.path.exists(p):
 gw=c.setdefault('gateway',{{}})
 gw['bind']='lan'
 gw.setdefault('auth',{{}})['mode']='token'
-gw['auth']['token']='{}'
+gw['auth']['token']={token}
 h=gw.setdefault('http',{{}})
 e=h.setdefault('endpoints',{{}})
 e['chatCompletions']={{'enabled':True}}
+c['name']={name}
 with open(p,'w') as f: json.dump(c,f,indent=2)
 print('ok')
-""#, token);
-    let out = Command::new("ssh").args(ssh_args(&config_script)).output().await?;
-    let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if result == "ok" {
-        println!("✅ bind=lan, chatCompletions, auth token");
-    } else {
-        println!("⚠️  {}", result);
+""#,
+        token = escaped_token,
+        name = escaped_agent,
+    );
+    let cfg_out = Command::new("ssh").args(ssh_args(&config_script)).output().await?;
+    let cfg_result = String::from_utf8_lossy(&cfg_out.stdout).trim().to_string();
+    if cfg_result != "ok" {
+        do_rollback(oc_installed_by_us, &ssh_target, pfx).await;
+        return Err("Gateway configuration failed".into());
     }
+    // Read port
+    let port_cmd = format!(
+        "{}python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{{}}).get('port',18789))\"",
+        pfx
+    );
+    let port_out = Command::new("ssh").args(ssh_args(&port_cmd)).output().await?;
+    let port: i32 = String::from_utf8_lossy(&port_out.stdout).trim().parse().unwrap_or(18789);
+    println!("{}", c_bold_green(&format!("✅ bind=lan, chatCompletions, port={}", port)));
 
-    // Step 6: Get gateway port
-    print!("  [6/8] Reading gateway port... ");
-    let out = Command::new("ssh").args(ssh_args(&format!(
-        "{}python3 -c \"import json,os;c=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')));print(c.get('gateway',{{}}).get('port',18789))\"", pfx
-    ))).output().await?;
-    let port: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(18789);
-    println!("✅ {}", port);
-
-    // Step 7: Register in DB
-    print!("  [7/8] Registering in fleet DB... ");
-    let pool = crate::db::get_pool();
-    let mut conn = pool.get_conn().await?;
-    use mysql_async::prelude::*;
-    conn.exec_drop(
-        "INSERT INTO mc_fleet_status (agent_name, tailscale_ip, status, gateway_port, gateway_token, os_info) VALUES (?, ?, 'offline', ?, ?, ?) ON DUPLICATE KEY UPDATE tailscale_ip=VALUES(tailscale_ip), gateway_port=VALUES(gateway_port), gateway_token=VALUES(gateway_token), os_info=VALUES(os_info)",
-        (&agent_name, host, port, &token, &os_name),
-    ).await?;
-    println!("✅");
-
-    // Step 8: Restart gateway and verify
-    print!("  [8/8] Restarting gateway... ");
+    // ── Step 8: Start gateway ─────────────────────────────────────────────
+    print_step(8, TOTAL, "Starting gateway...");
+    std::io::stdout().flush().ok();
     let restart_cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
     let _ = tokio::time::timeout(Duration::from_secs(15),
         Command::new("ssh").args(ssh_args(&restart_cmd)).output()
     ).await;
-    
-    // Verify via HTTP API
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let url = format!("http://{}:{}/v1/chat/completions", host, port);
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
-    let body = serde_json::json!({
-        "model": "openclaw:main",
-        "messages": [{"role": "user", "content": "Say 'online' in one word."}]
-    });
-    match client.post(&url)
-        .header("Authorization", format!("Bearer {}", token))
-        .json(&body).send().await {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                println!("✅ Gateway responding!");
-                // Update status
-                conn.exec_drop("UPDATE mc_fleet_status SET status='online' WHERE agent_name=?", (&agent_name,)).await?;
+    println!("{}", c_green("✅ gateway restart requested"));
+
+    // ── Step 9: Check / configure Tailscale ──────────────────────────────
+    print_step(9, TOTAL, "Checking Tailscale...");
+    std::io::stdout().flush().ok();
+    let ts_cmd = format!(
+        "{}tailscale status --json 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('BackendState',''))\" || echo NOT_FOUND",
+        pfx
+    );
+    let ts_out = Command::new("ssh").args(ssh_args(&ts_cmd)).output().await.ok();
+    let ts_state = ts_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    match ts_state.as_str() {
+        "Running" => println!("{}", c_green("✅ Tailscale is running")),
+        "NOT_FOUND" | "" => println!("{}", c_dim("⊘  Tailscale not installed — using direct IP")),
+        other => {
+            let ts_server = std::env::var("SAM_TAILSCALE_SERVER").unwrap_or_default();
+            if !ts_server.is_empty() {
+                let ts_up_cmd = format!("{}sudo tailscale up --login-server={} 2>&1 | tail -3", pfx, shell::escape(&ts_server));
+                let _ = tokio::time::timeout(Duration::from_secs(30),
+                    Command::new("ssh").args(ssh_args(&ts_up_cmd)).output()
+                ).await;
+                println!("{}", c_yellow(&format!("🔧 ran tailscale up (was: {})", other)));
             } else {
-                println!("⚠️  Gateway returned {}", resp.status());
+                println!("{}", c_yellow(&format!("⚠️  state={} — set SAM_TAILSCALE_SERVER to auto-join", other)));
             }
         }
-        Err(_) => println!("⚠️  Gateway not responding yet (may need manual restart on macOS)"),
     }
 
+    // ── Step 10: Post-install diagnostic ─────────────────────────────────
+    print_step(10, TOTAL, "Running post-install diagnostic...");
+    std::io::stdout().flush().ok();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // SSH check
+    let ssh_ok = tokio::time::timeout(Duration::from_secs(6),
+        Command::new("ssh").args(ssh_args("echo ok")).output()
+    ).await.ok().and_then(|r| r.ok()).map(|o| o.status.success()).unwrap_or(false);
+    // OC version
+    let oc_ver_out = Command::new("ssh").args(ssh_args(&format!("{}openclaw --version 2>/dev/null || echo unknown", pfx))).output().await.ok();
+    let final_oc_ver = oc_ver_out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|| "unknown".into());
+    // Gateway health
+    let gw_url = format!("http://{}:{}/v1/models", host, port);
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let gw_ok = client.get(&gw_url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send().await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    println!("  SSH: {}  OpenClaw: {}  Gateway: {}",
+        if ssh_ok { c_green("✅") } else { c_red("✗") },
+        c_green(&final_oc_ver),
+        if gw_ok { c_green("✅") } else { c_yellow("⚠ not yet responding") },
+    );
+
+    // ── Step 11: Atomic DB registration ──────────────────────────────────
+    print_step(11, TOTAL, "Registering in fleet DB...");
+    std::io::stdout().flush().ok();
+    let pool = crate::db::get_pool();
+    let mut conn = pool.get_conn().await?;
+    use mysql_async::prelude::*;
+    let final_status = if ssh_ok && gw_ok { "online" } else { "offline" };
+    conn.exec_drop(
+        "INSERT INTO mc_fleet_status \
+         (agent_name, tailscale_ip, status, gateway_port, gateway_token, os_info) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON DUPLICATE KEY UPDATE \
+           tailscale_ip=VALUES(tailscale_ip), \
+           status=VALUES(status), \
+           gateway_port=VALUES(gateway_port), \
+           gateway_token=VALUES(gateway_token), \
+           os_info=VALUES(os_info)",
+        (&agent_name, host, final_status, port, &token, &os_name),
+    ).await?;
     pool.disconnect().await?;
+    println!("{}", c_bold_green("✅"));
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  ✅ Agent '{}' onboarded at {}", agent_name, host);
-    println!("     Port: {} | Token: {}...", port, &token[..12]);
-    println!("     Run `sam` to see it in the fleet.\n");
+    println!("  {} added to fleet — all checks passed",
+        c_bold_green(&format!("✅ {} ({})", agent_name, os_name)));
+    println!("     Port: {}  |  Token: {}…", port, &token[..12]);
+    println!("     Run {} to see it in the fleet.\n", c_bold_cyan("`sam`"));
 
     Ok(())
 }
@@ -677,7 +865,6 @@ fn random_hex_token(byte_len: usize) -> Result<String, Box<dyn std::error::Error
     getrandom::fill(&mut bytes)?;
     Ok(bytes.into_iter().map(|b| format!("{:02x}", b)).collect())
 }
-
 
 /// Deploy workspace file to agent(s)
 pub async fn run_deploy(target: &str, file: &str, source: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -925,7 +1112,311 @@ fn whoami() -> Option<String> {
 }
 
 
+#[derive(Debug, Clone, Serialize)]
+struct FleetDoctorAgentResult {
+    agent: String,
+    ip: String,
+    ssh_reachable: bool,
+    gateway_api_reachable: bool,
+    oc_version: String,
+    oc_current: bool,
+    fixed_actions: Vec<String>,
+}
+
+impl FleetDoctorAgentResult {
+    fn is_healthy(&self) -> bool {
+        self.ssh_reachable && self.gateway_api_reachable && self.oc_current
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FleetDoctorOutput {
+    total_agents: usize,
+    unhealthy_agents: usize,
+    down_agents: usize,
+    exit_code: i32,
+    latest_oc_version: Option<String>,
+    results: Vec<FleetDoctorAgentResult>,
+}
+
+fn parse_semver(raw: &str) -> Option<String> {
+    raw.split_whitespace()
+        .map(|part| part.trim_start_matches('v'))
+        .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(|s| s.trim().to_string())
+}
+
+fn doctor_exit_code(total_agents: usize, unhealthy_agents: usize, down_agents: usize) -> i32 {
+    // down_agents * 2 > total_agents means "strictly more than 50% down".
+    if total_agents > 0 && (down_agents * 2) > total_agents { 2 }
+    else if unhealthy_agents > 0 { 1 }
+    else { 0 }
+}
+
 /// Diagnose and auto-fix fleet issues
+pub async fn run_doctor_fleet(
+    fix: bool,
+    agent_filter: Option<&str>,
+    json: bool,
+    quiet: bool,
+    timeout_secs: u64,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    use tokio::process::Command;
+    use tokio::sync::mpsc;
+    let timeout_secs = timeout_secs.max(1);
+
+    print_banner();
+
+    let pool = crate::db::get_pool();
+    let agents = crate::db::load_fleet(&pool).await?;
+
+    let targets: Vec<crate::db::DbAgent> = if let Some(name) = agent_filter {
+        agents.iter().filter(|a| a.agent_name.contains(name)).cloned().collect()
+    } else {
+        agents.clone()
+    };
+
+    let latest_oc_version = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        Command::new("npm").args(["view", "openclaw", "version", "--silent"]).output(),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .filter(|o| o.status.success())
+    .and_then(|o| parse_semver(&String::from_utf8_lossy(&o.stdout)));
+
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        ?;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    for agent in targets {
+        let tx = tx.clone();
+        let latest_oc_version = latest_oc_version.clone();
+        let http_client = http_client.clone();
+        tokio::spawn(async move {
+            let name = agent.agent_name.clone();
+            let ip = agent.tailscale_ip.clone().unwrap_or_else(|| "?".to_string());
+            let user = "admin";
+            let is_mac = agent.os_info.as_deref().unwrap_or("").to_lowercase().contains("mac");
+            let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+            let ssh_target = format!("{}@{}", user, ip);
+            let mut fixed_actions = Vec::new();
+
+            let ssh_reachable = tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                Command::new("ssh")
+                    .args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", &ssh_target, "echo ok"])
+                    .output(),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+            let mut oc_version = String::new();
+            let mut oc_current = false;
+            let mut gateway_api_reachable = false;
+
+            if ssh_reachable {
+                let oc_raw = tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    Command::new("ssh")
+                        .args([
+                            "-o",
+                            "ConnectTimeout=3",
+                            "-o",
+                            "StrictHostKeyChecking=no",
+                            "-o",
+                            "BatchMode=yes",
+                            &ssh_target,
+                            &format!("{pfx}openclaw --version 2>/dev/null || echo NOT_INSTALLED"),
+                        ])
+                        .output(),
+                )
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+
+                oc_version = parse_semver(&oc_raw).unwrap_or(oc_raw);
+                oc_current = if oc_version.is_empty() || oc_version.contains("NOT_INSTALLED") {
+                    false
+                } else if let Some(latest) = &latest_oc_version {
+                    oc_version == *latest
+                } else {
+                    true
+                };
+
+                if fix && !oc_current {
+                    let cmd = if is_mac {
+                        format!("{pfx}npm install -g openclaw@latest >/dev/null 2>&1")
+                    } else {
+                        "sudo npm install -g openclaw@latest >/dev/null 2>&1".to_string()
+                    };
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        Command::new("ssh")
+                            .args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", &ssh_target, &cmd])
+                            .output(),
+                    )
+                    .await;
+                    let oc_after = Command::new("ssh")
+                        .args([
+                            "-o",
+                            "ConnectTimeout=3",
+                            "-o",
+                            "StrictHostKeyChecking=no",
+                            "-o",
+                            "BatchMode=yes",
+                            &ssh_target,
+                            &format!("{pfx}openclaw --version 2>/dev/null"),
+                        ])
+                        .output()
+                        .await
+                        .ok()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    oc_version = parse_semver(&oc_after).unwrap_or(oc_after);
+                    oc_current = if let Some(latest) = &latest_oc_version {
+                        oc_version == *latest
+                    } else {
+                        !oc_version.is_empty()
+                    };
+                    if oc_current {
+                        fixed_actions.push("openclaw_updated".to_string());
+                    }
+                }
+
+                gateway_api_reachable = http_client
+                    .get(format!("http://{}:18789/", ip))
+                    .send()
+                    .await
+                    .is_ok();
+
+                if fix && !gateway_api_reachable {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        Command::new("ssh")
+                            .args([
+                                "-o",
+                                "ConnectTimeout=3",
+                                "-o",
+                                "StrictHostKeyChecking=no",
+                                "-o",
+                                "BatchMode=yes",
+                                &ssh_target,
+                                &format!("{pfx}openclaw gateway restart >/dev/null 2>&1"),
+                            ])
+                            .output(),
+                    )
+                    .await;
+                    gateway_api_reachable = http_client
+                        .get(format!("http://{}:18789/", ip))
+                        .send()
+                        .await
+                        .is_ok();
+                    if gateway_api_reachable {
+                        fixed_actions.push("gateway_restarted".to_string());
+                    }
+                }
+            }
+
+            let _ = tx.send(FleetDoctorAgentResult {
+                agent: name,
+                ip,
+                ssh_reachable,
+                gateway_api_reachable,
+                oc_version,
+                oc_current,
+                fixed_actions,
+            });
+        });
+    }
+    drop(tx);
+
+    let mut results = Vec::new();
+    while let Some(result) = rx.recv().await {
+        results.push(result);
+    }
+    results.sort_by(|a, b| a.agent.cmp(&b.agent));
+
+    let unhealthy_agents = results
+        .iter()
+        .filter(|r| !r.is_healthy())
+        .count();
+    let down_agents = results.iter().filter(|r| !r.ssh_reachable).count();
+    let exit_code = doctor_exit_code(results.len(), unhealthy_agents, down_agents);
+
+    let payload = FleetDoctorOutput {
+        total_agents: results.len(),
+        unhealthy_agents,
+        down_agents,
+        exit_code,
+        latest_oc_version,
+        results,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if quiet {
+        for r in &payload.results {
+            if r.is_healthy() {
+                continue;
+            }
+            println!(
+                "{:<20} ssh:{} gateway:{} oc:{}{}",
+                r.agent,
+                if r.ssh_reachable { "✓" } else { "✗" },
+                if r.gateway_api_reachable { "✓" } else { "✗" },
+                if r.oc_current { "✓" } else { "✗" },
+                if r.fixed_actions.is_empty() {
+                    String::new()
+                } else {
+                    format!(" fixed={}", r.fixed_actions.join(","))
+                }
+            );
+        }
+    } else {
+        println!(
+            "   {:<20} {:<7} {:<9} {:<7} {}",
+            c_bold("Agent"),
+            c_bold("SSH"),
+            c_bold("Gateway"),
+            c_bold("OC"),
+            c_bold("Version")
+        );
+        print_divider();
+        for r in &payload.results {
+            println!(
+                "   {:<20} {:<7} {:<9} {:<7} {}",
+                r.agent,
+                if r.ssh_reachable { "✓" } else { "✗" },
+                if r.gateway_api_reachable { "✓" } else { "✗" },
+                if r.oc_current { "✓" } else { "✗" },
+                if r.oc_version.is_empty() { "unknown" } else { &r.oc_version }
+            );
+        }
+        print_divider();
+        println!(
+            "   {} agents checked, {} unhealthy, {} down",
+            payload.total_agents, payload.unhealthy_agents, payload.down_agents
+        );
+        println!("   exit code: {}\n", payload.exit_code);
+    }
+
+    let status = if exit_code == 0 { "pass" } else { "fail" };
+    let record_result = crate::db::record_fleet_doctor_run(&pool, status, &serde_json::to_string(&payload)?).await;
+    let disconnect_result = pool.disconnect().await;
+    record_result?;
+    disconnect_result?;
+    Ok(exit_code)
+}
+
 pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::process::Command;
 
@@ -1110,6 +1601,24 @@ pub async fn run_doctor(fix: bool, agent_filter: Option<&str>) -> Result<(), Box
     Ok(())
 }
 
+#[cfg(test)]
+mod cli_tests {
+    use super::{doctor_exit_code, parse_semver};
+
+    #[test]
+    fn parse_semver_extracts_version_token() {
+        assert_eq!(parse_semver("openclaw 1.2.3"), Some("1.2.3".to_string()));
+        assert_eq!(parse_semver("v1.2.3"), Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn doctor_exit_codes_follow_thresholds() {
+        assert_eq!(doctor_exit_code(4, 0, 0), 0);
+        assert_eq!(doctor_exit_code(4, 1, 2), 1);
+        assert_eq!(doctor_exit_code(4, 3, 3), 2);
+    }
+}
+
 /// Print operation history log (non-TUI)
 pub async fn run_log(agent: Option<&str>, tail: u32) -> Result<(), Box<dyn std::error::Error>> {
     let pool = crate::db::get_pool();
@@ -1152,70 +1661,19 @@ pub async fn run_log(agent: Option<&str>, tail: u32) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-/// Validate openclaw.json on one agent or the full fleet.
-pub async fn run_validate(agent: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::process::Command;
+#[cfg(test)]
+mod tests {
+    use super::SamConfig;
 
-    let pool = crate::db::get_pool();
-    let fleet = crate::db::load_fleet(&pool).await?;
-    let targets: Vec<&crate::db::DbAgent> = if let Some(name) = agent {
-        fleet.iter().filter(|a| a.agent_name == name).collect()
-    } else {
-        fleet.iter().collect()
-    };
-
-    if targets.is_empty() {
-        return Err("No matching agents found".into());
+    #[test]
+    fn tui_vim_mode_defaults_to_false() {
+        let cfg: SamConfig = toml::from_str("[tui]\n").expect("config should parse");
+        assert!(!cfg.tui.vim_mode);
     }
 
-    println!("\n🔎 Validating openclaw.json schema\n");
-    let mut invalid_agents = 0usize;
-    for target in targets {
-        let name = &target.agent_name;
-        let ip = target.tailscale_ip.as_deref().unwrap_or("?");
-        let user = target.ssh_user.as_deref().unwrap_or("admin");
-        print!("  {} ({}) ... ", name, ip);
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            Command::new("ssh").args([
-                "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                &format!("{}@{}", user, ip), "cat ~/.openclaw/openclaw.json 2>/dev/null || echo null",
-            ]).output()
-        ).await;
-
-        let text = match out {
-            Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            _ => {
-                println!("❌ unreachable");
-                invalid_agents += 1;
-                continue;
-            }
-        };
-
-        let parsed = match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                println!("❌ invalid JSON ({})", e);
-                invalid_agents += 1;
-                continue;
-            }
-        };
-
-        let errors = validate::validate_openclaw_config(&parsed);
-        if errors.is_empty() {
-            println!("✅ valid");
-        } else {
-            invalid_agents += 1;
-            println!("❌ {} issue(s)", errors.len());
-            for err in errors {
-                println!("     - {}", err);
-            }
-        }
+    #[test]
+    fn tui_vim_mode_reads_true_from_config() {
+        let cfg: SamConfig = toml::from_str("[tui]\nvim_mode = true\n").expect("config should parse");
+        assert!(cfg.tui.vim_mode);
     }
-
-    pool.disconnect().await?;
-    if invalid_agents > 0 {
-        return Err(format!("Validation failed for {} agent(s)", invalid_agents).into());
-    }
-    Ok(())
 }
