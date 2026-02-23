@@ -1161,6 +1161,10 @@ impl App {
             });
         }
 
+        // Detect first launch — no config file exists yet
+        let is_first_launch = !std::path::Path::new(&format!("{}/.sam/config.toml", std::env::var("HOME").unwrap_or_default())).exists()
+            && !std::path::Path::new(".env").exists();
+
         App {
             fleet_config: fleet_config.agent,
             agents,
