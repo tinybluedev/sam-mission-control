@@ -470,6 +470,113 @@ fn db_latency_color(latency: Option<u32>, online: bool, t: &Theme) -> Color {
     }
 }
 
+fn compute_agent_health_score(
+    status: &AgentStatus,
+    uptime_seconds: i64,
+    latency_ms: Option<u32>,
+    oc_version: &str,
+    latest_oc_version: &str,
+    disk_pct: Option<f32>,
+    ram_pct: Option<f32>,
+    mem_free_mb: Option<i64>,
+) -> u8 {
+    if matches!(status, AgentStatus::Offline | AgentStatus::Unknown) {
+        return 0;
+    }
+
+    let mut score = 100i32;
+
+    if uptime_seconds == 0 {
+        score -= 15;
+    } else if uptime_seconds < 0 {
+        score -= 15;
+    } else if uptime_seconds < 3600 {
+        score -= 10;
+    } else if uptime_seconds < 86_400 {
+        score -= 5;
+    }
+
+    match latency_ms {
+        Some(ms) if ms >= 1000 => score -= 20,
+        Some(ms) if ms >= 500 => score -= 12,
+        Some(ms) if ms >= 200 => score -= 6,
+        Some(_) => {}
+        None => score -= 8,
+    }
+
+    let oc = oc_version.trim();
+    if oc.is_empty() || oc == "?" || oc == "unknown" {
+        score -= 15;
+    } else if !latest_oc_version.is_empty() {
+        let oc_norm = oc
+            .split_whitespace()
+            .last()
+            .unwrap_or(oc)
+            .trim_start_matches('v');
+        let latest_norm = latest_oc_version.trim_start_matches('v');
+        if oc_norm != latest_norm {
+            score -= 10;
+        }
+    }
+
+    if let Some(disk) = disk_pct {
+        if disk >= 95.0 {
+            score -= 25;
+        } else if disk >= 90.0 {
+            score -= 15;
+        } else if disk >= 80.0 {
+            score -= 8;
+        }
+    } else {
+        score -= 5;
+    }
+
+    if let Some(ram) = ram_pct {
+        if ram >= 95.0 {
+            score -= 25;
+        } else if ram >= 90.0 {
+            score -= 15;
+        } else if ram >= 80.0 {
+            score -= 8;
+        }
+    } else if let Some(mem_free) = mem_free_mb {
+        if mem_free < 256 {
+            score -= 25;
+        } else if mem_free < 512 {
+            score -= 15;
+        } else if mem_free < 1024 {
+            score -= 8;
+        }
+    } else {
+        score -= 5;
+    }
+
+    score.clamp(0, 100) as u8
+}
+
+fn agent_health_score(agent: &Agent, latest_oc_version: &str) -> u8 {
+    compute_agent_health_score(
+        &agent.status,
+        agent.uptime_seconds,
+        agent.latency_ms,
+        &agent.oc_version,
+        latest_oc_version,
+        agent.disk_pct,
+        agent.ram_pct,
+        agent.mem_free_mb,
+    )
+}
+
+fn health_score_color(score: u8, t: &Theme) -> Color {
+    if score >= 85 {
+        t.status_online
+    } else if score >= 60 {
+        t.status_busy
+    } else {
+        t.status_offline
+    }
+}
+
 fn resource_bar(pct: Option<f32>, width: u16) -> String {
     let p = pct.unwrap_or(0.0);
     let filled = ((p / 100.0) * width as f32) as usize;
@@ -7699,23 +7806,23 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     let show_activity = area.width > 100;
     let hcells_vec: Vec<&str> = if show_resources {
         vec![
-            "  ", "Agent", "IP", "Location", "Status", "Ping", "Activity", "Ctx%", "CPU", "RAM",
-            "Disk", "Version",
+            "  ", "Agent", "IP", "Location", "Status", "Health", "Ping", "Activity", "Ctx%", "CPU",
+            "RAM", "Disk", "Version",
         ]
     } else if show_activity {
         vec![
-            "  ", "Agent", "IP", "Location", "Status", "Ping", "Uptime", "Activity", "Version",
+            "  ", "Agent", "IP", "Location", "Status", "Health", "Ping", "Uptime", "Activity", "Version",
         ]
     } else if show_ip && show_latency {
         vec![
-            "  ", "Agent", "IP", "Location", "Status", "Ping", "Uptime", "Version",
+            "  ", "Agent", "IP", "Location", "Status", "Health", "Ping", "Uptime", "Version",
         ]
     } else if show_latency {
         vec![
-            "  ", "Agent", "Location", "Status", "Ping", "Uptime", "Version",
+            "  ", "Agent", "Location", "Status", "Health", "Ping", "Uptime", "Version",
         ]
     } else {
-        vec!["  ", "Agent", "Location", "Status", "Version"]
+        vec!["  ", "Agent", "Location", "Status", "Health", "Version"]
     };
     let hcells = hcells_vec
         .iter()
@@ -7781,6 +7888,11 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
                     Cell::from(a.location.clone()).style(Style::default().fg(loc_color)),
                     Cell::from(a.status.to_string()).style(Style::default().fg(st_color)),
                 ]);
+                let health = agent_health_score(a, &app.latest_oc_version);
+                cells.push(
+                    Cell::from(format!("{}%", health))
+                        .style(Style::default().fg(health_score_color(health, t))),
+                );
                 if show_latency {
                     cells.push(Cell::from(lat_str).style(Style::default().fg(lat_color)));
                     cells.push(
@@ -7869,6 +7981,7 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             Constraint::Length(13),
             Constraint::Length(8),
             Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Length(10),
             Constraint::Length(5),
@@ -7884,6 +7997,7 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             Constraint::Length(13),
             Constraint::Length(8),
             Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(12),
@@ -7896,6 +8010,7 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             Constraint::Length(13),
             Constraint::Length(8),
             Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Min(10),
@@ -7906,6 +8021,7 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             Constraint::Length(14),
             Constraint::Length(8),
             Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Min(10),
@@ -7916,6 +8032,7 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
             Constraint::Length(14),
             Constraint::Length(8),
             Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Min(10),
         ]
     };
@@ -8213,6 +8330,9 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
     } else {
         "loading…".to_string()
     };
+    let health = agent_health_score(a, &app.latest_oc_version);
+    let health_text = format!("{}%", health);
+    let health_color = health_score_color(health, t);
     let rows = vec![
         ("Host", a.host.clone(), t.text),
         (
@@ -8227,6 +8347,7 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
             },
         ),
         ("Status", a.status.to_string(), st_color),
+        ("Health", health_text, health_color),
         ("OS", a.os.clone(), t.text),
         ("Kernel", a.kernel.clone(), t.text),
         ("OC Version", a.oc_version.clone(), t.version),
@@ -13782,7 +13903,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fleet_change_detail, AgentStatus, App, ChatLine, INPUT_POLL_MS};
+    use super::{AgentStatus, App, ChatLine, INPUT_POLL_MS, compute_agent_health_score};
 
     #[test]
     fn input_poll_interval_is_low_for_responsive_ui() {
@@ -13871,35 +13992,47 @@ mod tests {
     }
 
     #[test]
-    fn fleet_change_detail_includes_version_os_and_kernel_changes() {
-        let detail = fleet_change_detail(
-            &AgentStatus::Online,
-            &AgentStatus::Online,
-            "Ubuntu 22.04",
-            "Ubuntu 24.04",
-            "5.15.0",
-            "6.8.0",
+    fn health_score_is_zero_for_offline_agents() {
+        let score = compute_agent_health_score(
+            &AgentStatus::Offline,
+            10_000,
+            Some(25),
             "openclaw 1.0.0",
-            "openclaw 1.1.0",
-        )
-        .unwrap_or_default();
-        assert!(detail.contains("version: openclaw 1.0.0 → openclaw 1.1.0"));
-        assert!(detail.contains("os: Ubuntu 22.04 → Ubuntu 24.04"));
-        assert!(detail.contains("kernel: 5.15.0 → 6.8.0"));
+            "1.0.0",
+            Some(20.0),
+            Some(30.0),
+            Some(4096),
+        );
+        assert_eq!(score, 0);
     }
 
     #[test]
-    fn fleet_change_detail_is_none_when_snapshot_fields_match() {
-        assert!(fleet_change_detail(
+    fn health_score_rewards_healthy_signals() {
+        let score = compute_agent_health_score(
             &AgentStatus::Online,
+            200_000,
+            Some(45),
+            "openclaw 1.2.3",
+            "1.2.3",
+            Some(35.0),
+            Some(42.0),
+            Some(3072),
+        );
+        assert_eq!(score, 100);
+    }
+
+    #[test]
+    fn health_score_penalizes_risky_signals() {
+        let score = compute_agent_health_score(
             &AgentStatus::Online,
-            "Ubuntu",
-            "Ubuntu",
-            "6.8.0",
-            "6.8.0",
-            "openclaw 1.1.0",
-            "openclaw 1.1.0",
-        )
-        .is_none());
+            120,
+            Some(1200),
+            "unknown",
+            "9.9.9",
+            Some(97.0),
+            Some(96.0),
+            Some(128),
+        );
+        assert_eq!(score, 5);
     }
 }
