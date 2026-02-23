@@ -4387,10 +4387,18 @@ PY"#, escaped_model);
                 let install_cmd = if is_mac {
                     format!("{}npm install -g openclaw@latest 2>&1 | tail -1", pfx)
                 } else {
-                    format!(
-                        "{}PREFIX=$(npm config get prefix 2>/dev/null); if echo "$PREFIX" | grep -qE '^/home/|^/Users/|.npm'; then npm install -g openclaw@latest 2>&1 | tail -1; else sudo npm install -g openclaw@latest 2>&1 | tail -1; fi",
-                        pfx
-                    )
+                    {
+                        let smart_install = if true {
+                            // no sudo when npm prefix is user home
+                            let check = r#"NPM_PFX=$(npm config get prefix 2>/dev/null)"#;
+                            let cond = r#"echo "$NPM_PFX" | grep -qE "^/home/|^/Users/""#;
+                            let yes_cmd = "npm install -g openclaw@latest 2>&1 | tail -1";
+                            let no_cmd = "sudo npm install -g openclaw@latest 2>&1 | tail -1";
+                            format!("{}; if {} ; then {}; else {}; fi", check, cond, yes_cmd, no_cmd)
+                        } else { String::new() };
+                        let smart = smart_install.as_str();
+                        format!("{}{}", pfx, smart)
+                    }
                 };
                 let _ = tokio::time::timeout(
                     Duration::from_secs(120),
@@ -5061,10 +5069,18 @@ PY"#, escaped_model);
                     format!("{}npm install -g openclaw@latest 2>&1", pfx)
                 } else {
                     // Smart: no sudo if npm prefix is user-owned
-                    format!(
-                        "{}PREFIX=$(npm config get prefix 2>/dev/null); if echo "$PREFIX" | grep -qE '^/home/|^/Users/|.npm'; then npm install -g openclaw@latest 2>&1; else sudo npm install -g openclaw@latest 2>&1; fi",
-                        pfx
-                    )
+                    {
+                        let smart_install = if true {
+                            // no sudo when npm prefix is user home
+                            let check = r#"NPM_PFX=$(npm config get prefix 2>/dev/null)"#;
+                            let cond = r#"echo "$NPM_PFX" | grep -qE "^/home/|^/Users/""#;
+                            let yes_cmd = "npm install -g openclaw@latest 2>&1";
+                            let no_cmd = "sudo npm install -g openclaw@latest 2>&1";
+                            format!("{}; if {} ; then {}; else {}; fi", check, cond, yes_cmd, no_cmd)
+                        } else { String::new() };
+                        let smart = smart_install.as_str();
+                        format!("{}{}", pfx, smart)
+                    }
                 };
                 let install_out = tokio::time::timeout(Duration::from_secs(120),
                     Command::new("ssh").args(ssh_args(&npm_cmd)).output()
