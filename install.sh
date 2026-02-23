@@ -37,9 +37,11 @@ TIMELINE_LABELS=(
     "Compile release binary"
     "Install binary"
 )
+# Rough first-run estimates on commodity laptops/VMs; actual time varies by hardware.
 TIMELINE_ETA_SECS=(240 20)
 TIMELINE_STATUS=("pending" "pending")
 TIMELINE_LINES=0
+TIMELINE_UPDATE_INTERVAL=0.2
 
 fmt_eta() {
     local sec="$1"
@@ -57,6 +59,7 @@ timeline_render() {
     local idx dot eta
 
     if [ -t 1 ] && [ "$TIMELINE_LINES" -gt 0 ]; then
+        # Move cursor up to redraw the timeline in place (avoids log-dump output).
         printf "\033[%sA" "$TIMELINE_LINES"
     fi
 
@@ -64,7 +67,7 @@ timeline_render() {
     for idx in "${!TIMELINE_LABELS[@]}"; do
         case "${TIMELINE_STATUS[$idx]}" in
             running)
-                dot="${CYAN}${SPIN_FRAMES[$((frame % 10))]}${RESET}"
+                dot="${CYAN}${SPIN_FRAMES[$((frame % ${#SPIN_FRAMES[@]}))]}${RESET}"
                 eta="$(fmt_eta "$active_left") left"
                 ;;
             done)
@@ -103,7 +106,7 @@ timeline_run() {
         left=$((eta - elapsed))
         if [ "$left" -lt 0 ]; then left=0; fi
         timeline_render "$frame" "$idx" "$left"
-        sleep 0.1
+        sleep "$TIMELINE_UPDATE_INTERVAL"
         frame=$((frame + 1))
     done
 
