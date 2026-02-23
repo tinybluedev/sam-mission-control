@@ -7274,6 +7274,14 @@ fn fmt_hhmm(t: &str) -> String {
     t.chars().take(5).collect()
 }
 
+fn typing_dots(spinner_frame: usize) -> &'static str {
+    match spinner_frame % 3 {
+        0 => " .",
+        1 => " ..",
+        _ => " ...",
+    }
+}
+
 fn build_chat_lines(
     messages: &[ChatLine],
     user: &str,
@@ -7369,7 +7377,7 @@ fn build_chat_lines(
                 "responded" => "✓✓".into(),
                 "streaming" => {
                     let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
-                    format!("{} streaming", c)
+                    format!("{} streaming{}", c, typing_dots(spinner_frame))
                 }
                 "connecting" => {
                     let dots = ".".repeat((spinner_frame % 3) + 1);
@@ -7377,7 +7385,7 @@ fn build_chat_lines(
                 }
                 "thinking" | "processing" => {
                     let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
-                    format!("{} thinking", c)
+                    format!("{} thinking{}", c, typing_dots(spinner_frame))
                 }
                 "pending" => "⏳ sending".into(),
                 "failed" => "✗ failed".into(),
@@ -7503,11 +7511,11 @@ fn build_chat_lines(
                 let status_text: String = match msg.status.as_str() {
                     "streaming" => {
                         let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
-                        format!("  {} tokens flowing...", c)
+                        format!("  {} tokens flowing{}", c, typing_dots(spinner_frame))
                     }
                     "thinking" => {
                         let c = BRAILLE_SPINNER[spinner_frame % BRAILLE_SPINNER.len()];
-                        format!("  {} agent is thinking...", c)
+                        format!("  {} agent is thinking{}", c, typing_dots(spinner_frame))
                     }
                     "connecting" => {
                         let dots = ".".repeat((spinner_frame % 3) + 1);
@@ -14138,7 +14146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, ChatLine, INPUT_POLL_MS, format_ram_total};
+    use super::{App, ChatLine, INPUT_POLL_MS, format_ram_total, typing_dots};
 
     #[test]
     fn input_poll_interval_is_low_for_responsive_ui() {
@@ -14231,5 +14239,14 @@ mod tests {
         assert_eq!(format_ram_total(Some(512)), "512 MB");
         assert_eq!(format_ram_total(Some(2048)), "2.0 GB");
         assert_eq!(format_ram_total(None), "—");
+    }
+
+    #[test]
+    fn typing_dots_cycles_for_chat_animation() {
+        assert_eq!(typing_dots(0), " .");
+        assert_eq!(typing_dots(1), " ..");
+        assert_eq!(typing_dots(2), " ...");
+        assert_eq!(typing_dots(3), " .");
+        assert_eq!(typing_dots(4), " ..");
     }
 }
