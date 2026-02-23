@@ -798,6 +798,7 @@ struct App {
     // Splash
     spawned_agents: Vec<db::SpawnedAgent>,
     show_splash: bool,
+    launch_wizard_after_splash: bool,
     splash_start: Instant,
     // Alerts
     alerts: Vec<Alert>,
@@ -1108,6 +1109,7 @@ impl App {
         let tn = ThemeName::Standard;
         let tm = ThemeMode::Auto;
         let bd = detect_system_bg_density();
+        let is_first_launch = agents.is_empty();
         let (audit_tx, mut audit_input_rx) = mpsc::unbounded_channel::<AuditEvent>();
         let (audit_result_tx, audit_result_rx) = mpsc::unbounded_channel::<AuditResult>();
         let audit_pool = pool.clone();
@@ -1162,7 +1164,8 @@ impl App {
             last_task_poll: Instant::now(),
             tasks_rx: None,
             spawned_agents: vec![],
-            show_splash: true,
+            show_splash: is_first_launch,
+            launch_wizard_after_splash: is_first_launch,
             splash_start: Instant::now(),
             config_text: None,
             config_scroll: 0,
@@ -1302,6 +1305,14 @@ impl App {
             ws_cron_form_focus: 0,
             ws_cron_form_schedule: String::new(),
             ws_cron_selected: 0,
+        }
+    }
+
+    fn dismiss_splash(&mut self) {
+        self.show_splash = false;
+        if self.launch_wizard_after_splash {
+            self.wizard.open();
+            self.launch_wizard_after_splash = false;
         }
     }
 
@@ -7899,6 +7910,22 @@ fn render_too_small(frame: &mut Frame) {
     frame.render_widget(msg, area);
 }
 
+fn splash_prompt(launch_wizard_after_splash: bool) -> &'static str {
+    if launch_wizard_after_splash {
+        "Press any key to begin setup wizard..."
+    } else {
+        "Press any key to continue..."
+    }
+}
+
+fn splash_scanline_y(elapsed_ms: u32, height: u16) -> u16 {
+    if height > 0 {
+        (elapsed_ms / 45 % height as u32) as u16
+    } else {
+        0
+    }
+}
+
 fn render_splash(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let area = frame.area();
@@ -7933,12 +7960,13 @@ fn render_splash(frame: &mut Frame, app: &App) {
         "",
         "Strange Artificial Machine — Fleet Orchestration TUI",
         "",
-        "Press any key to continue...",
+        splash_prompt(app.launch_wizard_after_splash),
     ];
 
     // Animated gradient: cycle through theme accent colors using elapsed time
     let elapsed_ms = app.splash_start.elapsed().as_millis() as u32;
     let phase = (elapsed_ms / 80) % 6;
+    let scan_y = splash_scanline_y(elapsed_ms, area.height);
     let gradient_colors = [
         t.accent,
         t.accent2,
@@ -7966,9 +7994,14 @@ fn render_splash(frame: &mut Frame, app: &App) {
         } else {
             t.text_dim
         };
+        let style = if y == scan_y {
+            Style::default().fg(app.bg_density.bg()).bg(color).bold()
+        } else {
+            Style::default().fg(color).bold()
+        };
         let p = Paragraph::new(Line::from(Span::styled(
             line.to_string(),
-            Style::default().fg(color).bold(),
+            style,
         )))
         .alignment(Alignment::Center);
         frame.render_widget(p, Rect::new(0, y, area.width, 1));
@@ -12020,7 +12053,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if app.show_splash {
                 match &ev {
                     Event::Key(_) | Event::Mouse(_) => {
-                        app.show_splash = false;
+                        app.dismiss_splash();
                     }
                     _ => {}
                 }
@@ -14043,7 +14076,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Auto-dismiss splash
         if app.show_splash && app.splash_start.elapsed() > Duration::from_secs(3) {
-            app.show_splash = false;
+            app.dismiss_splash();
         }
 
         // Auto-refresh every 30s (non-blocking)
@@ -14657,7 +14690,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, ChatLine, INPUT_POLL_MS, format_ram_total, typing_dots};
+    use super::{
+        App, ChatLine, INPUT_POLL_MS, format_ram_total, splash_prompt, splash_scanline_y,
+        typing_dots,
+    };
 
     #[test]
     fn input_poll_interval_is_low_for_responsive_ui() {
@@ -14759,5 +14795,22 @@ mod tests {
         assert_eq!(typing_dots(2), " ...");
         assert_eq!(typing_dots(3), " .");
         assert_eq!(typing_dots(4), " ..");
+    }
+
+    #[test]
+    fn splash_prompt_reflects_boot_to_wizard_flow() {
+        assert_eq!(
+            splash_prompt(true),
+            "Press any key to begin setup wizard..."
+        );
+        assert_eq!(splash_prompt(false), "Press any key to continue...");
+    }
+
+    #[test]
+    fn splash_scanline_wraps_within_viewport() {
+        assert_eq!(splash_scanline_y(0, 10), 0);
+        assert_eq!(splash_scanline_y(450, 10), 0);
+        assert_eq!(splash_scanline_y(495, 10), 1);
+        assert_eq!(splash_scanline_y(120, 0), 0);
     }
 }
