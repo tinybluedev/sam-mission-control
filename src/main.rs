@@ -389,6 +389,59 @@ fn resource_bar(pct: Option<f32>, width: u16) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(empty),)
 }
 
+
+// ── Gateway action type ────────────────────────────────────────────
+#[derive(Debug, Clone, PartialEq)]
+enum GatewayAction { Start, Stop, Restart }
+
+// ── Audit pipeline ─────────────────────────────────────────────────
+struct AuditEvent {
+    actor: String,
+    action: String,
+    target: String,
+    detail: String,
+}
+
+struct AuditResult {
+    ok: bool,
+    action: String,
+    target: String,
+    error: Option<String>,
+}
+
+// ── Split pane constants ───────────────────────────────────────────
+const MIN_SPLIT_PCT: u16 = 20;
+const MAX_SPLIT_PCT: u16 = 80;
+const DIVIDER_HIT_WIDTH: u16 = 2;
+const FLEET_TABLE_HEADER_ROWS: u16 = 2;
+
+fn chrono_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+fn split_pct_from_mouse(mx: u16, area: ratatui::layout::Rect) -> u16 {
+    if area.width == 0 { return 45; }
+    let pct = ((mx.saturating_sub(area.x)) as u32 * 100 / area.width as u32) as u16;
+    pct.max(MIN_SPLIT_PCT).min(MAX_SPLIT_PCT)
+}
+
+fn dashboard_split(_area: &ratatui::layout::Rect, split_pct: Option<u16>) -> (u16, u16) {
+    let pct = split_pct.unwrap_or(45).max(MIN_SPLIT_PCT).min(MAX_SPLIT_PCT);
+    (pct, 100 - pct)
+}
+
+fn detail_split(_area: &ratatui::layout::Rect, split_pct: Option<u16>) -> (u16, u16) {
+    let pct = split_pct.unwrap_or(55).max(MIN_SPLIT_PCT).min(MAX_SPLIT_PCT);
+    (pct, 100 - pct)
+}
+
 struct App {
     agents: Vec<Agent>,
     fleet_config: Vec<config::AgentConfig>,
@@ -537,6 +590,21 @@ struct App {
     db_latency_ms: Option<u32>,
     db_online: bool,
     db_latency_rx: Option<mpsc::UnboundedReceiver<Option<u32>>>,
+    // Multi-select (index-based)
+    multi_selected: HashSet<usize>,
+    // Split-pane resize
+    dashboard_split_pct: Option<u16>,
+    detail_split_pct: Option<u16>,
+    dragging_split: Option<SplitDragTarget>,
+    dashboard_body_area: ratatui::layout::Rect,
+    detail_body_area: ratatui::layout::Rect,
+    dashboard_divider_area: ratatui::layout::Rect,
+    detail_divider_area: ratatui::layout::Rect,
+    // Audit log
+    audit_tx: Option<tokio::sync::mpsc::UnboundedSender<AuditEvent>>,
+    audit_rx: Option<mpsc::UnboundedReceiver<AuditResult>>,
+    audit_last: Option<String>,
+    audit_pending: usize,
 }
 
 /// Returns true for npm output lines worth showing in the overlay.
@@ -752,7 +820,7 @@ impl App {
             alert_flash: None,
             alerts_scroll: 0,
             gateway_confirm_at: None,
-            multi_selected: HashSet::new(),
+            multi_selected: HashSet::new(), // usize indices
             spinner_frame: 0,
             sort_mode: SortMode::Name,
             group_filter: GroupFilter::All,
@@ -808,6 +876,46 @@ impl App {
             latest_oc_version: String::new(),
             interrupted_ops,
             diag_task_running: false,
+            agent_model: None,
+            agent_model_agent: None,
+            agent_model_loading: false,
+            audit_last: None,
+            audit_pending: 0,
+            audit_rx: None,
+            audit_tx: None,
+            dashboard_body_area: ratatui::layout::Rect::default(),
+            dashboard_divider_area: ratatui::layout::Rect::default(),
+            dashboard_split_pct: None,
+            db_latency_ms: None,
+            db_latency_rx: None,
+            db_online: true,
+            detail_body_area: ratatui::layout::Rect::default(),
+            detail_divider_area: ratatui::layout::Rect::default(),
+            detail_split_pct: None,
+            dragging_split: None::<SplitDragTarget>,
+            gateway_action_confirm: None,
+            model_load_rx: None,
+            model_options: vec![
+                "anthropic/claude-opus-4-6".into(),
+                "anthropic/claude-sonnet-4-6".into(),
+                "anthropic/claude-haiku-4-5".into(),
+                "openai/gpt-4o".into(),
+                "openai/gpt-4o-mini".into(),
+                "google/gemini-2.0-flash".into(),
+            ],
+            model_picker_active: false,
+            model_picker_selected: 0,
+            model_write_rx: None,
+            selected_agents: std::collections::HashSet::new(),
+            tui_start: Instant::now(),
+            vim_mode: false,
+            vim_pending: None,
+            ws_cron_form_active: false,
+            ws_cron_form_description: String::new(),
+            ws_cron_form_edit: false,
+            ws_cron_form_focus: 0,
+            ws_cron_form_schedule: String::new(),
+            ws_cron_selected: 0,
         }
     }
 
@@ -895,6 +1003,39 @@ impl App {
             let _ = copy_to_clipboard(text).await;
         });
         self.toast("📋 Copied agent info");
+    }
+
+
+    fn active_ops_running(&self) -> usize {
+        let mut count = 0;
+        if self.diag_active { count += 1; }
+        if self.fleet_diag_active { count += 1; }
+        count
+    }
+
+    fn queue_audit_mutation(&mut self, action: impl Into<String>, target: impl Into<String>, detail: impl Into<String>) {
+        if let Some(tx) = &self.audit_tx {
+            let _ = tx.send(AuditEvent {
+                actor: std::env::var("USER").unwrap_or_else(|_| "operator".into()),
+                action: action.into(),
+                target: target.into(),
+                detail: detail.into(),
+            });
+        }
+    }
+
+    fn start_db_latency_probe(&mut self) {
+        if let Some(pool) = &self.db_pool {
+            let pool = pool.clone();
+            let (tx, rx) = mpsc::unbounded_channel::<Option<u32>>();
+            self.db_latency_rx = Some(rx);
+            tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let ok = pool.get_conn().await.is_ok();
+                let lat = if ok { Some(start.elapsed().as_millis() as u32) } else { None };
+                let _ = tx.send(lat);
+            });
+        }
     }
 
     fn toast(&mut self, msg: &str) {
@@ -4999,6 +5140,8 @@ PY",
                     disk_pct: disk,
                     activity: act,
                     context_pct: ctx,
+                    gateway_status: GatewayStatus::Unknown,
+                    gateway_pid: None,
                 });
             });
         }
@@ -5912,35 +6055,12 @@ fn is_wide(area: &Rect) -> bool {
     area.width > 160
 }
 
-fn dashboard_split(area: &Rect) -> (Constraint, Constraint) {
-    if is_narrow(area) {
-        (Constraint::Percentage(100), Constraint::Percentage(0))
-    } else if is_wide(area) {
-        (Constraint::Percentage(40), Constraint::Percentage(60))
-    } else {
-        (Constraint::Percentage(50), Constraint::Percentage(50))
-    }
-}
 
-fn detail_split(area: &Rect) -> (Constraint, Constraint) {
-    if is_narrow(area) {
-        (Constraint::Percentage(100), Constraint::Percentage(0))
-    } else if is_wide(area) {
-        (Constraint::Percentage(35), Constraint::Percentage(65))
-    } else {
-        (Constraint::Percentage(40), Constraint::Percentage(60))
-    }
-}
 
 fn point_in_rect(x: u16, y: u16, area: Rect) -> bool {
     x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
 }
 
-fn split_pct_from_mouse(x: u16, area: Rect) -> u16 {
-    if area.width == 0 { return 50; }
-    let relative_x = x.saturating_sub(area.x).min(area.width);
-    (((relative_x as u32 * 100) / area.width as u32) as u16).clamp(MIN_SPLIT_PCT, MAX_SPLIT_PCT)
-}
 
 fn truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -9150,7 +9270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let msg = message.join(" ");
             return cli::send_chat(&agent, &msg).await.map_err(|e| e.into());
         }
-        Some(cli::Commands::Doctor { fix, agent }) => {
+        Some(cli::Commands::Doctor { fix, agent, fleet, json, quiet, timeout }) => {
             return cli::run_doctor(fix, agent.as_deref())
                 .await
                 .map_err(|e| e.into());
@@ -9414,6 +9534,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => {}
                         }
                     }
+                    _ => {}
                 }
 
                 // Scroll wheel in chat
@@ -9434,14 +9555,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         _ => {}
                     }
-                    MouseEventKind::ScrollDown => {
-                        if app.screen == Screen::Dashboard && point_in_rect(mx, my, app.chat_area) {
-                            app.chat_scroll = app.chat_scroll.saturating_sub(3);
-                        } else if app.screen == Screen::AgentDetail && point_in_rect(mx, my, app.detail_chat_area) {
-                            app.agent_chat_scroll = app.agent_chat_scroll.saturating_sub(3);
-                        }
-                    }
-                    _ => {}
                 }
             }
 
@@ -11360,6 +11473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Receive diagnostic steps (non-blocking)
         if app.diag_active {
             let mut should_reload_workspace = false;
+            let mut refresh_after_done = false;
             if let Some(ref mut rx) = app.diag_rx {
                 while let Ok(mut step) = rx.try_recv() {
                     let reload_workspace = step.label == "DONE" && step.detail.contains("[reload-workspace]");
@@ -11443,7 +11557,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref mut rx) = app.audit_rx {
             while let Ok(result) = rx.try_recv() {
                 app.audit_pending = app.audit_pending.saturating_sub(1);
-                app.audit_last = if result.ok {
+                app.audit_last = Some(if result.ok {
                     format!("🧾 {} {}", result.action, result.target)
                 } else {
                     format!(
@@ -11452,7 +11566,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         result.target,
                         result.error.unwrap_or_else(|| "unknown".into())
                     )
-                };
+                });
             }
         }
 
