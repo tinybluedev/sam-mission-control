@@ -784,6 +784,8 @@ struct App {
     task_input: String,
     task_input_active: bool,
     last_task_poll: Instant,
+    last_activity_poll: Instant,
+    activity_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<(String, String, i32)>>>,
     tasks_rx: Option<mpsc::UnboundedReceiver<Vec<db::Task>>>,
     // UI state
     spinner_frame: usize,
@@ -1202,6 +1204,8 @@ impl App {
             task_input: String::new(),
             task_input_active: false,
             last_task_poll: Instant::now(),
+            last_activity_poll: Instant::now() - Duration::from_secs(30),
+            activity_rx: None,
             tasks_rx: None,
             spawned_agents: vec![],
             show_splash: is_first_launch,
@@ -3042,8 +3046,8 @@ PY"#, escaped_model);
                 jump_user.as_deref(),
                 &self_ip,
                 &format!(
-                    "{}openclaw --version 2>/dev/null || echo '(not installed)'",
-                    pfx
+                    r#"{}python3 -c "import json,os; paths=['/home/{}/.npm-global/lib/node_modules/openclaw/package.json','/home/papasmurf/.npm-global/lib/node_modules/openclaw/package.json','/usr/lib/node_modules/openclaw/package.json','/usr/local/lib/node_modules/openclaw/package.json']; found=[open(p).read() for p in paths if os.path.exists(p)]; print(json.loads(found[0]).get('version','not installed') if found else 'not installed')" 2>/dev/null || echo "(not installed)""#,
+                    pfx, user
                 ),
             )
             .await;
@@ -7107,7 +7111,7 @@ async fn probe_agent(
         );
     }
     let tgt = format!("{}@{}", user, host);
-    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(python3 -c "import json; paths=['/home/papasmurf/.npm-global/lib/node_modules/openclaw/package.json','/home/nick/.npm-global/lib/node_modules/openclaw/package.json','/usr/lib/node_modules/openclaw/package.json','/usr/local/lib/node_modules/openclaw/package.json']; [print(json.load(open(p)).get('version','?')) or exit() for p in paths if __import__('os').path.exists(p)]" 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); CPU_MODEL=$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/^ *//' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo ?); RAM_TOTAL_MB=$(free -m 2>/dev/null | awk '/Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f", $1/1024/1024}' || echo ?); DISK_LAYOUT=$(lsblk -rno NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | head -6 | tr '\n' ';' || df -h 2>/dev/null | awk 'NR==1 || /^\/dev\//' | head -6 | tr '\n' ';' || echo ?); GWPID=$(pgrep -f 'openclaw.*gateway' 2>/dev/null | head -1 || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; echo "CPU_MODEL:$CPU_MODEL"; echo "RAM_TOTAL_MB:$RAM_TOTAL_MB"; echo "DISK_LAYOUT:$DISK_LAYOUT"; echo "GWPID:$GWPID"; GW_PORT=$(cat ~/.openclaw/openclaw.json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('gateway',{}).get('port',18789))" 2>/dev/null || echo 18789); GW_STATUS=$(curl -sf --max-time 2 "http://localhost:${GW_PORT}/v1/status" 2>/dev/null || echo '{}'); ACT=$(echo "$GW_STATUS" | python3 -c "import json,sys;d=json.loads(sys.stdin.read() or '{}');ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];print(active[0].get('channel','idle') if active else 'idle')" 2>/dev/null || echo idle); CTX=$(echo "$GW_STATUS" | python3 -c "import json,sys;d=json.loads(sys.stdin.read() or '{}');ss=d.get('sessions',[]);active=[s for s in ss if s.get('active')];t=active[0].get('contextTokens',0) if active else 0;m=active[0].get('maxTokens',1000000) if active else 1000000;print(f'{t/m*100:.1f}')" 2>/dev/null || echo ?); echo "ACT:$ACT"; echo "CTX:$CTX""#;
+    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(python3 -c "import json; paths=['/home/papasmurf/.npm-global/lib/node_modules/openclaw/package.json','/home/nick/.npm-global/lib/node_modules/openclaw/package.json','/usr/lib/node_modules/openclaw/package.json','/usr/local/lib/node_modules/openclaw/package.json']; [print(json.load(open(p)).get('version','?')) or exit() for p in paths if __import__('os').path.exists(p)]" 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); CPU_MODEL=$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/^ *//' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo ?); RAM_TOTAL_MB=$(free -m 2>/dev/null | awk '/Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f", $1/1024/1024}' || echo ?); DISK_LAYOUT=$(lsblk -rno NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | head -6 | tr '\n' ';' || df -h 2>/dev/null | awk 'NR==1 || /^\/dev\//' | head -6 | tr '\n' ';' || echo ?); GWPID=$(pgrep -f 'openclaw.*gateway' 2>/dev/null | head -1 || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; echo "CPU_MODEL:$CPU_MODEL"; echo "RAM_TOTAL_MB:$RAM_TOTAL_MB"; echo "DISK_LAYOUT:$DISK_LAYOUT"; echo "GWPID:$GWPID"; GW_PORT=$(cat ~/.openclaw/openclaw.json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('gateway',{}).get('port',18789))" 2>/dev/null || echo 18789); GW_UP=$(curl -sf --max-time 2 "http://localhost:${GW_PORT}" >/dev/null 2>&1 && echo up || echo down); ACT=$([ "$GW_UP" = "up" ] && echo "gateway:up" || echo "offline"); echo "ACT:$ACT"; echo "CTX:?""#;
     let mut ssh_args: Vec<String> = vec![
         "-o".to_string(), "ConnectTimeout=2".to_string(),
         "-o".to_string(), "BatchMode=yes".to_string(),
@@ -11990,6 +11994,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.start_db_latency_probe();
 
     loop {
+        // Poll agent activity from DB every 30s
+        if app.activity_rx.is_none() && app.last_activity_poll.elapsed() > Duration::from_secs(30) {
+            if let Some(pool) = &app.db_pool {
+                let pool = pool.clone();
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                app.activity_rx = Some(rx);
+                app.last_activity_poll = Instant::now();
+                tokio::spawn(async move {
+                    if let Ok(data) = db::get_agent_activity(&pool).await {
+                        let _ = tx.send(data);
+                    }
+                });
+            }
+        }
+        if let Some(rx) = &mut app.activity_rx {
+            if let Ok(activity_data) = rx.try_recv() {
+                for (name, channel, msgs) in activity_data {
+                    if let Some(a) = app.agents.iter_mut().find(|a| a.db_name == name) {
+                        a.activity = if msgs > 0 { channel } else { "idle".to_string() };
+                        a.token_burn = msgs;
+                    }
+                }
+                app.activity_rx = None;
+            }
+        }
+
         // Drain background probe results (non-blocking)
         let updates = app.drain_refresh_results();
         if !updates.is_empty() {

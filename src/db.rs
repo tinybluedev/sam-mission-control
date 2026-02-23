@@ -1176,3 +1176,22 @@ pub async fn append_audit_log(
     ).await?;
     Ok(())
 }
+
+/// Returns (agent_name, last_channel, messages_today) for all agents with recent chat activity
+pub async fn get_agent_activity(pool: &Pool) -> Result<Vec<(String, String, i32)>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = pool.get_conn().await?;
+    let rows: Vec<(String, String, i32)> = conn.exec_map(
+        r"SELECT
+            sender,
+            MAX(COALESCE(NULLIF(target,''), 'chat')) as last_channel,
+            COUNT(*) as msgs_today
+          FROM mc_chat
+          WHERE DATE(created_at) = CURDATE()
+            AND sender != 'operator'
+            AND sender != ''
+          GROUP BY sender",
+        (),
+        |(sender, channel, count)| (sender, channel, count),
+    ).await?;
+    Ok(rows)
+}
