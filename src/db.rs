@@ -913,6 +913,102 @@ pub async fn load_interrupted_operations(
         .collect())
 }
 
+/// Insert a scheduled op for an absolute datetime string (MySQL DATETIME-compatible).
+/// Returns the inserted operation ID.
+pub async fn create_scheduled_op_absolute(
+    pool: &Pool,
+    scheduled_at: &str,
+    op_type: &str,
+    target: &str,
+    params_json: &str,
+) -> Result<i64, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "INSERT INTO mc_scheduled_ops (scheduled_at, op_type, target, params_json, status) VALUES (?, ?, ?, ?, 'pending')",
+        (scheduled_at, op_type, target, params_json),
+    ).await?;
+    let id: Option<i64> = conn.query_first("SELECT LAST_INSERT_ID()").await?;
+    Ok(id.unwrap_or(0))
+}
+
+/// Insert a scheduled op relative to now by `offset_minutes`.
+/// Returns the inserted operation ID.
+pub async fn create_scheduled_op_relative_minutes(
+    pool: &Pool,
+    offset_minutes: i64,
+    op_type: &str,
+    target: &str,
+    params_json: &str,
+) -> Result<i64, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "INSERT INTO mc_scheduled_ops (scheduled_at, op_type, target, params_json, status) VALUES (DATE_ADD(NOW(), INTERVAL ? MINUTE), ?, ?, ?, 'pending')",
+        (offset_minutes, op_type, target, params_json),
+    ).await?;
+    let id: Option<i64> = conn.query_first("SELECT LAST_INSERT_ID()").await?;
+    Ok(id.unwrap_or(0))
+}
+
+/// Load pending scheduled operations, ordered by scheduled time (ascending).
+/// Queue is capped to the newest 100 pending entries.
+pub async fn load_pending_scheduled_ops(pool: &Pool) -> Result<Vec<ScheduledOp>, mysql_async::Error> {
+    const SCHEDULE_QUEUE_LIMIT: usize = 100;
+    let mut conn = pool.get_conn().await?;
+    let query = format!(
+        "SELECT id, DATE_FORMAT(scheduled_at, '%Y-%m-%d %H:%i:%s'), op_type, target, COALESCE(params_json,''), status FROM mc_scheduled_ops WHERE status='pending' ORDER BY scheduled_at ASC LIMIT {}",
+        SCHEDULE_QUEUE_LIMIT
+    );
+    let rows: Vec<mysql_async::Row> = conn.query(query).await?;
+    Ok(rows.into_iter().map(|r| ScheduledOp {
+        id: r.get::<Option<i64>, _>(0).flatten().unwrap_or(0),
+        scheduled_at: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
+        op_type: r.get::<Option<String>, _>(2).flatten().unwrap_or_default(),
+        target: r.get::<Option<String>, _>(3).flatten().unwrap_or_default(),
+        params_json: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
+        status: r.get::<Option<String>, _>(5).flatten().unwrap_or_default(),
+    }).collect())
+}
+
+/// Load due pending operations (`scheduled_at <= NOW()`), oldest first.
+/// Batch is capped at 20 entries per execution cycle.
+pub async fn load_due_scheduled_ops(pool: &Pool) -> Result<Vec<ScheduledOp>, mysql_async::Error> {
+    const SCHEDULE_DUE_LIMIT: usize = 20;
+    let mut conn = pool.get_conn().await?;
+    let query = format!(
+        "SELECT id, DATE_FORMAT(scheduled_at, '%Y-%m-%d %H:%i:%s'), op_type, target, COALESCE(params_json,''), status FROM mc_scheduled_ops WHERE status='pending' AND scheduled_at <= NOW() ORDER BY scheduled_at ASC LIMIT {}",
+        SCHEDULE_DUE_LIMIT
+    );
+    let rows: Vec<mysql_async::Row> = conn.query(query).await?;
+    Ok(rows.into_iter().map(|r| ScheduledOp {
+        id: r.get::<Option<i64>, _>(0).flatten().unwrap_or(0),
+        scheduled_at: r.get::<Option<String>, _>(1).flatten().unwrap_or_default(),
+        op_type: r.get::<Option<String>, _>(2).flatten().unwrap_or_default(),
+        target: r.get::<Option<String>, _>(3).flatten().unwrap_or_default(),
+        params_json: r.get::<Option<String>, _>(4).flatten().unwrap_or_default(),
+        status: r.get::<Option<String>, _>(5).flatten().unwrap_or_default(),
+    }).collect())
+}
+
+/// Update scheduled-op status (`pending|running|completed|cancelled|failed`).
+pub async fn update_scheduled_op_status(pool: &Pool, id: i64, status: &str) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "UPDATE mc_scheduled_ops SET status=? WHERE id=?",
+        (status, id),
+    ).await?;
+    Ok(())
+}
+
+/// Cancel a scheduled op only when it is still pending.
+pub async fn cancel_scheduled_op(pool: &Pool, id: i64) -> Result<(), mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "UPDATE mc_scheduled_ops SET status='cancelled' WHERE id=? AND status='pending'",
+        (id,),
+    ).await?;
+    Ok(())
+}
+
 // ── Spawned Agents ─────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct SpawnedAgent {

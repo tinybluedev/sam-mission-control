@@ -6275,6 +6275,23 @@ struct ChatPollResult {
     new_routed_ids: Vec<i64>,
 }
 
+enum ScheduleMsg {
+    /// Replace the currently displayed pending queue.
+    Queue(Vec<db::ScheduledOp>),
+    /// User-facing toast/notification message.
+    Notice(String),
+}
+
+const SCHEDULE_OPS: [(&str, &str); 4] = [
+    ("update_agent", "Update Agent"),
+    ("bulk_update_group", "Bulk Update Group"),
+    ("restart_gateway", "Restart Gateway"),
+    ("config_push", "Config Push"),
+];
+const SCHEDULE_DEFAULT_TIME: &str = "+30m";
+const SCHEDULE_DEFAULT_TARGET: &str = "all";
+const SCHEDULE_CHECK_INTERVAL_SECS: u64 = 60;
+
 /// Minimum content width (chars) for message word-wrap, preventing extremely narrow wrapping.
 const MIN_WRAP_WIDTH: usize = 10;
 /// Approximate lines rendered per chat message (header + body + blank), used to estimate
@@ -9838,6 +9855,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return cli::run_log(agent.as_deref(), tail)
                 .await
                 .map_err(|e| e.into());
+        }
+        Some(cli::Commands::Daemon) => {
+            let fleet_config = config::load_fleet_config().map_err(|e| format!("Error: {}", e))?;
+            let pool = db::get_pool();
+            let _ = db::run_migrations(&pool).await;
+            let self_ip = std::env::var("SAM_SELF_IP").unwrap_or_else(|_| "localhost".into());
+            loop {
+                let db_agents = db::load_fleet(&pool).await.unwrap_or_default();
+                let agents: Vec<Agent> = db_agents.into_iter().map(|da| {
+                    let cfg = fleet_config.agent.iter().find(|c| c.name == da.agent_name);
+                    Agent {
+                        name: cfg.map(|c| c.display_name().to_string()).unwrap_or_else(|| da.agent_name.clone()),
+                        db_name: da.agent_name.clone(),
+                        emoji: cfg.map(|c| c.emoji().to_string()).unwrap_or_else(|| "🤖".to_string()),
+                        host: da.tailscale_ip.unwrap_or_else(|| "localhost".into()),
+                        location: cfg.map(|c| c.location().to_string()).unwrap_or_else(|| "Unknown".into()),
+                        status: AgentStatus::from_str(&da.status),
+                        os: da.os_info.unwrap_or_default(),
+                        kernel: da.kernel.unwrap_or_default(),
+                        oc_version: da.oc_version.unwrap_or_default(),
+                        last_seen: String::new(),
+                        current_task: None,
+                        ssh_user: cfg.map(|c| c.ssh_user().to_string()).unwrap_or_else(|| "root".into()),
+                        capabilities: vec![],
+                        token_burn: da.token_burn_today,
+                        latency_ms: None,
+                        cpu_pct: None,
+                        ram_pct: None,
+                        disk_pct: None,
+                        gateway_port: da.gateway_port,
+                        gateway_token: da.gateway_token.clone(),
+                        uptime_seconds: da.uptime_seconds,
+                        activity: String::new(),
+                        context_pct: None,
+                        last_probe_at: None,
+                    }
+                }).collect();
+                for notice in process_due_scheduled_ops(&pool, &agents, &fleet_config.agent, &self_ip).await {
+                    println!("{} {}", now_str(), notice);
+                }
+                tokio::time::sleep(Duration::from_secs(SCHEDULE_CHECK_INTERVAL_SECS)).await;
+            }
         }
         Some(cli::Commands::Version) => {
             println!("sam v{}", env!("CARGO_PKG_VERSION"));
