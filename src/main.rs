@@ -546,6 +546,11 @@ struct App {
     svc_config: Option<serde_json::Value>, // Full openclaw.json
     svc_loading: bool,
     svc_load_rx: Option<mpsc::UnboundedReceiver<Option<serde_json::Value>>>,
+    svc_panel_rx: Option<mpsc::UnboundedReceiver<ServicePanelMsg>>,
+    svc_panel_loading: bool,
+    svc_panel_name: Option<String>,
+    svc_panel_outputs: HashMap<String, String>,
+    svc_panel_errors: HashMap<String, String>,
     config_load_rx: Option<mpsc::UnboundedReceiver<Option<String>>>,
     svc_detail_scroll: u16,
     // Agent model management
@@ -2282,6 +2287,7 @@ PY"#, escaped_model);
                             enabled: false,
                             has_channel_config: true,
                             summary: format!("no plugin entry — {}", summary),
+                            panel_script: None,
                         });
                     }
                 }
@@ -2362,6 +2368,99 @@ PY"#, escaped_model);
             rank(a).cmp(&rank(b))
         });
         self.svc_list = services;
+        self.svc_selected = self.svc_selected.min(self.svc_list.len().saturating_sub(1));
+    }
+
+    fn maybe_start_panel_for_selected_service(&mut self, force: bool) {
+        if self.selected >= self.agents.len() || self.svc_selected >= self.svc_list.len() {
+            return;
+        }
+        let svc = &self.svc_list[self.svc_selected];
+        let Some(script) = svc.panel_script.clone() else { return; };
+        if self.svc_panel_loading {
+            return;
+        }
+        if !force && self.svc_panel_outputs.contains_key(&svc.name) {
+            return;
+        }
+        self.start_service_panel_load(svc.name.clone(), script);
+    }
+
+    fn start_service_panel_load(&mut self, service_name: String, script: String) {
+        if self.selected >= self.agents.len() || self.svc_panel_loading {
+            return;
+        }
+        let agent = &self.agents[self.selected];
+        let host = agent.host.clone();
+        let user = agent.ssh_user.clone();
+        let self_ip = self.self_ip.clone();
+
+        self.svc_panel_loading = true;
+        self.svc_panel_name = Some(service_name.clone());
+        self.svc_panel_errors.remove(&service_name);
+        self.diag_active = true;
+        self.diag_task_running = true;
+        self.diag_auto_fix = false;
+        self.diag_title = Some(format!("🔌 Plugin Panel — {}", service_name));
+        self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
+        self.diag_steps = vec![DiagStep {
+            label: format!("Loading panel for {}", service_name),
+            status: DiagStatus::Running,
+            detail: String::new(),
+        }];
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.svc_panel_rx = Some(rx);
+        tokio::spawn(async move {
+            let _ = tx.send(ServicePanelMsg::Step(DiagStep {
+                label: "Running plugin panel script".into(),
+                status: DiagStatus::Running,
+                detail: "collecting output...".into(),
+            }));
+            let output = if host == "localhost" || host == self_ip {
+                tokio::time::timeout(
+                    Duration::from_secs(PANEL_SCRIPT_TIMEOUT_SECS),
+                    Command::new("bash").args(["-lc", &script]).output(),
+                )
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(PANEL_SCRIPT_TIMEOUT_SECS),
+                    Command::new("ssh")
+                        .args([
+                            "-o",
+                            "ConnectTimeout=5",
+                            "-o",
+                            "BatchMode=yes",
+                            "-o",
+                            "StrictHostKeyChecking=no",
+                            &format!("{}@{}", user, host),
+                            "bash",
+                            "-lc",
+                            &script,
+                        ])
+                        .output(),
+                )
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+            };
+            let result = match output {
+                Some(o) if o.status.success() => {
+                    let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    Ok(if text.is_empty() { "(no panel output)".to_string() } else { text })
+                }
+                Some(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    Err(if err.is_empty() { "panel command failed".to_string() } else { err })
+                }
+                None => Err("panel command timed out".to_string()),
+            };
+            let _ = tx.send(ServicePanelMsg::Done { service_name, result });
+        });
     }
 
     fn build_channel_summary(&self, name: &str, config: &serde_json::Value) -> String {
@@ -6461,6 +6560,17 @@ fn svc_icon(name: &str) -> &'static str {
         .unwrap_or("🔌")
 }
 
+fn panel_script_from_plugin_entry(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("panelScript")
+        .or_else(|| entry.get("panel_script"))
+        .or_else(|| entry.get("panel").and_then(|p| p.get("script")))
+        .or_else(|| entry.get("panel").and_then(|p| p.get("command")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 const AGENT_FILES: &[(&str, &str, &str)] = &[
     ("SOUL.md", "soul", "🧬"),
     ("IDENTITY.md", "identity", "🪪"),
@@ -6527,6 +6637,8 @@ const SCHEDULE_CHECK_INTERVAL_SECS: u64 = 60;
 
 /// Minimum content width (chars) for message word-wrap, preventing extremely narrow wrapping.
 const MIN_WRAP_WIDTH: usize = 10;
+const PANEL_SCRIPT_TIMEOUT_SECS: u64 = 15;
+const MAX_PANEL_DISPLAY_LINES: usize = 24;
 /// Approximate lines rendered per chat message (header + body + blank), used to estimate
 /// the number of unseen messages from a raw line count.
 const LINES_PER_MSG_EST: usize = 3;
@@ -8821,6 +8933,42 @@ fn render_services(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::Yellow),
                     )));
                 }
+            }
+        }
+        if svc.panel_script.is_some() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Custom Panel", Style::default().fg(t.text_bold).bold())));
+            if app.svc_panel_loading && app.svc_panel_name.as_deref() == Some(svc.name.as_str()) {
+                let spinner = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+                lines.push(Line::from(Span::styled(
+                    format!("  {} Loading panel output...", spinner),
+                    Style::default().fg(t.pending),
+                )));
+            } else if let Some(err) = app.svc_panel_errors.get(&svc.name) {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", err),
+                    Style::default().fg(t.status_offline),
+                )));
+            } else if let Some(output) = app.svc_panel_outputs.get(&svc.name) {
+                let all_lines: Vec<&str> = output.lines().collect();
+                for line in all_lines.iter().take(MAX_PANEL_DISPLAY_LINES) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", line),
+                        Style::default().fg(t.text),
+                    )));
+                }
+                let hidden = all_lines.len().saturating_sub(MAX_PANEL_DISPLAY_LINES);
+                if hidden > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("  … ({} more lines)", hidden),
+                        Style::default().fg(t.text_dim),
+                    )));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  Press [p] to load panel output",
+                    Style::default().fg(t.text_dim),
+                )));
             }
         }
         lines
@@ -12694,6 +12842,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.svc_loading = false;
                 let count = app.svc_list.len();
                 app.toast(&format!("✓ Loaded {} services", count));
+            }
+        }
+
+        // Receive plugin panel results (non-blocking)
+        let mut panel_msgs = Vec::new();
+        if let Some(ref mut rx) = app.svc_panel_rx {
+            while let Ok(msg) = rx.try_recv() {
+                panel_msgs.push(msg);
+            }
+        }
+        for msg in panel_msgs {
+            match msg {
+                ServicePanelMsg::Step(step) => app.diag_steps.push(step),
+                ServicePanelMsg::Done { service_name, result } => {
+                    app.svc_panel_loading = false;
+                    app.svc_panel_name = None;
+                    app.diag_task_running = false;
+                    match result {
+                        Ok(output) => {
+                            app.svc_panel_errors.remove(&service_name);
+                            app.svc_panel_outputs.insert(service_name.clone(), output);
+                            app.diag_steps.push(DiagStep {
+                                label: "DONE".into(),
+                                status: DiagStatus::Pass,
+                                detail: "panel loaded".into(),
+                            });
+                            app.toast(&format!("✓ Loaded {} panel", service_name));
+                        }
+                        Err(err) => {
+                            app.svc_panel_errors.insert(service_name.clone(), err.clone());
+                            app.diag_steps.push(DiagStep {
+                                label: "DONE".into(),
+                                status: DiagStatus::Fail,
+                                detail: err,
+                            });
+                            app.toast(&format!("⚠ {} panel failed", service_name));
+                        }
+                    }
+                }
             }
         }
 
