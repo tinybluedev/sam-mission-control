@@ -14,6 +14,7 @@ theme = "standard"
 background = "dark"
 refresh_interval = 30
 chat_poll_interval = 3
+vim_mode = false
 
 [identity]
 user = "operator"
