@@ -5634,6 +5634,115 @@ PY",
         self.toast(&format!("✓ Saved {}", fname));
     }
 
+    fn start_fleet_search(&mut self) {
+        let query = self.fleet_search_query.trim().to_string();
+        if query.is_empty() {
+            self.toast("Enter a search query first");
+            return;
+        }
+
+        let targets: Vec<(String, String, String, bool)> = if self.multi_selected.is_empty() {
+            self.agents.iter()
+                .filter(|a| a.status == AgentStatus::Online)
+                .map(|a| (a.name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac")))
+                .collect()
+        } else {
+            self.multi_selected.iter()
+                .filter_map(|&i| self.agents.get(i))
+                .filter(|a| a.status == AgentStatus::Online)
+                .map(|a| (a.name.clone(), a.host.clone(), a.ssh_user.clone(), a.os.to_lowercase().contains("mac")))
+                .collect()
+        };
+
+        self.fleet_search_active = true;
+        self.fleet_search_running = true;
+        self.fleet_search_scroll = 0;
+        self.fleet_search_steps.clear();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.fleet_search_rx = Some(rx);
+        let self_ip = self.self_ip.clone();
+
+        tokio::spawn(async move {
+            let _ = tx.send(DiagStep {
+                label: "Fleet search".into(),
+                status: DiagStatus::Running,
+                detail: format!("query: {}", query),
+            });
+            let _ = tx.send(DiagStep {
+                label: "Targets".into(),
+                status: DiagStatus::Pass,
+                detail: format!("{} online agent(s)", targets.len()),
+            });
+
+            if targets.is_empty() {
+                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "No online agents selected".into() });
+                return;
+            }
+
+            let mut handles = Vec::new();
+            for (name, host, user, is_mac) in targets {
+                let self_ip = self_ip.clone();
+                let query = query.clone();
+                handles.push(tokio::spawn(async move {
+                    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                    let q = shell::escape(&query);
+                    let cmd = format!(
+                        "{}for f in {}; do [ -f \"$f\" ] && grep -n -i -- {} \"$f\"; done 2>/dev/null | head -n {}",
+                        pfx, FLEET_SEARCH_TARGET_GLOBS, q, FLEET_SEARCH_MAX_RESULTS
+                    );
+
+                    let output = if host == "localhost" || host == self_ip {
+                        tokio::time::timeout(Duration::from_secs(FLEET_SEARCH_TIMEOUT_SECS), tokio::process::Command::new("bash").args(["-lc", &cmd]).output()).await.ok().and_then(|r| r.ok())
+                    } else {
+                        tokio::time::timeout(
+                            Duration::from_secs(FLEET_SEARCH_TIMEOUT_SECS),
+                            tokio::process::Command::new("ssh")
+                                .args(["-o","ConnectTimeout=2","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                    &format!("{}@{}", user, host), &cmd])
+                                .output()
+                        ).await.ok().and_then(|r| r.ok())
+                    };
+
+                    match output {
+                        Some(o) => {
+                            let out = String::from_utf8_lossy(&o.stdout).to_string();
+                            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                            let (count, preview) = summarize_fleet_search_output(&out);
+                            if count > 0 {
+                                (DiagStep {
+                                    label: name,
+                                    status: DiagStatus::Pass,
+                                    detail: if preview.is_empty() { format!("{} match(es)", count) } else { format!("{} match(es) — {}", count, preview) },
+                                }, true)
+                            } else if !err.is_empty() {
+                                (DiagStep { label: name, status: DiagStatus::Fail, detail: err.chars().take(FLEET_SEARCH_ERROR_MAX_CHARS).collect() }, false)
+                            } else {
+                                (DiagStep { label: name, status: DiagStatus::Skipped, detail: "no matches".into() }, false)
+                            }
+                        }
+                        None => (DiagStep { label: name, status: DiagStatus::Fail, detail: "timeout".into() }, false),
+                    }
+                }));
+            }
+
+            let mut matched_agents = 0usize;
+            let mut total_agents = 0usize;
+            for h in handles {
+                if let Ok((step, matched)) = h.await {
+                    total_agents += 1;
+                    if matched { matched_agents += 1; }
+                    let _ = tx.send(step);
+                }
+            }
+            let _ = tx.send(DiagStep {
+                label: "DONE".into(),
+                status: DiagStatus::Pass,
+                detail: format!("{} / {} agent(s) with matches", matched_agents, total_agents),
+            });
+        });
+    }
+
     fn start_refresh(&mut self) {
         if self.refreshing {
             return;
@@ -8211,6 +8320,76 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
                 .style(Style::default().bg(app.bg_density.bg())),
         );
     frame.render_widget(diag, popup);
+}
+
+fn render_fleet_search(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = frame.area();
+    let w = ((area.width as f32 * 0.75) as u16).max(70).min(area.width.saturating_sub(4));
+    let h = ((area.height as f32 * 0.75) as u16).max(12).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Query: ", Style::default().fg(t.text_dim)),
+            Span::styled(&app.fleet_search_query, Style::default().fg(t.text).bold()),
+            if !app.fleet_search_running { Span::styled("▌", Style::default().fg(t.accent)) } else { Span::raw("") },
+        ]),
+        Line::from(""),
+    ];
+
+    for step in &app.fleet_search_steps {
+        if step.label == "DONE" {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(format!("  {}", step.detail), Style::default().fg(if step.status == DiagStatus::Fail { t.status_offline } else { t.status_online }).bold())));
+            continue;
+        }
+        if step.status == DiagStatus::Running {
+            let c = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", c), Style::default().fg(t.pending)),
+                Span::styled(&step.label, Style::default().fg(t.text).bold()),
+                Span::styled(format!(" — {}", step.detail), Style::default().fg(t.text_dim)),
+            ]));
+        } else {
+            let (icon, color) = match step.status {
+                DiagStatus::Pass => ("✓ ", t.status_online),
+                DiagStatus::Fail => ("✗ ", t.status_offline),
+                DiagStatus::Skipped => ("⊘ ", t.text_dim),
+                DiagStatus::Fixed => ("🔧", t.status_busy),
+                DiagStatus::Running => ("⏳", t.pending),
+                DiagStatus::Rollback => ("⏪", t.status_busy),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+                Span::styled(&step.label, Style::default().fg(t.text).bold()),
+                Span::styled(format!(" — {}", step.detail), Style::default().fg(t.text_dim)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if app.fleet_search_running {
+            "  Enter search  Backspace edit  ↑↓ scroll  Esc close"
+        } else {
+            "  Type to edit query  Enter search again  ↑↓ scroll  Esc close"
+        },
+        Style::default().fg(t.text_dim),
+    )));
+
+    let search = Paragraph::new(lines)
+        .scroll((app.fleet_search_scroll, 0))
+        .block(Block::default()
+            .title(Span::styled(" 🔎 Fleet Search — memory + config grep ", Style::default().fg(t.accent).bold()))
+            .borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(Style::default().fg(t.accent))
+            .style(Style::default().bg(app.bg_density.bg())));
+    frame.render_widget(search, popup);
 }
 
 fn render_services(frame: &mut Frame, app: &App, area: Rect) {
@@ -12347,6 +12526,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             app.fleet_diag_done = true;
                         }
                     }
+                }
+            }
+        }
+        if app.fleet_search_active {
+            if let Some(ref mut rx) = app.fleet_search_rx {
+                while let Ok(step) = rx.try_recv() {
+                    if step.label == "DONE" { app.fleet_search_running = false; }
+                    app.fleet_search_steps.push(step);
                 }
             }
         }
