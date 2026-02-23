@@ -5959,7 +5959,7 @@ print('ok')
     }
 
     fn save_svc_form(&mut self) {
-        if self.selected >= self.agents.len() {
+        if self.selected >= self.agents.len() || self.svc_form_plugin.is_empty() {
             return;
         }
         let plugin = self.svc_form_plugin.clone();
@@ -5981,8 +5981,13 @@ print('ok')
         // Build Python script to merge channel config and enable plugin
         let channel_json = serde_json::to_string(&serde_json::Value::Object(channel_obj))
             .unwrap_or_else(|_| "{}".into());
-        // Escape single quotes in the JSON for embedding in Python
-        let escaped_json = channel_json.replace('\\', "\\\\").replace('\'', "\\'");
+        // Escape for embedding in Python single-quoted string
+        let escaped_json = channel_json
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t");
         let cmd = format!(
             r#"python3 -c "
 import json, os
@@ -11805,7 +11810,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let display_val = if val.is_empty() && !focused {
                             "(empty)".to_string()
                         } else if focused {
-                            format!("{}_", val)
+                            format!("{}▏", val)
                         } else {
                             val.clone()
                         };
@@ -12476,7 +12481,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                 let display = match v {
                                                                     serde_json::Value::String(s) => {
                                                                         if k.to_lowercase().contains("token") || k.to_lowercase().contains("secret") {
-                                                                            format!("{}…", &s[..s.len().min(8)])
+                                                                            let masked: String = s.chars().take(8).collect();
+                                                                            format!("{}…", masked)
                                                                         } else {
                                                                             s.clone()
                                                                         }
