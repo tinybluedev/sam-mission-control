@@ -230,6 +230,31 @@ impl GroupFilter {
 #[derive(Clone, Copy)]
 enum SplitDragTarget { Dashboard, Detail }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ThemeMode {
+    Auto,
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Dark,
+            Self::Dark => Self::Light,
+            Self::Light => Self::Auto,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum SortMode {
     Name,
@@ -523,6 +548,28 @@ fn detail_split(_area: &ratatui::layout::Rect, split_pct: Option<u16>) -> (u16, 
     (pct, 100 - pct)
 }
 
+fn detect_system_bg_density() -> BgDensity {
+    if let Ok(mode) = std::env::var("SAM_THEME_MODE") {
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "light" => return BgDensity::White,
+            "dark" => return BgDensity::Dark,
+            _ => {}
+        }
+    }
+    if let Ok(colorfgbg) = std::env::var("COLORFGBG") {
+        if let Some(bg) = colorfgbg
+            .split(';')
+            .next_back()
+            .and_then(|v| v.parse::<u16>().ok())
+        {
+            if bg >= 10 {
+                return BgDensity::White;
+            }
+        }
+    }
+    BgDensity::Dark
+}
+
 struct App {
     agents: Vec<Agent>,
     fleet_config: Vec<config::AgentConfig>,
@@ -659,8 +706,10 @@ struct App {
     selected_agents: std::collections::HashSet<String>,
     // Theme
     theme_name: ThemeName,
+    theme_mode: ThemeMode,
     bg_density: BgDensity,
     theme: Theme,
+    theme_toggle_area: Rect,
     // OC version tracking
     latest_oc_version: String,
     // Routing
@@ -866,7 +915,8 @@ impl App {
             .unwrap_or_default();
 
         let tn = ThemeName::Standard;
-        let bd = BgDensity::Dark;
+        let tm = ThemeMode::Auto;
+        let bd = detect_system_bg_density();
         let (audit_tx, mut audit_input_rx) = mpsc::unbounded_channel::<AuditEvent>();
         let (audit_result_tx, audit_result_rx) = mpsc::unbounded_channel::<AuditResult>();
         let audit_pool = pool.clone();
@@ -941,8 +991,10 @@ impl App {
             detail_chat_area: Rect::default(),
             fleet_row_start_y: 0,
             theme_name: tn,
+            theme_mode: tm,
             bg_density: bd,
             theme: Theme::resolve(tn, bd),
+            theme_toggle_area: Rect::default(),
             routed_msg_ids: std::collections::HashSet::new(),
             diag_active: false,
             diag_steps: vec![],
@@ -1313,6 +1365,16 @@ impl App {
         self.theme = Theme::resolve(self.theme_name, self.bg_density);
     }
 
+    fn cycle_theme_mode(&mut self) {
+        self.theme_mode = self.theme_mode.next();
+        self.bg_density = match self.theme_mode {
+            ThemeMode::Auto => detect_system_bg_density(),
+            ThemeMode::Dark => BgDensity::Dark,
+            ThemeMode::Light => BgDensity::White,
+        };
+        self.theme = Theme::resolve(self.theme_name, self.bg_density);
+    }
+
     fn cycle_sort(&mut self) {
         self.sort_mode = self.sort_mode.next();
         let sm = self.sort_mode;
@@ -1344,6 +1406,11 @@ impl App {
 
     fn cycle_bg(&mut self) {
         self.bg_density = self.bg_density.next();
+        self.theme_mode = if self.bg_density.is_light() {
+            ThemeMode::Light
+        } else {
+            ThemeMode::Dark
+        };
         self.theme = Theme::resolve(self.theme_name, self.bg_density);
     }
 
@@ -6261,7 +6328,7 @@ PY",
             String::new()
         };
         self.status_message = format!(
-            "v1.2 │ {}/{} online{}{}{} │ sort:{} │ chat({}) │ {}/{} │ /=cmd ?=help",
+            "v1.2 │ {}/{} online{}{}{} │ sort:{} │ chat({}) │ {}/{}/{} │ /=cmd ?=help",
             on,
             total,
             refresh,
@@ -6270,7 +6337,8 @@ PY",
             self.sort_mode.label(),
             chat_count,
             self.theme_name.label(),
-            self.bg_density.label()
+            self.bg_density.label(),
+            self.theme_mode.label()
         );
     }
 }
@@ -7311,6 +7379,11 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
             Span::raw("")
         },
         Span::raw("    "),
+        Span::styled(
+            format!("🌓 {}", app.theme_mode.label()),
+            Style::default().fg(t.accent2).bold(),
+        ),
+        Span::raw(" "),
         Span::styled(chrono_now(), Style::default().fg(t.text_dim)),
         Span::raw("    "),
         Span::styled(
@@ -7330,6 +7403,12 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
             .style(Style::default().bg(app.bg_density.bg())),
     );
     frame.render_widget(header, outer[0]);
+    app.theme_toggle_area = Rect::new(
+        outer[0].x + outer[0].width.saturating_sub(16),
+        outer[0].y,
+        14.min(outer[0].width),
+        outer[0].height,
+    );
 
     let (fleet_pct, chat_pct) = dashboard_split(&outer[1], app.dashboard_split_pct);
     let body = Layout::default()
@@ -7908,6 +7987,11 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
             },
             Style::default().fg(t.accent).bold(),
         ),
+        Span::raw("    "),
+        Span::styled(
+            format!("🌓 {}", app.theme_mode.label()),
+            Style::default().fg(t.accent2).bold(),
+        ),
     ]))
     .block(
         Block::default()
@@ -7917,6 +8001,12 @@ fn render_detail(frame: &mut Frame, app: &mut App) {
             .style(Style::default().bg(app.bg_density.bg())),
     );
     frame.render_widget(header, chunks[0]);
+    app.theme_toggle_area = Rect::new(
+        chunks[0].x + chunks[0].width.saturating_sub(16),
+        chunks[0].y,
+        14.min(chunks[0].width),
+        chunks[0].height,
+    );
 
     // Body: info left, chat right (responsive)
     let (info_pct, chat_pct) = detail_split(&chunks[1], app.detail_split_pct);
@@ -9540,7 +9630,7 @@ fn render_vpn_status(frame: &mut Frame, app: &App) {
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            "Esc/q=back  │  b=bg  │  c=theme",
+            "Esc/q=back  │  m=mode  │  b=bg  │  c=theme",
             Style::default().fg(t.text_dim),
         ),
     ]))
@@ -9982,7 +10072,8 @@ fn render_alerts(frame: &mut Frame, app: &App) {
     frame.render_widget(alerts, outer[1]);
 
     let footer_msg = format!(
-        "Esc/q=back │ ↑↓=scroll │ b=bg ({}) │ c=theme ({})",
+        "Esc/q=back │ ↑↓=scroll │ m=mode ({}) │ b=bg ({}) │ c=theme ({})",
+        app.theme_mode.label(),
         app.bg_density.label(),
         app.theme_name.label()
     );
@@ -10108,6 +10199,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         ("GLOBAL", "", dim_style),
         ("  ?", "Open this help screen", nav_style),
         ("  q", "Quit", dest_style),
+        ("  m", "Cycle mode: auto → dark → light", act_style),
         ("  c", "Cycle color theme", act_style),
         ("  b", "Cycle background density", act_style),
         ("", "", dim_style),
@@ -10265,6 +10357,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ("t", "tasks"),
                 ("f", "filter"),
                 ("r", "refresh"),
+                ("m", "mode"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
@@ -10308,6 +10401,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ("w", "files"),
                 ("t", "tasks"),
                 ("5", "svc"),
+                ("m", "mode"),
                 ("Tab", "chat"),
                 ("Esc", "back"),
             ],
@@ -10696,7 +10790,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Event::Mouse(mouse) = &ev {
                 let (mx, my) = (mouse.column, mouse.row);
                 match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => match app.screen {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if matches!(app.screen, Screen::Dashboard | Screen::AgentDetail)
+                            && point_in_rect(mx, my, app.theme_toggle_area)
+                        {
+                            app.cycle_theme_mode();
+                            continue;
+                        }
+                        match app.screen {
                         Screen::Dashboard => {
                             // Click on fleet panel
                             if mx >= app.fleet_area.x
@@ -10739,6 +10840,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         _ => {}
+                    }
                     },
                     MouseEventKind::Drag(MouseButton::Left) => {
                         match app.dragging_split {
@@ -11667,6 +11769,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         KeyCode::Char('U') => app.start_oc_update(),
                                         KeyCode::Char('q') => app.should_quit = true,
                                         KeyCode::Char('r') => app.start_refresh(),
+                                        KeyCode::Char('m') => app.cycle_theme_mode(),
                                         KeyCode::Char('b') => app.cycle_bg(),
                                         KeyCode::Char('e') => {
                                             // Fetch remote config (non-blocking)
@@ -11827,6 +11930,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         app.screen = Screen::Dashboard;
                                         app.focus = Focus::Fleet;
                                     }
+                                    KeyCode::Char('m') => app.cycle_theme_mode(),
                                     KeyCode::Char('b') => app.cycle_bg(),
                                     KeyCode::Char('c') => app.cycle_theme(),
                                     KeyCode::Up | KeyCode::Char('k') => {
@@ -11842,6 +11946,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         app.screen = Screen::Dashboard;
                                         app.focus = Focus::Fleet;
                                     }
+                                    KeyCode::Char('m') => app.cycle_theme_mode(),
                                     KeyCode::Char('b') => app.cycle_bg(),
                                     KeyCode::Char('c') => app.cycle_theme(),
                                     _ => {}
@@ -12037,6 +12142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                                 KeyCode::Char('?') => app.screen = Screen::Help,
                                                 KeyCode::Char('r') => app.start_refresh(),
+                                                KeyCode::Char('m') => app.cycle_theme_mode(),
                                                 KeyCode::Char('b') => app.cycle_bg(),
                                                 KeyCode::Char('c') => app.cycle_theme(),
                                                 KeyCode::Char('s') => {
