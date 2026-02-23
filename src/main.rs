@@ -713,14 +713,14 @@ fn split_pct_from_mouse(mx: u16, area: ratatui::layout::Rect) -> u16 {
     pct.max(MIN_SPLIT_PCT).min(MAX_SPLIT_PCT)
 }
 
-fn dashboard_split(_area: &ratatui::layout::Rect, split_pct: Option<u16>) -> (u16, u16) {
+fn dashboard_split(_area: &ratatui::layout::Rect, split_pct: Option<u16>) -> (Constraint, Constraint) {
     let pct = split_pct.unwrap_or(45).max(MIN_SPLIT_PCT).min(MAX_SPLIT_PCT);
-    (pct, 100 - pct)
+    (Constraint::Percentage(pct), Constraint::Percentage(100 - pct))
 }
 
-fn detail_split(_area: &ratatui::layout::Rect, split_pct: Option<u16>) -> (u16, u16) {
+fn detail_split(_area: &ratatui::layout::Rect, split_pct: Option<u16>) -> (Constraint, Constraint) {
     let pct = split_pct.unwrap_or(55).max(MIN_SPLIT_PCT).min(MAX_SPLIT_PCT);
-    (pct, 100 - pct)
+    (Constraint::Percentage(pct), Constraint::Percentage(100 - pct))
 }
 
 fn detect_system_bg_density() -> BgDensity {
