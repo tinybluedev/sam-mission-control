@@ -124,6 +124,50 @@ SAM_DB_URL=mysql://user:pass@host:port/database
 SAM_SELF_IP=10.0.0.1
 ```
 
+## Agent Detection
+
+S.A.M uses a **two-phase detection** strategy to determine each agent's status:
+
+### Phase 1: Tailscale Connectivity Check
+Before any SSH attempts, S.A.M runs `tailscale status --json` once per refresh cycle. This returns the online/offline state of every node in the Tailscale mesh instantly, without opening any connections.
+
+- **Offline nodes are skipped immediately** — no SSH timeout waited (saves ~3s per offline agent)
+- **Online nodes proceed to Phase 2**
+- **Graceful degradation** — if the `tailscale` binary is unavailable or returns an error, S.A.M falls back to SSH-only probing with zero behavior change
+
+### Phase 2: SSH Gateway Verification
+For nodes that Tailscale reports as online, S.A.M verifies the OpenClaw gateway service via SSH:
+
+- **Fast probe** (4 out of every 5 cycles): `ssh echo ok` — confirms SSH reachability and measures latency
+- **Full probe** (every 5th cycle): SSHes in to collect OS, kernel version, OpenClaw version, CPU/RAM/disk usage, gateway PID, and context window fill level
+
+### Version Alerts
+S.A.M polls `npm view openclaw version` every 30 seconds to get the latest release. Any online agent running an older version triggers a **⚠ warning alert** in the TUI:
+
+```
+dellr720 outdated: 2026.2.19 → 2026.3.13 (Shift+U to update)
+```
+
+Press **Shift+U** with an agent selected to trigger an in-TUI update flow that SSHes in, runs `npm update -g openclaw`, and restarts the gateway service.
+
+### Detection Flow Summary
+
+```
+refresh() every 30s
+  │
+  ├─ tailscale status --json  ← single fast call
+  │    │
+  │    ├─ node OFFLINE → mark Offline immediately (no SSH)
+  │    │
+  │    └─ node ONLINE → SSH probe
+  │         │
+  │         ├─ fast (4/5): echo ok → Online + latency
+  │         │
+  │         └─ full (1/5): metrics, version, gateway PID
+  │
+  └─ npm view openclaw version → version alert if any agent is behind
+```
+
 ## Architecture
 
 ```mermaid

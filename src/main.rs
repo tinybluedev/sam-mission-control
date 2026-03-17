@@ -71,6 +71,8 @@ struct Agent {
     context_pct: Option<f32>, // Context window usage %
     #[serde(skip)]
     last_probe_at: Option<std::time::Instant>,
+    #[serde(skip)]
+    ts_online: Option<bool>, // Tailscale connectivity (None = unknown)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -315,6 +317,7 @@ struct ProbeResult {
     context_pct: Option<f32>,
     gateway_status: GatewayStatus,
     gateway_pid: Option<i32>,
+    ts_online: Option<bool>,
 }
 
 // ── UI Helpers ──────────────────────────────────────
@@ -1087,6 +1090,7 @@ impl App {
                         activity: "idle".into(),
                         context_pct: None,
                         last_probe_at: None,
+                        ts_online: None,
                     });
                 }
             }
@@ -6656,6 +6660,12 @@ PY",
         let (tx, rx) = mpsc::unbounded_channel();
         self.refresh_rx = Some(rx);
 
+        // Fetch Tailscale status once before spawning per-agent probes.
+        // Uses a synchronous std::process::Command (fast local CLI) so we can
+        // build the map before spawning tasks without needing block_on.
+        // Falls back to empty map if tailscale binary is unavailable.
+        let ts_map = std::sync::Arc::new(fetch_tailscale_status_sync());
+
         for (i, a) in self.agents.iter().enumerate() {
             let (host, user, jump_host, jump_user, sip) = (
                 a.host.clone(),
@@ -6666,9 +6676,10 @@ PY",
             );
             let tx = tx.clone();
             let full = self.refresh_cycle % 5 == 0; // full probe every 5th cycle
+            let ts_online = ts_map.get(&host).copied();
             tokio::spawn(async move {
                 let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx, hw_cpu_model, hw_ram_total_mb, hw_disk_layout) =
-                    probe_agent(&host, &user, jump_host.as_deref(), jump_user.as_deref(), &sip, full).await;
+                    probe_agent(&host, &user, jump_host.as_deref(), jump_user.as_deref(), &sip, full, ts_online).await;
                 let _ = tx.send(ProbeResult {
                     index: i,
                     status,
@@ -6688,6 +6699,7 @@ PY",
                     gateway_pid: None,
                     mem_free_mb: None,
                     swap_mb: None,
+                    ts_online,
                 });
             });
         }
@@ -6735,6 +6747,9 @@ PY",
                     }
                     self.agents[r.index].last_seen = now_str();
                     self.agents[r.index].last_probe_at = Some(Instant::now());
+                    if r.ts_online.is_some() {
+                        self.agents[r.index].ts_online = r.ts_online;
+                    }
                     let change_detail = fleet_change_detail(
                         &prev_status,
                         &r.status,
@@ -6953,6 +6968,69 @@ PY",
     }
 }
 
+// ---- Tailscale Status ----
+
+/// Parse Tailscale JSON output into an IP -> online map.
+fn parse_tailscale_json(output: &[u8]) -> std::collections::HashMap<String, bool> {
+    let mut map = std::collections::HashMap::new();
+    let json: serde_json::Value = match serde_json::from_slice(output) {
+        Ok(v) => v,
+        Err(_) => return map,
+    };
+    // Add self node (always online from our perspective)
+    if let Some(self_node) = json.get("Self") {
+        let online = self_node.get("Online").and_then(|v| v.as_bool()).unwrap_or(true);
+        if let Some(ips) = self_node.get("TailscaleIPs").and_then(|v| v.as_array()) {
+            for ip in ips {
+                if let Some(s) = ip.as_str() {
+                    map.insert(s.to_string(), online);
+                }
+            }
+        }
+    }
+    // Add peers
+    if let Some(peers) = json.get("Peer").and_then(|v| v.as_object()) {
+        for (_key, peer) in peers {
+            let online = peer.get("Online").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Some(ips) = peer.get("TailscaleIPs").and_then(|v| v.as_array()) {
+                for ip in ips {
+                    if let Some(s) = ip.as_str() {
+                        map.insert(s.to_string(), online);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Synchronous Tailscale status fetch (used from non-async context in start_refresh).
+/// Returns empty map on any error so SSH-only probe logic is used as fallback.
+fn fetch_tailscale_status_sync() -> std::collections::HashMap<String, bool> {
+    match std::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+    {
+        Ok(o) if o.status.success() => parse_tailscale_json(&o.stdout),
+        _ => std::collections::HashMap::new(),
+    }
+}
+
+/// Async version of Tailscale status fetch (for use in async contexts).
+async fn fetch_tailscale_status() -> std::collections::HashMap<String, bool> {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::process::Command::new("tailscale")
+            .args(["status", "--json"])
+            .output(),
+    )
+    .await;
+    match result {
+        Ok(Ok(o)) if o.status.success() => parse_tailscale_json(&o.stdout),
+        _ => std::collections::HashMap::new(),
+    }
+}
+
 // ---- SSH Probe ----
 
 async fn probe_agent(
@@ -6962,6 +7040,7 @@ async fn probe_agent(
     jump_user: Option<&str>,
     self_ip: &str,
     full: bool,
+    tailscale_online: Option<bool>,
 ) -> (
     AgentStatus,
     String,
@@ -6978,6 +7057,15 @@ async fn probe_agent(
     String,
 ) {
     let start = Instant::now();
+    // Tailscale short-circuit: if Tailscale reports offline, skip SSH entirely
+    if tailscale_online == Some(false) && host != "localhost" && host != self_ip {
+        return (
+            AgentStatus::Offline,
+            String::new(), String::new(), String::new(),
+            None, None, None, None, String::new(), None,
+            String::new(), None, String::new(),
+        );
+    }
     // Fast probe: just SSH echo (connectivity + latency only)
     if !full && host != "localhost" && host != self_ip {
         let mut args = vec![
@@ -11971,6 +12059,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         activity: String::new(),
                         context_pct: None,
                         last_probe_at: None,
+                        ts_online: None,
                     }
                 }).collect();
                 for notice in process_due_scheduled_ops(&pool, &agents, &fleet_config.agent, &self_ip).await {
@@ -12412,6 +12501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             uptime_seconds: 0,
                                             activity: "new".into(), context_pct: None,
                                             last_probe_at: None,
+                        ts_online: None,
                                             gateway_pid: None,
                                             gateway_status: GatewayStatus::Unknown,
                                             mem_free_mb: None,
@@ -12465,6 +12555,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         activity: "new".into(),
                                         context_pct: None,
                                         last_probe_at: None,
+                        ts_online: None,
                                         mem_free_mb: None,
                                         swap_mb: None,
                                     });
@@ -14537,6 +14628,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 uptime_seconds: 0,
                 activity: "new".into(), context_pct: None,
                 last_probe_at: None,
+                        ts_online: None,
                 gateway_pid: None,
                 gateway_status: GatewayStatus::Unknown,
                 mem_free_mb: None,
