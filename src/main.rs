@@ -7083,27 +7083,45 @@ fn parse_tailscale_json(output: &[u8]) -> std::collections::HashMap<String, bool
         Ok(v) => v,
         Err(_) => return map,
     };
+    // Helper: extract IPs from both TailscaleIPs and AllowedIPs fields.
+    // Headscale may only put IPv6 in TailscaleIPs, but AllowedIPs has both
+    // in CIDR format (e.g., "10.64.0.25/32"). We strip the /prefix.
+    let extract_ips = |node: &serde_json::Value| -> Vec<String> {
+        let mut ips = Vec::new();
+        if let Some(arr) = node.get("TailscaleIPs").and_then(|v| v.as_array()) {
+            for ip in arr {
+                if let Some(s) = ip.as_str() {
+                    ips.push(s.to_string());
+                }
+            }
+        }
+        if let Some(arr) = node.get("AllowedIPs").and_then(|v| v.as_array()) {
+            for ip in arr {
+                if let Some(s) = ip.as_str() {
+                    // Strip CIDR prefix (e.g., "10.64.0.25/32" → "10.64.0.25")
+                    let bare = s.split('/').next().unwrap_or(s);
+                    if !ips.contains(&bare.to_string()) {
+                        ips.push(bare.to_string());
+                    }
+                }
+            }
+        }
+        ips
+    };
+
     // Add self node (always online from our perspective)
     if let Some(self_node) = json.get("Self") {
         let online = self_node.get("Online").and_then(|v| v.as_bool()).unwrap_or(true);
-        if let Some(ips) = self_node.get("TailscaleIPs").and_then(|v| v.as_array()) {
-            for ip in ips {
-                if let Some(s) = ip.as_str() {
-                    map.insert(s.to_string(), online);
-                }
-            }
+        for ip in extract_ips(self_node) {
+            map.insert(ip, online);
         }
     }
     // Add peers
     if let Some(peers) = json.get("Peer").and_then(|v| v.as_object()) {
         for (_key, peer) in peers {
             let online = peer.get("Online").and_then(|v| v.as_bool()).unwrap_or(false);
-            if let Some(ips) = peer.get("TailscaleIPs").and_then(|v| v.as_array()) {
-                for ip in ips {
-                    if let Some(s) = ip.as_str() {
-                        map.insert(s.to_string(), online);
-                    }
-                }
+            for ip in extract_ips(peer) {
+                map.insert(ip, online);
             }
         }
     }
@@ -7218,9 +7236,14 @@ async fn probe_agent(
         return match result {
             Ok(Ok(o)) if o.status.success() => {
                 let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                // openclaw --version returns "OpenClaw 2026.3.13 (hash)" — extract version
+                // Parse version from various formats:
+                // "OpenClaw 2026.3.13 (61d171a)" → 2026.3.13
+                // "2026.2.21-2" → 2026.2.21-2
                 let oc_ver = if raw.starts_with("OpenClaw ") {
                     raw.split_whitespace().nth(1).unwrap_or("").to_string()
+                } else if raw.starts_with("20") && raw.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                    // Older versions output just the version string
+                    raw.split_whitespace().next().unwrap_or("").to_string()
                 } else {
                     String::new()
                 };
@@ -7277,7 +7300,13 @@ async fn probe_agent(
             .await
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
-        let oc = Command::new("bash").args(["-c", "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; openclaw --version 2>/dev/null || echo ?"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let oc_raw = Command::new("bash").args(["-c", "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; openclaw --version 2>/dev/null || echo ?"]).output().await.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        // Parse version: "OpenClaw 2026.3.13 (hash)" → "2026.3.13", or "2026.2.19" stays as-is
+        let oc = if oc_raw.starts_with("OpenClaw ") {
+            oc_raw.split_whitespace().nth(1).unwrap_or(&oc_raw).to_string()
+        } else {
+            oc_raw
+        };
         let cpu = Command::new("bash")
             .args([
                 "-c",
