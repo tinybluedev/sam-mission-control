@@ -66,6 +66,10 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Enable debug logging to ~/.config/sam/debug.log
+    #[arg(long, global = true)]
+    pub debug: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -166,6 +170,15 @@ pub enum Commands {
     },
     /// Run scheduled-operations executor without launching TUI
     Daemon,
+    /// Tail the debug log (use with --debug on the TUI instance)
+    DebugLog {
+        /// Number of lines to show
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
+        /// Follow the log (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 /// Persistent config file (~/.config/sam/config.toml)

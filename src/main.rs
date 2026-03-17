@@ -30,6 +30,28 @@ use tokio::sync::mpsc;
 
 use theme::{BgDensity, Theme, ThemeName};
 
+// ── Debug Logging ──────────────────────────────────────
+use std::sync::atomic::{AtomicBool, Ordering};
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+fn debug_log(msg: &str) {
+    if !DEBUG_ENABLED.load(Ordering::Relaxed) { return; }
+    use std::io::Write;
+    let config_dir = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let log_path = config_dir.join("sam").join("debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let secs = now % 86400;
+        let h = ((secs / 3600) + 24 - 6) % 24;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        let _ = writeln!(f, "[{:02}:{:02}:{:02}] {}", h, m, s, msg);
+    }
+}
+
 // ---- Data ----
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -6740,6 +6762,7 @@ PY",
         let (tx, rx) = mpsc::unbounded_channel();
         self.refresh_rx = Some(rx);
 
+        debug_log(&format!("refresh: cycle {} starting ({} agents)", self.refresh_cycle, self.agents.len()));
         // Fetch Tailscale status once before spawning per-agent probes.
         // Uses a synchronous std::process::Command (fast local CLI) so we can
         // build the map before spawning tasks without needing block_on.
@@ -6830,6 +6853,9 @@ PY",
                     if r.ts_online.is_some() {
                         self.agents[r.index].ts_online = r.ts_online;
                     }
+                    debug_log(&format!("drain: {} → status={} ver='{}' lat={:?}ms ts={:?}",
+                        self.agents[r.index].db_name, r.status, r.oc_version,
+                        r.latency_ms, r.ts_online));
                     let change_detail = fleet_change_detail(
                         &prev_status,
                         &r.status,
@@ -7087,12 +7113,29 @@ fn parse_tailscale_json(output: &[u8]) -> std::collections::HashMap<String, bool
 /// Synchronous Tailscale status fetch (used from non-async context in start_refresh).
 /// Returns empty map on any error so SSH-only probe logic is used as fallback.
 fn fetch_tailscale_status_sync() -> std::collections::HashMap<String, bool> {
+    debug_log("tailscale: fetching status --json (sync)");
     match std::process::Command::new("tailscale")
         .args(["status", "--json"])
         .output()
     {
-        Ok(o) if o.status.success() => parse_tailscale_json(&o.stdout),
-        _ => std::collections::HashMap::new(),
+        Ok(o) if o.status.success() => {
+            let map = parse_tailscale_json(&o.stdout);
+            let online_count = map.values().filter(|&&v| v).count();
+            let offline_count = map.values().filter(|&&v| !v).count();
+            debug_log(&format!("tailscale: {} peers found ({} online, {} offline)", map.len(), online_count, offline_count));
+            for (ip, online) in &map {
+                debug_log(&format!("  tailscale: {} → {}", ip, if *online { "ONLINE" } else { "offline" }));
+            }
+            map
+        },
+        Ok(o) => {
+            debug_log(&format!("tailscale: command failed with exit code {:?}", o.status.code()));
+            std::collections::HashMap::new()
+        },
+        Err(e) => {
+            debug_log(&format!("tailscale: binary not found or error: {}", e));
+            std::collections::HashMap::new()
+        },
     }
 }
 
@@ -7139,6 +7182,7 @@ async fn probe_agent(
     let start = Instant::now();
     // Tailscale short-circuit: if Tailscale reports offline, skip SSH entirely
     if tailscale_online == Some(false) && host != "localhost" && host != self_ip {
+        debug_log(&format!("probe {}: SKIP (tailscale offline)", host));
         return (
             AgentStatus::Offline,
             String::new(), String::new(), String::new(),
@@ -7180,6 +7224,7 @@ async fn probe_agent(
                 } else {
                     String::new()
                 };
+                debug_log(&format!("probe {}: ONLINE {}ms ver={} raw='{}'", host, ms, if oc_ver.is_empty() { "?" } else { &oc_ver }, raw.chars().take(80).collect::<String>()));
                 (
                     AgentStatus::Online,
                     String::new(),
@@ -7196,7 +7241,9 @@ async fn probe_agent(
                     String::new(),
                 )
             },
-            _ => (
+            _ => {
+                debug_log(&format!("probe {}: OFFLINE (SSH failed/timeout, ts={:?})", host, tailscale_online));
+                (
                 AgentStatus::Offline,
                 String::new(),
                 String::new(),
@@ -7210,7 +7257,8 @@ async fn probe_agent(
                 String::new(),
                 None,
                 String::new(),
-            ),
+            )
+            },
         };
     }
     if host == "localhost" || host == self_ip {
@@ -12034,6 +12082,19 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = cli::Cli::parse();
 
+    // Enable debug logging if --debug flag is set
+    if args.debug {
+        DEBUG_ENABLED.store(true, Ordering::Relaxed);
+        let config_dir = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let log_dir = config_dir.join("sam");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log_path = log_dir.join("debug.log");
+        // Truncate on start so each run is clean
+        let _ = std::fs::write(&log_path, "");
+        debug_log("=== S.A.M Mission Control debug session started ===");
+        eprintln!("🐛 Debug logging enabled → {}", log_path.display());
+    }
+
     // Load config (config.toml → .env → defaults)
     let sam_config = cli::SamConfig::load(args.config.as_ref());
     sam_config.apply_to_env();
@@ -12099,6 +12160,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return cli::run_log(agent.as_deref(), tail)
                 .await
                 .map_err(|e| e.into());
+        }
+        Some(cli::Commands::DebugLog { lines, follow }) => {
+            let config_dir = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            let log_path = config_dir.join("sam").join("debug.log");
+            if !log_path.exists() {
+                eprintln!("No debug log found at {}", log_path.display());
+                eprintln!("Run the TUI with --debug flag: sam --debug");
+                return Ok(());
+            }
+            if follow {
+                // tail -f
+                let _ = std::process::Command::new("tail")
+                    .args(["-f", "-n", &lines.to_string()])
+                    .arg(&log_path)
+                    .status();
+            } else {
+                let content = std::fs::read_to_string(&log_path)?;
+                let all_lines: Vec<&str> = content.lines().collect();
+                let start = if all_lines.len() > lines { all_lines.len() - lines } else { 0 };
+                for line in &all_lines[start..] {
+                    println!("{}", line);
+                }
+            }
+            return Ok(());
         }
         Some(cli::Commands::Daemon) => {
             if !db::mysql_enabled() {
