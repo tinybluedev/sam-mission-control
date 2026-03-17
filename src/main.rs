@@ -7066,7 +7066,7 @@ async fn probe_agent(
             String::new(), None, String::new(),
         );
     }
-    // Fast probe: just SSH echo (connectivity + latency only)
+    // Fast probe: SSH connectivity + version check (version is instant, no reason to skip it)
     if !full && host != "localhost" && host != self_ip {
         let mut args = vec![
             "-o".to_string(),
@@ -7081,8 +7081,8 @@ async fn probe_agent(
             args.push(jump);
         }
         args.push(ssh_target(user, host));
-        args.push("echo".to_string());
-        args.push("ok".to_string());
+        // Fetch version alongside connectivity check — openclaw --version is near-instant
+        args.push("export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH; openclaw --version 2>/dev/null || echo ok".to_string());
         let result = tokio::time::timeout(
             Duration::from_secs(3),
             Command::new("ssh")
@@ -7092,21 +7092,30 @@ async fn probe_agent(
         .await;
         let ms = start.elapsed().as_millis() as u32;
         return match result {
-            Ok(Ok(o)) if o.status.success() => (
-                AgentStatus::Online,
-                String::new(),
-                String::new(),
-                String::new(),
-                Some(ms),
-                None,
-                None,
-                None,
-                String::new(),
-                None,
-                String::new(),
-                None,
-                String::new(),
-            ),
+            Ok(Ok(o)) if o.status.success() => {
+                let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                // openclaw --version returns "OpenClaw 2026.3.13 (hash)" — extract version
+                let oc_ver = if raw.starts_with("OpenClaw ") {
+                    raw.split_whitespace().nth(1).unwrap_or("").to_string()
+                } else {
+                    String::new()
+                };
+                (
+                    AgentStatus::Online,
+                    String::new(),
+                    String::new(),
+                    oc_ver,
+                    Some(ms),
+                    None,
+                    None,
+                    None,
+                    String::new(),
+                    None,
+                    String::new(),
+                    None,
+                    String::new(),
+                )
+            },
             _ => (
                 AgentStatus::Offline,
                 String::new(),
