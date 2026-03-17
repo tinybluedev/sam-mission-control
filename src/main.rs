@@ -3350,6 +3350,86 @@ PY"#, escaped_model);
         });
     }
 
+    /// Bulk-update OpenClaw on a list of agents, showing live progress in the diag overlay.
+    fn start_bulk_update(&mut self, targets: Vec<(String, String, String, bool, String)>, latest: String) {
+        if targets.is_empty() {
+            self.toast("✓ All agents already on latest version");
+            return;
+        }
+        let count = targets.len();
+        self.diag_active = true;
+        self.diag_task_running = true;
+        self.diag_auto_fix = false;
+        self.diag_title = Some(format!("⬆  Bulk Update — {} agent{}", count, if count == 1 { "" } else { "s" }));
+        self.diag_start = Some(Instant::now());
+        self.diag_overlay_scroll = 0;
+        self.diag_steps = vec![DiagStep {
+            label: format!("Updating {} agent{} to {}...", count, if count == 1 { "" } else { "s" },
+                if latest.is_empty() { "latest".to_string() } else { latest.clone() }),
+            status: DiagStatus::Running,
+            detail: String::new(),
+        }];
+        let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
+        self.diag_rx = Some(rx);
+        let self_ip = self.self_ip.clone();
+
+        tokio::spawn(async move {
+            let mut any_fail = false;
+            for (db_name, host, ssh_user, is_mac, old_ver) in targets {
+                let _ = tx.send(DiagStep {
+                    label: format!("Updating {}  {} → {}", db_name, old_ver,
+                        if latest.is_empty() { "latest".to_string() } else { latest.clone() }),
+                    status: DiagStatus::Running,
+                    detail: String::new(),
+                });
+                let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+                let cmd = format!(
+                    "{}sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1",
+                    pfx
+                );
+                let output = if host == "localhost" || host == self_ip {
+                    tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
+                } else {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        tokio::process::Command::new("ssh")
+                            .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                &format!("{}@{}", ssh_user, host), &cmd])
+                            .output()
+                    ).await.ok().and_then(|r| r.ok())
+                };
+                match output {
+                    Some(o) if o.status.success() => {
+                        let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        let new_ver = out.lines()
+                            .find(|l| l.contains("OpenClaw "))
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("done")
+                            .to_string();
+                        let _ = tx.send(DiagStep {
+                            label: format!("✓ {}", db_name),
+                            status: DiagStatus::Pass,
+                            detail: new_ver,
+                        });
+                    }
+                    _ => {
+                        any_fail = true;
+                        let _ = tx.send(DiagStep {
+                            label: format!("✗ {}", db_name),
+                            status: DiagStatus::Fail,
+                            detail: "SSH failed or timed out".to_string(),
+                        });
+                    }
+                }
+            }
+            let _ = tx.send(DiagStep {
+                label: "DONE".into(),
+                status: if any_fail { DiagStatus::Fail } else { DiagStatus::Pass },
+                detail: if any_fail { "Some updates failed — check above".into() } else { "All agents updated successfully".into() },
+            });
+        });
+    }
+
     fn start_gateway_action(&mut self, action: GatewayAction) {
         if self.selected >= self.agents.len() { return; }
         let idx = self.selected;
@@ -14060,107 +14140,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                             })
                                                             .collect()
                                                     };
-                                                    if targets.is_empty() {
-                                                        app.toast("✓ All agents already on latest version");
-                                                    } else {
-                                                        let count = targets.len();
-                                                        app.toast(&format!(
-                                                            "🔄 Updating {} agents to {}...",
-                                                            count,
-                                                            if latest.is_empty() {
-                                                                "latest".into()
-                                                            } else {
-                                                                latest.clone()
-                                                            }
-                                                        ));
-                                                        for (
-                                                            db_name,
-                                                            host,
-                                                            ssh_user,
-                                                            is_mac,
-                                                            old_ver,
-                                                        ) in targets
-                                                        {
-                                                            if let Some(pool) = &app.db_pool {
-                                                                let pool = pool.clone();
-                                                                let sender = app.user();
-                                                                let self_ip = app.self_ip.clone();
-                                                                let latest = latest.clone();
-                                                                tokio::spawn(async move {
-                                                                    let op_id =
-                                                                        db::create_operation(
-                                                                            &pool,
-                                                                            &db_name,
-                                                                            "bulk_update",
-                                                                        )
-                                                                        .await
-                                                                        .ok();
-                                                                    let pfx = if is_mac {
-                                                                        "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
-                                                                    } else {
-                                                                        ""
-                                                                    };
-                                                                    let cmd = format!(
-                                                                        "{}openclaw --version 2>/dev/null && sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1",
-                                                                        pfx
-                                                                    );
-                                                                    let output = if host
-                                                                        == "localhost"
-                                                                        || host == self_ip
-                                                                    {
-                                                                        tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
-                                                                    } else {
-                                                                        tokio::time::timeout(
-                                                            std::time::Duration::from_secs(120),
-                                                            tokio::process::Command::new("ssh")
-                                                                .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                                                    &format!("{}@{}", ssh_user, host), &cmd])
-                                                                .output()
-                                                        ).await.ok().and_then(|r| r.ok())
-                                                                    };
-                                                                    let timed_out =
-                                                                        output.is_none();
-                                                                    let response = output.map(|o| {
-                                                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                                                        if s.is_empty() { "(no output)".into() } else { s.chars().take(500).collect::<String>() }
-                                                    }).unwrap_or_else(|| "Timeout".into());
-                                                                    let msg = format!(
-                                                                        "🔄 update {} → {}",
-                                                                        old_ver, latest
-                                                                    );
-                                                                    let _ = crate::db::send_direct(
-                                                                        &pool, &sender, &db_name,
-                                                                        &msg,
-                                                                    )
-                                                                    .await;
-                                                                    if let Ok(mut conn) =
-                                                                        pool.get_conn().await
-                                                                    {
-                                                                        use mysql_async::prelude::*;
-                                                                        let _ = conn.exec_drop(
-                                                            "UPDATE mc_chat SET response=?, status='responded', responded_at=NOW() WHERE sender=? AND target=? AND status='pending' ORDER BY id DESC LIMIT 1",
-                                                            (&response, &sender, &db_name),
-                                                        ).await;
-                                                                    }
-                                                                    if let Some(op_id) = op_id {
-                                                                        let status = if timed_out {
-                                                                            "failed"
-                                                                        } else {
-                                                                            "completed"
-                                                                        };
-                                                                        let _ =
-                                                                            db::complete_operation(
-                                                                                &pool,
-                                                                                op_id,
-                                                                                status,
-                                                                                Some(&response),
-                                                                            )
-                                                                            .await;
-                                                                    }
-                                                                });
-                                                            }
-                                                        }
-                                                    }
+                                                    // Show live progress overlay for all agents being updated
+                                                    app.start_bulk_update(targets, latest);
                                                 }
                                                 KeyCode::Char('U') => app.start_oc_update(),
                                                 KeyCode::Char('G') => {
