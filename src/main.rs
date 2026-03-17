@@ -6868,6 +6868,38 @@ PY",
                 }
             }
         }
+        // Version outdated alerts
+        if !self.latest_oc_version.is_empty() {
+            let latest_norm = self.latest_oc_version.trim_start_matches('v');
+            for a in &self.agents {
+                if a.status == AgentStatus::Online
+                    && !a.oc_version.is_empty()
+                    && a.oc_version != "?"
+                    && a.oc_version != "unknown"
+                {
+                    let agent_norm = a.oc_version.trim_start_matches('v');
+                    if agent_norm != latest_norm {
+                        let already = self.alerts.iter().any(|al| {
+                            al.agent == a.db_name && al.message.contains("outdated")
+                        });
+                        if !already {
+                            self.alerts.push(Alert {
+                                time: now.clone(),
+                                created_at: Instant::now(),
+                                agent: a.db_name.clone(),
+                                emoji: a.emoji.clone(),
+                                message: format!(
+                                    "{} outdated: {} → {} (Shift+U to update)",
+                                    a.name, a.oc_version, self.latest_oc_version
+                                ),
+                                severity: AlertSeverity::Warning,
+                            });
+                            self.alert_flash = Some(Instant::now());
+                        }
+                    }
+                }
+            }
+        }
         // Keep last 100 alerts
         if self.alerts.len() > 100 {
             self.alerts.drain(0..self.alerts.len() - 100);
