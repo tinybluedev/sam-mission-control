@@ -3381,6 +3381,11 @@ PY"#, escaped_model);
             self.toast("✓ All agents already on latest version");
             return;
         }
+        if latest.is_empty() {
+            debug_log("action: start_bulk_update — skipped, latest version unknown (npm not checked yet)");
+            self.toast("⏳ Waiting for version check — try again in a few seconds");
+            return;
+        }
         let names: Vec<&str> = targets.iter().map(|(n,_,_,_,_)| n.as_str()).collect();
         debug_log(&format!("action: start_bulk_update {} agents to {}: {:?}", targets.len(), latest, names));
         let count = targets.len();
@@ -3401,8 +3406,10 @@ PY"#, escaped_model);
         let self_ip = self.self_ip.clone();
 
         tokio::spawn(async move {
+            debug_log(&format!("bulk_update: async task started, {} agents queued", targets.len()));
             let mut any_fail = false;
             for (db_name, host, ssh_user, is_mac, old_ver) in targets {
+                debug_log(&format!("bulk_update: starting {} ({}) {} → {}", db_name, host, old_ver, latest));
                 let _ = tx.send(DiagStep {
                     label: format!("Updating {}  {} → {}", db_name, old_ver,
                         if latest.is_empty() { "latest".to_string() } else { latest.clone() }),
@@ -3411,9 +3418,10 @@ PY"#, escaped_model);
                 });
                 let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
                 let cmd = format!(
-                    "{}sudo npm install -g openclaw@latest 2>&1 | tail -3 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1",
+                    "{}sudo npm install -g openclaw@latest 2>&1 | tail -5 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1",
                     pfx
                 );
+                debug_log(&format!("bulk_update: {} cmd={}", db_name, if host == "localhost" || host == self_ip { "local" } else { "ssh" }));
                 let output = if host == "localhost" || host == self_ip {
                     tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
                 } else {
@@ -3428,9 +3436,10 @@ PY"#, escaped_model);
                 match output {
                     Some(o) if o.status.success() => {
                         let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        debug_log(&format!("bulk_update: {} SUCCESS output='{}'", db_name, out.chars().take(200).collect::<String>()));
                         let new_ver = out.lines()
-                            .find(|l| l.contains("OpenClaw "))
-                            .and_then(|l| l.split_whitespace().nth(1))
+                            .find(|l| l.contains("OpenClaw ") || l.starts_with("20"))
+                            .and_then(|l| if l.starts_with("OpenClaw ") { l.split_whitespace().nth(1) } else { l.split_whitespace().next() })
                             .unwrap_or("done")
                             .to_string();
                         let _ = tx.send(DiagStep {
@@ -3439,12 +3448,24 @@ PY"#, escaped_model);
                             detail: new_ver,
                         });
                     }
-                    _ => {
+                    Some(o) => {
                         any_fail = true;
+                        let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                        let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        debug_log(&format!("bulk_update: {} FAILED exit={:?} stderr='{}' stdout='{}'", db_name, o.status.code(), stderr.chars().take(200).collect::<String>(), stdout.chars().take(200).collect::<String>()));
                         let _ = tx.send(DiagStep {
                             label: format!("✗ {}", db_name),
                             status: DiagStatus::Fail,
-                            detail: "SSH failed or timed out".to_string(),
+                            detail: if !stderr.is_empty() { stderr.chars().take(100).collect() } else { "Command failed".to_string() },
+                        });
+                    }
+                    None => {
+                        any_fail = true;
+                        debug_log(&format!("bulk_update: {} TIMEOUT (120s)", db_name));
+                        let _ = tx.send(DiagStep {
+                            label: format!("✗ {}", db_name),
+                            status: DiagStatus::Fail,
+                            detail: "SSH timeout (120s)".to_string(),
                         });
                     }
                 }
