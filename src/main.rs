@@ -212,7 +212,7 @@ enum Focus {
     Services,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum Screen {
     Dashboard,
     AgentDetail,
@@ -3018,9 +3018,11 @@ PY"#, escaped_model);
 
     fn start_oc_update(&mut self) {
         if self.selected >= self.agents.len() {
+            debug_log("action: start_oc_update — no agent selected");
             return;
         }
         let agent = &self.agents[self.selected];
+        debug_log(&format!("action: start_oc_update on {} ({})", agent.db_name, agent.host));
         let host = agent.host.clone();
         let user = agent.ssh_user.clone();
         let jump_host = agent.jump_host.clone();
@@ -3375,9 +3377,12 @@ PY"#, escaped_model);
     /// Bulk-update OpenClaw on a list of agents, showing live progress in the diag overlay.
     fn start_bulk_update(&mut self, targets: Vec<(String, String, String, bool, String)>, latest: String) {
         if targets.is_empty() {
+            debug_log("action: start_bulk_update — no outdated agents found");
             self.toast("✓ All agents already on latest version");
             return;
         }
+        let names: Vec<&str> = targets.iter().map(|(n,_,_,_,_)| n.as_str()).collect();
+        debug_log(&format!("action: start_bulk_update {} agents to {}: {:?}", targets.len(), latest, names));
         let count = targets.len();
         self.diag_active = true;
         self.diag_task_running = true;
@@ -12636,6 +12641,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Event::Key(key) = ev {
                 if key.kind == KeyEventKind::Press {
+                    // Log every keypress in debug mode
+                    {
+                        let mods = key.modifiers;
+                        let mod_str = if mods.contains(KeyModifiers::SHIFT) { "Shift+" }
+                            else if mods.contains(KeyModifiers::CONTROL) { "Ctrl+" }
+                            else if mods.contains(KeyModifiers::ALT) { "Alt+" }
+                            else { "" };
+                        let key_str = match key.code {
+                            KeyCode::Char(c) => format!("{}{}", mod_str, c),
+                            KeyCode::Enter => format!("{}Enter", mod_str),
+                            KeyCode::Tab => format!("{}Tab", mod_str),
+                            KeyCode::Esc => format!("{}Esc", mod_str),
+                            KeyCode::Backspace => format!("{}Backspace", mod_str),
+                            KeyCode::Up => format!("{}Up", mod_str),
+                            KeyCode::Down => format!("{}Down", mod_str),
+                            KeyCode::Left => format!("{}Left", mod_str),
+                            KeyCode::Right => format!("{}Right", mod_str),
+                            KeyCode::F(n) => format!("{}F{}", mod_str, n),
+                            _ => format!("{}{:?}", mod_str, key.code),
+                        };
+                        let screen_str = format!("{:?}", app.screen);
+                        debug_log(&format!("key: {} (screen={}, selected={}, diag={})",
+                            key_str, screen_str, app.selected, app.diag_active));
+                    }
                     // Wizard overlay intercepts all input when active
                     if app.wizard.active {
                         match key.code {
