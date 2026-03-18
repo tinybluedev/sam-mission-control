@@ -7363,11 +7363,11 @@ async fn probe_agent(
             String::new(), None, String::new(),
         );
     }
-    // Fast probe: SSH connectivity + version check (version is instant, no reason to skip it)
+    // Fast probe: SSH connectivity + version check
     if !full && host != "localhost" && host != self_ip {
         let mut args = vec![
             "-o".to_string(),
-            "ConnectTimeout=1".to_string(),
+            "ConnectTimeout=3".to_string(),
             "-o".to_string(),
             "StrictHostKeyChecking=no".to_string(),
             "-o".to_string(),
@@ -7378,10 +7378,10 @@ async fn probe_agent(
             args.push(jump);
         }
         args.push(ssh_target(user, host));
-        // Fetch version alongside connectivity check — openclaw --version is near-instant
+        // Fetch version alongside connectivity check
         args.push("export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH; openclaw --version 2>/dev/null || echo ok".to_string());
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(8),
             Command::new("ssh")
                 .args(args)
                 .output(),
