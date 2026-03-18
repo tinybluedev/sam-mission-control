@@ -524,30 +524,31 @@ fn compute_agent_health_score(
         return 0;
     }
 
+    // Weighted scoring: only deduct from categories where we HAVE data.
+    // Categories: reachability (30pts), version (20pts), resources (30pts), stability (20pts)
+    // If no data for a category, give full points (don't penalize unknown).
     let mut score = 100i32;
 
-    if uptime_seconds == 0 {
-        score -= 15;
-    } else if uptime_seconds < 0 {
-        score -= 15;
-    } else if uptime_seconds < 3600 {
-        score -= 10;
-    } else if uptime_seconds < 86_400 {
-        score -= 5;
+    // ── Stability (20pts) ──
+    // Only deduct if we actually have uptime data (>0 means we got it)
+    if uptime_seconds > 0 && uptime_seconds < 3600 {
+        score -= 10;  // just booted
+    } else if uptime_seconds > 0 && uptime_seconds < 86_400 {
+        score -= 3;   // less than a day
     }
+    // uptime == 0 means no data — don't penalize
 
+    // ── Reachability (30pts) ──
     match latency_ms {
-        Some(ms) if ms >= 1000 => score -= 20,
-        Some(ms) if ms >= 500 => score -= 12,
-        Some(ms) if ms >= 200 => score -= 6,
-        Some(_) => {}
-        None => score -= 8,
+        Some(ms) if ms >= 2000 => score -= 25,
+        Some(ms) if ms >= 1000 => score -= 15,
+        Some(ms) if ms >= 500 => score -= 8,
+        _ => {}  // <500ms or unknown = fine
     }
 
+    // ── Version (20pts) ──
     let oc = oc_version.trim();
-    if oc.is_empty() || oc == "?" || oc == "unknown" {
-        score -= 15;
-    } else if !latest_oc_version.is_empty() {
+    if !oc.is_empty() && oc != "?" && oc != "unknown" && !latest_oc_version.is_empty() {
         let oc_norm = oc
             .split_whitespace()
             .last()
@@ -555,41 +556,41 @@ fn compute_agent_health_score(
             .trim_start_matches('v');
         let latest_norm = latest_oc_version.trim_start_matches('v');
         if oc_norm != latest_norm {
-            score -= 10;
+            score -= 15;  // outdated version is a real issue
         }
     }
+    // No version info = don't penalize (fast probe hasn't run yet)
 
+    // ── Resources (30pts) — only deduct when we HAVE metrics showing problems ──
     if let Some(disk) = disk_pct {
         if disk >= 95.0 {
-            score -= 25;
+            score -= 20;
         } else if disk >= 90.0 {
-            score -= 15;
+            score -= 12;
         } else if disk >= 80.0 {
-            score -= 8;
+            score -= 5;
         }
-    } else {
-        score -= 5;
     }
+    // No disk data = don't penalize
 
     if let Some(ram) = ram_pct {
         if ram >= 95.0 {
-            score -= 25;
+            score -= 20;
         } else if ram >= 90.0 {
-            score -= 15;
+            score -= 12;
         } else if ram >= 80.0 {
-            score -= 8;
+            score -= 5;
         }
     } else if let Some(mem_free) = mem_free_mb {
         if mem_free < 256 {
-            score -= 25;
+            score -= 20;
         } else if mem_free < 512 {
-            score -= 15;
+            score -= 12;
         } else if mem_free < 1024 {
-            score -= 8;
+            score -= 5;
         }
-    } else {
-        score -= 5;
     }
+    // No RAM data = don't penalize
 
     score.clamp(0, 100) as u8
 }
