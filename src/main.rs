@@ -3381,13 +3381,8 @@ PY"#, escaped_model);
             self.toast("✓ All agents already on latest version");
             return;
         }
-        if latest.is_empty() {
-            debug_log("action: start_bulk_update — skipped, latest version unknown (npm not checked yet)");
-            self.toast("⏳ Waiting for version check — try again in a few seconds");
-            return;
-        }
         let names: Vec<&str> = targets.iter().map(|(n,_,_,_,_)| n.as_str()).collect();
-        debug_log(&format!("action: start_bulk_update {} agents to {}: {:?}", targets.len(), latest, names));
+        debug_log(&format!("action: start_bulk_update {} agents, latest={}: {:?}", targets.len(), if latest.is_empty() { "(fetching)" } else { &latest }, names));
         let count = targets.len();
         self.diag_active = true;
         self.diag_task_running = true;
@@ -3407,6 +3402,59 @@ PY"#, escaped_model);
 
         tokio::spawn(async move {
             debug_log(&format!("bulk_update: async task started, {} agents queued", targets.len()));
+
+            // Resolve latest version if not known yet
+            let latest = if latest.is_empty() {
+                let _ = tx.send(DiagStep {
+                    label: "Checking latest OpenClaw version...".into(),
+                    status: DiagStatus::Running,
+                    detail: String::new(),
+                });
+                debug_log("bulk_update: latest version unknown, fetching from npm...");
+                let ver = tokio::process::Command::new("npm")
+                    .args(["view", "openclaw", "version"])
+                    .output()
+                    .await
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                if ver.is_empty() {
+                    debug_log("bulk_update: npm version check FAILED");
+                    let _ = tx.send(DiagStep {
+                        label: "✗ Could not determine latest version".into(),
+                        status: DiagStatus::Fail,
+                        detail: "npm view openclaw version failed".into(),
+                    });
+                    let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: String::new() });
+                    return;
+                }
+                debug_log(&format!("bulk_update: resolved latest = {}", ver));
+                let _ = tx.send(DiagStep {
+                    label: format!("✓ Latest version: {}", ver),
+                    status: DiagStatus::Pass,
+                    detail: String::new(),
+                });
+                ver
+            } else {
+                latest
+            };
+
+            // Re-filter targets: skip agents already on latest now that we know it
+            let targets: Vec<_> = targets.into_iter()
+                .filter(|(_, _, _, _, old_ver)| !old_ver.contains(&latest))
+                .collect();
+            if targets.is_empty() {
+                debug_log("bulk_update: all agents already on latest after re-filter");
+                let _ = tx.send(DiagStep {
+                    label: "✓ All agents already up to date".into(),
+                    status: DiagStatus::Pass,
+                    detail: latest,
+                });
+                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: String::new() });
+                return;
+            }
+            debug_log(&format!("bulk_update: {} agents need update to {}", targets.len(), latest));
+
             let mut any_fail = false;
             for (db_name, host, ssh_user, is_mac, old_ver) in targets {
                 debug_log(&format!("bulk_update: starting {} ({}) {} → {}", db_name, host, old_ver, latest));
@@ -14269,6 +14317,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                 a.status == AgentStatus::Online
                                                             })
                                                             .filter(|a| {
+                                                                // If latest known, filter; if not, include all online
+                                                                // (async task will re-filter after npm check)
                                                                 latest.is_empty()
                                                                     || !a
                                                                         .oc_version
