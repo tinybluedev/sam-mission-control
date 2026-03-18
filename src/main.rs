@@ -8804,10 +8804,13 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
                 );
                 if show_latency {
                     cells.push(Cell::from(lat_str).style(Style::default().fg(lat_color)));
-                    cells.push(
-                        Cell::from(format_uptime(a.uptime_seconds))
-                            .style(Style::default().fg(t.text_dim)),
-                    );
+                    if !show_resources {
+                        // Uptime only in non-resource views (resource view has no Uptime column)
+                        cells.push(
+                            Cell::from(format_uptime(a.uptime_seconds))
+                                .style(Style::default().fg(t.text_dim)),
+                        );
+                    }
                 }
                 if show_activity && !show_resources {
                     let act_display = if a.activity.is_empty() || a.activity == "idle" {
