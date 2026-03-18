@@ -640,6 +640,23 @@ fn ssh_jump_arg(
 
 
 
+// ── Discovery (Tailscale scan → add agents) ────────────────────────
+#[derive(Clone, Debug)]
+struct DiscoveredPeer {
+    hostname: String,
+    ip: String,
+    os: String,
+    online: bool,
+    oc_version: String,
+    ssh_user: String,
+}
+
+enum DiscoveryMsg {
+    Scanning,
+    Peer(DiscoveredPeer),
+    Done,
+}
+
 // ── Onboarding types ──────────────────────────────────────────────
 #[derive(Debug, Clone)]
 struct OnboardPending {
@@ -804,6 +821,13 @@ struct App {
     command_input: String,
     // Wizard
     wizard: wizard::AgentWizard,
+    // Discovery overlay (scan Tailscale → pick agents to add)
+    discovery_active: bool,
+    discovery_scanning: bool,
+    discovery_peers: Vec<DiscoveredPeer>,
+    discovery_selected: usize,
+    discovery_checked: std::collections::HashSet<usize>,
+    discovery_rx: Option<mpsc::UnboundedReceiver<DiscoveryMsg>>,
     // Task board
     tasks: Vec<db::Task>,
     task_filter_agent: Option<String>,
@@ -1226,6 +1250,12 @@ impl App {
             self_ip,
             command_input: String::new(),
             wizard: wizard::AgentWizard::new(),
+            discovery_active: false,
+            discovery_scanning: false,
+            discovery_peers: Vec::new(),
+            discovery_selected: 0,
+            discovery_checked: std::collections::HashSet::new(),
+            discovery_rx: None,
             tasks: vec![],
             task_filter_agent: None,
             task_selected: 0,
@@ -3370,6 +3400,166 @@ PY"#, escaped_model);
     }
 
     /// Bulk-update OpenClaw on a list of agents, showing live progress in the diag overlay.
+    fn start_discovery(&mut self) {
+        self.discovery_active = true;
+        self.discovery_scanning = true;
+        self.discovery_peers.clear();
+        self.discovery_selected = 0;
+        self.discovery_checked.clear();
+        let (tx, rx) = mpsc::unbounded_channel::<DiscoveryMsg>();
+        self.discovery_rx = Some(rx);
+        let known_names: Vec<String> = self.agents.iter().map(|a| a.name.to_lowercase()).collect();
+        tokio::spawn(async move {
+            let _ = tx.send(DiscoveryMsg::Scanning);
+            // Get Tailscale peers
+            let ts_out = tokio::process::Command::new("tailscale")
+                .args(["status", "--json"])
+                .output().await;
+            let ts_json: serde_json::Value = match ts_out {
+                Ok(o) if o.status.success() => {
+                    serde_json::from_slice(&o.stdout).unwrap_or_default()
+                }
+                _ => {
+                    let _ = tx.send(DiscoveryMsg::Done);
+                    return;
+                }
+            };
+            if let Some(peers) = ts_json.get("Peer").and_then(|v| v.as_object()) {
+                for (_key, peer) in peers {
+                    let hostname = peer.get("HostName").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let online = peer.get("Online").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if hostname.is_empty() || hostname == "localhost" { continue; }
+                    let ip = peer.get("AllowedIPs").and_then(|v| v.as_array())
+                        .and_then(|arr| arr.iter()
+                            .filter_map(|ip| ip.as_str())
+                            .find(|ip| ip.contains('.'))
+                            .map(|ip| ip.split('/').next().unwrap_or(ip).to_string()))
+                        .unwrap_or_default();
+                    let os = peer.get("OS").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                    let name_lower = hostname.to_lowercase().replace(' ', "-");
+                    if known_names.contains(&name_lower) { continue; }
+                    if !online { continue; }
+                    // Quick probe for SSH + OC version
+                    let users = ["papasmurf", "nick", "charizard"];
+                    let mut oc_version = String::new();
+                    let mut working_user = String::new();
+                    for user in &users {
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            tokio::process::Command::new("ssh")
+                                .args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                                    &format!("{}@{}", user, ip),
+                                    "export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH; openclaw --version 2>/dev/null || echo NONE"])
+                                .output()
+                        ).await;
+                        if let Ok(Ok(o)) = result {
+                            if o.status.success() {
+                                let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                if raw != "NONE" && !raw.is_empty() && raw != "?" {
+                                    oc_version = if raw.starts_with("OpenClaw ") {
+                                        raw.split_whitespace().nth(1).unwrap_or(&raw).to_string()
+                                    } else { raw };
+                                    working_user = user.to_string();
+                                    break;
+                                } else if raw == "NONE" {
+                                    // SSH works but no OC
+                                    working_user = user.to_string();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = tx.send(DiscoveryMsg::Peer(DiscoveredPeer {
+                        hostname, ip, os, online, oc_version, ssh_user: working_user,
+                    }));
+                }
+            }
+            let _ = tx.send(DiscoveryMsg::Done);
+        });
+    }
+
+    fn add_discovered_agents(&mut self) {
+        let selected: Vec<DiscoveredPeer> = self.discovery_checked.iter()
+            .filter_map(|&i| self.discovery_peers.get(i).cloned())
+            .collect();
+        if selected.is_empty() { return; }
+        // Append to fleet.toml
+        let config_path = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("sam/fleet.toml");
+        let mut entries = String::new();
+        for p in &selected {
+            let name = p.hostname.to_lowercase().replace(' ', "-");
+            let is_mac = name.contains("apple") || name.contains("mac") || name.contains("imac");
+            let is_sm = name.contains("strainge") || name.contains("imac") || name.contains("nick-wharton") || name.contains("alma");
+            let location = if is_sm { "SM" } else if is_mac { "Mobile" } else { "Home" };
+            entries.push_str(&format!("\n[[agent]]\nname = \"{}\"\ndisplay = \"{}\"\nemoji = \"🖥️\"\nlocation = \"{}\"\nssh_user = \"{}\"\n",
+                name, p.hostname, location, if p.ssh_user.is_empty() { "papasmurf" } else { &p.ssh_user }));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&config_path) {
+            use std::io::Write;
+            let _ = f.write_all(entries.as_bytes());
+        }
+        self.toast(&format!("✓ Added {} agent(s) to fleet.toml — reloading", selected.len()));
+        self.discovery_active = false;
+        // Reload fleet config
+        self.reload_fleet_config();
+    }
+
+    fn reload_fleet_config(&mut self) {
+        let config_path = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("sam/fleet.toml");
+        if let Ok(raw) = std::fs::read_to_string(&config_path) {
+            if let Ok(cfg) = toml::from_str::<config::FleetConfig>(&raw) {
+                let existing_names: std::collections::HashSet<String> = self.agents.iter().map(|a| a.name.clone()).collect();
+                for ac in &cfg.agent {
+                    let db_name = ac.name.to_lowercase();
+                    if existing_names.contains(&db_name) { continue; }
+                    let display = ac.display.clone().unwrap_or_else(|| ac.name.clone());
+                    self.agents.push(Agent {
+                        name: display,
+                        db_name: db_name.clone(),
+                        emoji: ac.emoji.clone().unwrap_or_else(|| "🖥️".into()),
+                        host: String::new(), // populated by Tailscale probe
+                        ssh_user: ac.ssh_user.clone().unwrap_or_else(|| "papasmurf".into()),
+                        location: ac.location.clone().unwrap_or_else(|| "Home".into()),
+                        status: AgentStatus::Unknown,
+                        os: String::new(),
+                        kernel: String::new(),
+                        oc_version: String::new(),
+                        latency_ms: None,
+                        cpu_pct: None,
+                        ram_pct: None,
+                        disk_pct: None,
+                        hw_cpu_model: String::new(),
+                        hw_ram_total_mb: None,
+                        hw_disk_layout: String::new(),
+                        mem_free_mb: None,
+                        swap_mb: None,
+                        gateway_port: 18789,
+                        gateway_token: None,
+                        gateway_pid: None,
+                        gateway_status: GatewayStatus::Unknown,
+                        uptime_seconds: 0,
+                        activity: String::new(),
+                        context_pct: None,
+                        last_probe_at: None,
+                        ts_online: None,
+                        last_seen: String::new(),
+                        current_task: None,
+                        agent_note: String::new(),
+                        jump_host: None,
+                        jump_user: None,
+                        capabilities: Vec::new(),
+                        token_burn: 0,
+                    });
+                }
+                self.start_refresh();
+            }
+        }
+    }
+
     fn start_bulk_update(&mut self, targets: Vec<(String, String, String, bool, String)>, latest: String) {
         if targets.is_empty() {
             debug_log("action: start_bulk_update — no outdated agents found");
@@ -9984,6 +10174,77 @@ fn render_fleet_changelog(frame: &mut Frame, app: &App) {
     frame.render_widget(body, popup);
 }
 
+fn render_discovery(frame: &mut Frame, app: &App) {
+    let t = &app.theme;
+    let area = frame.area();
+    let w = (area.width as f32 * 0.7).max(60.0).min(area.width.saturating_sub(4) as f32) as u16;
+    let h = (app.discovery_peers.len() as u16 + 7).min(area.height.saturating_sub(4)).max(10);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+
+    let title = if app.discovery_scanning {
+        let spin = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
+        format!(" {} Scanning Tailscale mesh... ", spin)
+    } else {
+        format!(" 🔍 Discovered {} peer(s) ", app.discovery_peers.len())
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.accent))
+        .style(Style::default().bg(app.bg_density.bg()));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    if app.discovery_peers.is_empty() && !app.discovery_scanning {
+        lines.push(Line::from(Span::styled("  No new peers found on the mesh.", Style::default().fg(t.text_dim))));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  All Tailscale peers are already in your fleet.", Style::default().fg(t.text_dim))));
+    } else {
+        // Header
+        lines.push(Line::from(vec![
+            Span::styled("    ", Style::default()),
+            Span::styled(format!("{:<20} {:<15} {:<10} {:<12} {}", "Hostname", "IP", "OS", "OC Version", "SSH User"), Style::default().fg(t.text_dim)),
+        ]));
+        lines.push(Line::from(""));
+
+        for (i, p) in app.discovery_peers.iter().enumerate() {
+            let is_selected = i == app.discovery_selected;
+            let is_checked = app.discovery_checked.contains(&i);
+            let marker = if is_checked { "[✓]" } else { "[ ]" };
+            let cursor = if is_selected { "▶" } else { " " };
+            let ver_display = if p.oc_version.is_empty() { "—".to_string() } else { p.oc_version.clone() };
+            let user_display = if p.ssh_user.is_empty() { "—".to_string() } else { p.ssh_user.clone() };
+            let style = if is_selected {
+                Style::default().fg(t.accent).bold()
+            } else if is_checked {
+                Style::default().fg(t.status_online)
+            } else {
+                Style::default().fg(t.text)
+            };
+            lines.push(Line::from(Span::styled(
+                format!(" {} {} {:<20} {:<15} {:<10} {:<12} {}", cursor, marker, p.hostname, p.ip, p.os, ver_display, user_display),
+                style,
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    let hint = if app.discovery_peers.is_empty() {
+        "  Esc close"
+    } else {
+        "  Space select  ·  Enter add selected  ·  j/k navigate  ·  Esc close"
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(t.text_dim))));
+
+    let para = Paragraph::new(lines).style(Style::default().bg(app.bg_density.bg()));
+    frame.render_widget(para, inner);
+}
+
 fn render_diagnostics(frame: &mut Frame, app: &App) {
     let t = &app.theme;
     let area = frame.area();
@@ -12974,7 +13235,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     f.render_widget(p, rect);
                 }
-                if app.wizard.active {
+                if app.discovery_active {
+                    render_discovery(f, &app);
+                } else if app.wizard.active {
                     wizard::render_wizard(f, &app.wizard, &app.theme, app.bg_density.bg());
                 }
             } // close else for show_splash
@@ -13112,7 +13375,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             key_str, screen_str, app.selected, app.diag_active));
                     }
                     // Wizard overlay intercepts all input when active
-                    if app.wizard.active {
+                    if app.discovery_active {
+                        match key.code {
+                            KeyCode::Esc => { app.discovery_active = false; }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                if !app.discovery_peers.is_empty() {
+                                    app.discovery_selected = (app.discovery_selected + 1).min(app.discovery_peers.len().saturating_sub(1));
+                                }
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                app.discovery_selected = app.discovery_selected.saturating_sub(1);
+                            }
+                            KeyCode::Char(' ') => {
+                                if app.discovery_checked.contains(&app.discovery_selected) {
+                                    app.discovery_checked.remove(&app.discovery_selected);
+                                } else {
+                                    app.discovery_checked.insert(app.discovery_selected);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if !app.discovery_checked.is_empty() {
+                                    app.add_discovered_agents();
+                                } else if !app.discovery_peers.is_empty() {
+                                    // If nothing checked, add the selected one
+                                    app.discovery_checked.insert(app.discovery_selected);
+                                    app.add_discovered_agents();
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if app.wizard.active {
                         match key.code {
                             KeyCode::Esc => {
                                 if app.wizard.go_back() {
@@ -14562,7 +14854,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     ));
                                                 }
                                                 KeyCode::Char('a') => {
-                                                    app.wizard.open();
+                                                    app.start_discovery();
                                                 }
                                                 KeyCode::Char('A') => {
                                                     // Select all
@@ -15123,6 +15415,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if app.diag_active {
             let mut should_reload_workspace = false;
             let mut refresh_after_done = false;
+            // Drain discovery messages
+            if let Some(ref mut rx) = app.discovery_rx {
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        DiscoveryMsg::Scanning => { app.discovery_scanning = true; }
+                        DiscoveryMsg::Peer(p) => { app.discovery_peers.push(p); }
+                        DiscoveryMsg::Done => { app.discovery_scanning = false; }
+                    }
+                }
+            }
+
             if let Some(ref mut rx) = app.diag_rx {
                 while let Ok(mut step) = rx.try_recv() {
                     let reload_workspace = step.label == "DONE" && step.detail.contains("[reload-workspace]");
