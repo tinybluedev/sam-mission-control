@@ -3396,6 +3396,7 @@ PY"#, escaped_model);
         let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
         self.diag_rx = Some(rx);
         let self_ip = self.self_ip.clone();
+        let pool_opt = self.db_pool.clone();
 
         tokio::spawn(async move {
             debug_log(&format!("bulk_update: async task started, {} agents queued", targets.len()));
@@ -3452,73 +3453,130 @@ PY"#, escaped_model);
             }
             debug_log(&format!("bulk_update: {} agents need update to {}", targets.len(), latest));
 
-            let mut any_fail = false;
+            // Run updates in parallel batches of 5
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(5));
+            let any_fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut handles = Vec::new();
+
             for (db_name, host, ssh_user, is_mac, old_ver) in targets {
-                debug_log(&format!("bulk_update: starting {} ({}) {} → {}", db_name, host, old_ver, latest));
-                let _ = tx.send(DiagStep {
-                    label: format!("Updating {}  {} → {}", db_name, old_ver,
-                        if latest.is_empty() { "latest".to_string() } else { latest.clone() }),
-                    status: DiagStatus::Running,
-                    detail: String::new(),
-                });
-                let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
-                let cmd = format!(
-                    "{}sudo npm install -g openclaw@latest 2>&1 | tail -5 && echo '---' && openclaw --version 2>/dev/null && openclaw gateway restart 2>&1 | tail -1",
-                    pfx
-                );
-                debug_log(&format!("bulk_update: {} cmd={}", db_name, if host == "localhost" || host == self_ip { "local" } else { "ssh" }));
-                let output = if host == "localhost" || host == self_ip {
-                    tokio::process::Command::new("bash").args(["-c", &cmd]).output().await.ok()
-                } else {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
-                        tokio::process::Command::new("ssh")
-                            .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                &format!("{}@{}", ssh_user, host), &cmd])
-                            .output()
-                    ).await.ok().and_then(|r| r.ok())
-                };
-                match output {
-                    Some(o) if o.status.success() => {
-                        let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        debug_log(&format!("bulk_update: {} SUCCESS output='{}'", db_name, out.chars().take(200).collect::<String>()));
-                        let new_ver = out.lines()
-                            .find(|l| l.contains("OpenClaw ") || l.starts_with("20"))
-                            .and_then(|l| if l.starts_with("OpenClaw ") { l.split_whitespace().nth(1) } else { l.split_whitespace().next() })
-                            .unwrap_or("done")
-                            .to_string();
-                        let _ = tx.send(DiagStep {
-                            label: format!("✓ {}", db_name),
-                            status: DiagStatus::Pass,
-                            detail: new_ver,
-                        });
+                let tx = tx.clone();
+                let latest = latest.clone();
+                let self_ip = self_ip.clone();
+                let sem = sem.clone();
+                let any_fail = any_fail.clone();
+                let pool_opt = pool_opt.clone();
+
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    debug_log(&format!("bulk_update: starting {} ({}) {} → {}", db_name, host, old_ver, latest));
+                    let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
+
+                    // Step 1: Installing
+                    let _ = tx.send(DiagStep {
+                        label: db_name.clone(),
+                        status: DiagStatus::Running,
+                        detail: format!("installing {} → {}", old_ver, latest),
+                    });
+                    let install_cmd = format!(
+                        "{}sudo npm install -g openclaw@latest 2>&1 | tail -3",
+                        pfx
+                    );
+                    let install_out = if host == "localhost" || host == self_ip {
+                        tokio::process::Command::new("bash").args(["-c", &install_cmd]).output().await.ok()
+                    } else {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(90),
+                            tokio::process::Command::new("ssh")
+                                .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                    &format!("{}@{}", ssh_user, host), &install_cmd])
+                                .output()
+                        ).await.ok().and_then(|r| r.ok())
+                    };
+                    let install_ok = install_out.as_ref().map(|o| o.status.success()).unwrap_or(false);
+                    if !install_ok {
+                        any_fail.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let reason = install_out.as_ref()
+                            .map(|o| {
+                                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                                if !stderr.is_empty() { stderr.chars().take(80).collect() } else { "install failed".to_string() }
+                            })
+                            .unwrap_or_else(|| "SSH timeout (90s)".to_string());
+                        debug_log(&format!("bulk_update: {} INSTALL FAILED: {}", db_name, reason));
+                        let _ = tx.send(DiagStep { label: db_name.clone(), status: DiagStatus::Fail, detail: reason });
+                        if let Some(ref pool) = pool_opt {
+                            let _ = db::record_operation(pool, &db_name, "oc_update", "fail", Some("npm install failed")).await;
+                        }
+                        return;
                     }
-                    Some(o) => {
-                        any_fail = true;
-                        let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                        let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        debug_log(&format!("bulk_update: {} FAILED exit={:?} stderr='{}' stdout='{}'", db_name, o.status.code(), stderr.chars().take(200).collect::<String>(), stdout.chars().take(200).collect::<String>()));
-                        let _ = tx.send(DiagStep {
-                            label: format!("✗ {}", db_name),
-                            status: DiagStatus::Fail,
-                            detail: if !stderr.is_empty() { stderr.chars().take(100).collect() } else { "Command failed".to_string() },
-                        });
+
+                    // Step 2: Restarting gateway
+                    let _ = tx.send(DiagStep {
+                        label: db_name.clone(),
+                        status: DiagStatus::Running,
+                        detail: "restarting gateway...".into(),
+                    });
+                    let restart_cmd = format!("{}openclaw gateway restart 2>&1 | tail -1", pfx);
+                    let _ = if host == "localhost" || host == self_ip {
+                        tokio::process::Command::new("bash").args(["-c", &restart_cmd]).output().await.ok()
+                    } else {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            tokio::process::Command::new("ssh")
+                                .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                    &format!("{}@{}", ssh_user, host), &restart_cmd])
+                                .output()
+                        ).await.ok().and_then(|r| r.ok())
+                    };
+
+                    // Step 3: Verify version
+                    let _ = tx.send(DiagStep {
+                        label: db_name.clone(),
+                        status: DiagStatus::Running,
+                        detail: "verifying version...".into(),
+                    });
+                    let verify_cmd = format!("{}openclaw --version 2>/dev/null", pfx);
+                    let verify_out = if host == "localhost" || host == self_ip {
+                        tokio::process::Command::new("bash").args(["-c", &verify_cmd]).output().await.ok()
+                    } else {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            tokio::process::Command::new("ssh")
+                                .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                    &format!("{}@{}", ssh_user, host), &verify_cmd])
+                                .output()
+                        ).await.ok().and_then(|r| r.ok())
+                    };
+                    let new_ver = verify_out.map(|o| {
+                        let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if raw.starts_with("OpenClaw ") {
+                            raw.split_whitespace().nth(1).unwrap_or(&raw).to_string()
+                        } else if raw.starts_with("20") {
+                            raw.split_whitespace().next().unwrap_or(&raw).to_string()
+                        } else {
+                            raw
+                        }
+                    }).unwrap_or_else(|| "?".into());
+
+                    debug_log(&format!("bulk_update: {} DONE → {}", db_name, new_ver));
+                    let _ = tx.send(DiagStep {
+                        label: db_name.clone(),
+                        status: DiagStatus::Pass,
+                        detail: new_ver,
+                    });
+                    if let Some(ref pool) = pool_opt {
+                        let _ = db::record_operation(pool, &db_name, "oc_update", "pass", None).await;
                     }
-                    None => {
-                        any_fail = true;
-                        debug_log(&format!("bulk_update: {} TIMEOUT (120s)", db_name));
-                        let _ = tx.send(DiagStep {
-                            label: format!("✗ {}", db_name),
-                            status: DiagStatus::Fail,
-                            detail: "SSH timeout (120s)".to_string(),
-                        });
-                    }
-                }
+                }));
             }
+            // Wait for all parallel tasks
+            for h in handles {
+                let _ = h.await;
+            }
+            let failed = any_fail.load(std::sync::atomic::Ordering::Relaxed);
             let _ = tx.send(DiagStep {
                 label: "DONE".into(),
-                status: if any_fail { DiagStatus::Fail } else { DiagStatus::Pass },
-                detail: if any_fail { "Some updates failed — check above".into() } else { "All agents updated successfully".into() },
+                status: if failed { DiagStatus::Fail } else { DiagStatus::Pass },
+                detail: if failed { "Some updates failed — check above".into() } else { "All agents updated successfully".into() },
             });
         });
     }
@@ -9910,15 +9968,18 @@ fn render_diagnostics(frame: &mut Frame, app: &App) {
             }
             if step.status == DiagStatus::Running {
                 let c = BRAILLE_SPINNER[app.spinner_frame % BRAILLE_SPINNER.len()];
-                let elapsed_str = app
-                    .diag_start
-                    .map(|s| format!(" {:.1}s", s.elapsed().as_secs_f64()))
-                    .unwrap_or_default();
+                let detail_str = if step.detail.is_empty() {
+                    app.diag_start
+                        .map(|s| format!("  running {:.1}s", s.elapsed().as_secs_f64()))
+                        .unwrap_or_default()
+                } else {
+                    format!("  {}", step.detail)
+                };
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {} ", c), Style::default().fg(t.pending)),
                     Span::styled(&step.label, Style::default().fg(t.text).bold()),
                     Span::styled(
-                        format!("  running{}", elapsed_str),
+                        detail_str,
                         Style::default().fg(t.text_dim),
                     ),
                 ]));
