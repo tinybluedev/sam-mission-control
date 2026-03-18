@@ -3477,14 +3477,28 @@ PY"#, escaped_model);
                     let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
                     // Step 1: Installing (with retry — up to 3 attempts, escalating timeouts)
-                    // Update ALL npm install locations to avoid stale symlinks
-                    // Macs have /opt/homebrew/lib/node_modules AND Cellar; Linux may have /usr/lib AND ~/.npm-global
+                    // SMART INSTALL: detect where openclaw binary actually lives,
+                    // resolve the real npm prefix, and install THERE.
+                    // If the binary is at /opt/homebrew/bin/openclaw -> ../lib/node_modules/openclaw/...,
+                    // we install with --prefix /opt/homebrew, not blindly sudo npm install -g.
+                    // Falls back to sudo npm install -g if detection fails.
                     let install_cmd = format!(
-                        "{}sudo npm install -g openclaw@latest 2>&1 | tail -3; \
-                         for d in /opt/homebrew/lib/node_modules/openclaw ~/.npm-global/lib/node_modules/openclaw; do \
-                           [ -d \"$d\" ] && npm install -g --prefix $(dirname $(dirname $(dirname \"$d\"))) openclaw@latest 2>&1 | tail -1; \
-                         done",
-                        pfx
+                        "{pfx}\
+                         OC_BIN=$(which openclaw 2>/dev/null); \
+                         OC_REAL=$(readlink -f \"$OC_BIN\" 2>/dev/null || realpath \"$OC_BIN\" 2>/dev/null || echo \"\"); \
+                         if [ -n \"$OC_REAL\" ]; then \
+                           OC_PREFIX=$(echo \"$OC_REAL\" | sed 's|/lib/node_modules/openclaw/.*||; s|/bin/openclaw||'); \
+                           echo \"DETECTED_PREFIX:$OC_PREFIX\"; \
+                           if echo \"$OC_PREFIX\" | grep -qE '^(/home/|/Users/)'; then \
+                             npm install -g --prefix \"$OC_PREFIX\" openclaw@latest 2>&1 | tail -3; \
+                           else \
+                             sudo npm install -g --prefix \"$OC_PREFIX\" openclaw@latest 2>&1 | tail -3; \
+                           fi; \
+                         else \
+                           echo \"DETECTED_PREFIX:FALLBACK\"; \
+                           sudo npm install -g openclaw@latest 2>&1 | tail -3; \
+                         fi",
+                        pfx = pfx
                     );
                     let timeouts = [90u64, 120, 180]; // escalating timeouts per attempt
                     let mut install_ok = false;
