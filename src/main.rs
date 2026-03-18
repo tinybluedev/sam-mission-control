@@ -3049,11 +3049,7 @@ PY"#, escaped_model);
         self.diag_rx = Some(rx);
 
         tokio::spawn(async move {
-            let op_id = if let Some(ref pool) = pool_opt {
-                db::create_operation(pool, &name, "oc_update").await.ok()
-            } else {
-                None
-            };
+            // Op recorded at completion, not at start (avoids orphaned 'running' rows)
 
             let pfx = if is_mac {
                 "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
@@ -3367,9 +3363,10 @@ PY"#, escaped_model);
                 status: DiagStatus::Pass,
                 detail: "Update complete — press Esc to close".into(),
             });
-            if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
-                let status = if install_ok { "completed" } else { "failed" };
-                let _ = db::complete_operation(pool, op_id, status, None).await;
+            if let Some(ref pool) = pool_opt {
+                let status = if install_ok { "pass" } else { "fail" };
+                let output = if install_ok { None } else { Some("Install command failed") };
+                let _ = db::record_operation(pool, &name, "oc_update", status, output).await;
             }
         });
     }
@@ -3695,15 +3692,13 @@ PY"#, escaped_model);
 
         tokio::spawn(async move {
             let op_id = if let Some(ref pool) = pool_opt {
-                let op_type = if fix {
-                    "diagnostics_fix"
-                } else {
-                    "diagnostics"
-                };
-                db::create_operation(pool, &name, op_type).await.ok()
+                // Op recorded at completion, not at start
+                let _ = fix; // suppress warning
+                Some(())
             } else {
                 None
             };
+            let diag_op_type = if fix { "diagnostics_fix" } else { "diagnostics" }.to_string();
 
             let is_mac_check = Command::new("ssh")
                 .args([
@@ -4511,9 +4506,8 @@ PY"#, escaped_model);
                     status: DiagStatus::Fail,
                     detail: "Cannot proceed without SSH — see details above".into(),
                 });
-                if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
-                    let _ = db::complete_operation(pool, op_id, "failed", Some("SSH unreachable"))
-                        .await;
+                if let (Some(_), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                    let _ = db::record_operation(pool, &name, &diag_op_type, "fail", Some("SSH unreachable")).await;
                 }
                 return;
             }
@@ -5141,8 +5135,8 @@ PY"#, escaped_model);
                 status: DiagStatus::Pass,
                 detail: "diagnostic complete".into(),
             });
-            if let (Some(op_id), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
-                let _ = db::complete_operation(pool, op_id, "completed", None).await;
+            if let (Some(_), Some(ref pool)) = (op_id, pool_opt.as_ref()) {
+                let _ = db::record_operation(pool, &name, &diag_op_type, "pass", None).await;
             }
         });
     }
@@ -12463,8 +12457,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let p = pool.clone();
                         let agent_name = a.db_name.clone();
                         tokio::spawn(async move {
-                            if let Ok(op_id) = db::create_operation(&p, &agent_name, "fleet_change").await {
-                                let _ = db::complete_operation(&p, op_id, "pass", Some(&detail)).await;
+                            {
+                                let _ = db::record_operation(&p, &agent_name, "fleet_change", "pass", Some(&detail)).await;
                             }
                         });
                     }

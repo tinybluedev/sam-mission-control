@@ -922,6 +922,8 @@ pub async fn get_fleet_changelog(
 }
 
 /// Record the start of an operation in `mc_operations`. Returns the new record ID.
+/// NOTE: This writes status='running' immediately. Prefer `record_operation()` for
+/// fire-and-forget results to avoid orphaned 'running' rows on crash/exit.
 pub async fn create_operation(
     pool: &Pool,
     agent: &str,
@@ -950,6 +952,25 @@ pub async fn complete_operation(
     )
     .await?;
     Ok(())
+}
+
+/// Record a completed operation in one shot (no orphaned 'running' rows).
+/// Use this instead of create_operation + complete_operation when the work
+/// is already done and you just need to log the result.
+pub async fn record_operation(
+    pool: &Pool,
+    agent: &str,
+    op_type: &str,
+    status: &str,
+    output: Option<&str>,
+) -> Result<i64, mysql_async::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.exec_drop(
+        "INSERT INTO mc_operations (agent, op_type, status, started_at, completed_at, output) VALUES (?, ?, ?, NOW(), NOW(), ?)",
+        (agent, op_type, status, output),
+    ).await?;
+    let id: Option<i64> = conn.query_first("SELECT LAST_INSERT_ID()").await?;
+    Ok(id.unwrap_or(0))
 }
 
 /// Record a completed fleet doctor run in `mc_operations`.
