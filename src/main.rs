@@ -3471,40 +3471,60 @@ PY"#, escaped_model);
                     debug_log(&format!("bulk_update: starting {} ({}) {} → {}", db_name, host, old_ver, latest));
                     let pfx = if is_mac { "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; " } else { "" };
 
-                    // Step 1: Installing
-                    let _ = tx.send(DiagStep {
-                        label: db_name.clone(),
-                        status: DiagStatus::Running,
-                        detail: format!("installing {} → {}", old_ver, latest),
-                    });
+                    // Step 1: Installing (with retry — up to 3 attempts, escalating timeouts)
                     let install_cmd = format!(
-                        "{}sudo npm install -g openclaw@latest 2>&1 | tail -3",
+                        "{}sudo npm install -g openclaw@latest 2>&1 | tail -5",
                         pfx
                     );
-                    let install_out = if host == "localhost" || host == self_ip {
-                        tokio::process::Command::new("bash").args(["-c", &install_cmd]).output().await.ok()
-                    } else {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(90),
-                            tokio::process::Command::new("ssh")
-                                .args(["-o","ConnectTimeout=5","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                    &format!("{}@{}", ssh_user, host), &install_cmd])
-                                .output()
-                        ).await.ok().and_then(|r| r.ok())
-                    };
-                    let install_ok = install_out.as_ref().map(|o| o.status.success()).unwrap_or(false);
-                    if !install_ok {
-                        any_fail.store(true, std::sync::atomic::Ordering::Relaxed);
-                        let reason = install_out.as_ref()
+                    let timeouts = [90u64, 120, 180]; // escalating timeouts per attempt
+                    let mut install_ok = false;
+                    let mut last_reason = String::new();
+                    for (attempt, &timeout_secs) in timeouts.iter().enumerate() {
+                        let attempt_label = if attempt == 0 {
+                            format!("installing {} → {}", old_ver, latest)
+                        } else {
+                            format!("retry {}/2 — installing ({}s timeout)", attempt, timeout_secs)
+                        };
+                        let _ = tx.send(DiagStep {
+                            label: db_name.clone(),
+                            status: DiagStatus::Running,
+                            detail: attempt_label,
+                        });
+                        let install_out = if host == "localhost" || host == self_ip {
+                            tokio::process::Command::new("bash").args(["-c", &install_cmd]).output().await.ok()
+                        } else {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(timeout_secs),
+                                tokio::process::Command::new("ssh")
+                                    .args(["-o","ConnectTimeout=10","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                        &format!("{}@{}", ssh_user, host), &install_cmd])
+                                    .output()
+                            ).await.ok().and_then(|r| r.ok())
+                        };
+                        if install_out.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                            install_ok = true;
+                            break;
+                        }
+                        last_reason = install_out.as_ref()
                             .map(|o| {
                                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                                if !stderr.is_empty() { stderr.chars().take(80).collect() } else { "install failed".to_string() }
+                                let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                if !stderr.is_empty() { stderr.chars().take(80).collect() }
+                                else if !stdout.is_empty() { stdout.chars().take(80).collect() }
+                                else { "install failed".to_string() }
                             })
-                            .unwrap_or_else(|| "SSH timeout (90s)".to_string());
-                        debug_log(&format!("bulk_update: {} INSTALL FAILED: {}", db_name, reason));
-                        let _ = tx.send(DiagStep { label: db_name.clone(), status: DiagStatus::Fail, detail: reason });
+                            .unwrap_or_else(|| format!("SSH timeout ({}s)", timeout_secs));
+                        debug_log(&format!("bulk_update: {} attempt {} failed: {}", db_name, attempt + 1, last_reason));
+                        if attempt < timeouts.len() - 1 {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                    if !install_ok {
+                        any_fail.store(true, std::sync::atomic::Ordering::Relaxed);
+                        debug_log(&format!("bulk_update: {} ALL ATTEMPTS FAILED: {}", db_name, last_reason));
+                        let _ = tx.send(DiagStep { label: db_name.clone(), status: DiagStatus::Fail, detail: last_reason });
                         if let Some(ref pool) = pool_opt {
-                            let _ = db::record_operation(pool, &db_name, "oc_update", "fail", Some("npm install failed")).await;
+                            let _ = db::record_operation(pool, &db_name, "oc_update", "fail", Some("npm install failed after 3 attempts")).await;
                         }
                         return;
                     }
