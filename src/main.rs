@@ -1146,6 +1146,52 @@ impl App {
         }
         }
 
+        // Merge fleet.toml agents that aren't in the DB yet
+        {
+            let existing_names: std::collections::HashSet<String> = agents.iter().map(|a| a.db_name.clone()).collect();
+            for ac in &fleet_config.agent {
+                let db_name = ac.name.to_lowercase();
+                if existing_names.contains(&db_name) { continue; }
+                agents.push(Agent {
+                    name: ac.display.clone().unwrap_or_else(|| ac.name.clone()),
+                    db_name: db_name.clone(),
+                    emoji: ac.emoji.clone().unwrap_or_else(|| "🖥️".into()),
+                    host: String::new(),
+                    ssh_user: ac.ssh_user.clone().unwrap_or_else(|| "papasmurf".into()),
+                    location: ac.location.clone().unwrap_or_else(|| "Home".into()),
+                    status: AgentStatus::Unknown,
+                    os: String::new(),
+                    kernel: String::new(),
+                    oc_version: String::new(),
+                    latency_ms: None,
+                    cpu_pct: None,
+                    ram_pct: None,
+                    disk_pct: None,
+                    hw_cpu_model: String::new(),
+                    hw_ram_total_mb: None,
+                    hw_disk_layout: String::new(),
+                    mem_free_mb: None,
+                    swap_mb: None,
+                    gateway_port: 18789,
+                    gateway_token: None,
+                    gateway_pid: None,
+                    gateway_status: GatewayStatus::Unknown,
+                    uptime_seconds: 0,
+                    activity: String::new(),
+                    context_pct: None,
+                    last_probe_at: None,
+                    ts_online: None,
+                    last_seen: String::new(),
+                    current_task: None,
+                    agent_note: String::new(),
+                    jump_host: ac.jump_host.clone(),
+                    jump_user: ac.jump_user.clone(),
+                    capabilities: Vec::new(),
+                    token_burn: 0,
+                });
+            }
+        }
+
         let chat_history = if let Some(pool) = &pool {
             match db::load_global_chat(pool, 100).await {
                 Ok(msgs) => msgs
@@ -4866,7 +4912,7 @@ PY"#, escaped_model);
                 detail: String::new(),
             });
             let ts_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
-                &format!("{}@{}", user, host), r#"tailscale status --self --json 2>/dev/null | grep -o '"Online":[a-z]*' | head -1 | cut -d: -f2 || echo ?"#
+                &format!("{}@{}", user, host), r#"tailscale status --self --json 2>/dev/null | grep -o '"Online": *[a-z]*' | head -1 | cut -d: -f2 || echo ?"#
             ]).output().await;
             let ts_online = ts_out
                 .as_ref()
@@ -5442,7 +5488,7 @@ PY"#, escaped_model);
             // Step 10: Systemd service hardening (only on Linux)
             if !is_mac {
                 let _ = tx.send(DiagStep { label: "Service hardening".into(), status: DiagStatus::Running, detail: String::new() });
-                let svc_check_cmd = r#"SVC=openclaw-gateway; FILE=$(systemctl cat $SVC 2>/dev/null | grep -v '^#' | tr '\n' '|'); HAS_RESTART=$(echo "$FILE" | grep -c 'Restart=always'); HAS_BURST=$(echo "$FILE" | grep -c 'StartLimitBurst'); HAS_KILL=$(echo "$FILE" | grep 'KillMode' | grep -c 'process'); HAS_MEM=$(echo "$FILE" | grep -c 'MemoryMax\|MemoryLimit'); echo "RESTART:$HAS_RESTART BURST:$HAS_BURST KILLMODE:$HAS_KILL MEMMAX:$HAS_MEM""#;
+                let svc_check_cmd = r#"SVC=openclaw-gateway; FILE=$(systemctl cat $SVC 2>/dev/null | grep -v '^#' | tr '\n' '|'); if [ -z "$FILE" ]; then FILE=$(systemctl --user cat $SVC 2>/dev/null | grep -v '^#' | tr '\n' '|'); IS_USER=1; else IS_USER=0; fi; HAS_RESTART=$(echo "$FILE" | grep -c 'Restart=always'); HAS_BURST=$(echo "$FILE" | grep -c 'StartLimitBurst'); HAS_KILL=$(echo "$FILE" | grep 'KillMode' | grep -c 'process'); HAS_MEM=$(echo "$FILE" | grep -c 'MemoryMax\|MemoryLimit'); echo "RESTART:$HAS_RESTART BURST:$HAS_BURST KILLMODE:$HAS_KILL MEMMAX:$HAS_MEM USER:$IS_USER""#;
                 let svc_out = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host), svc_check_cmd
                 ]).output().await;
@@ -5459,7 +5505,12 @@ PY"#, escaped_model);
 
                 if !issues.is_empty() && fix {
                     let _ = tx.send(DiagStep { label: "Service hardening".into(), status: DiagStatus::Running, detail: "applying systemd drop-in...".into() });
-                    let dropin_cmd = r#"DROPIN=/etc/systemd/system/openclaw-gateway.service.d/mc-hardening.conf; sudo mkdir -p $(dirname $DROPIN); printf '[Service]\nKillMode=control-group\nMemoryMax=2G\nMemorySwapMax=512M\n[Unit]\nStartLimitBurst=3\nStartLimitIntervalSec=60\n' | sudo tee $DROPIN > /dev/null && sudo systemctl daemon-reload && echo APPLIED"#;
+                    let is_user_svc = svc_info.contains("USER:1");
+                    let dropin_cmd = if is_user_svc {
+                        r#"DROPIN=$HOME/.config/systemd/user/openclaw-gateway.service.d/mc-hardening.conf; mkdir -p $(dirname $DROPIN); printf '[Service]\nKillMode=control-group\nMemoryMax=2G\nMemorySwapMax=512M\n[Unit]\nStartLimitBurst=3\nStartLimitIntervalSec=60\n' > $DROPIN && systemctl --user daemon-reload && echo APPLIED"#
+                    } else {
+                        r#"DROPIN=/etc/systemd/system/openclaw-gateway.service.d/mc-hardening.conf; sudo mkdir -p $(dirname $DROPIN); printf '[Service]\nKillMode=control-group\nMemoryMax=2G\nMemorySwapMax=512M\n[Unit]\nStartLimitBurst=3\nStartLimitIntervalSec=60\n' | sudo tee $DROPIN > /dev/null && sudo systemctl daemon-reload && echo APPLIED"#
+                    };
                     let dropin_result = Command::new("ssh").args(["-o","ConnectTimeout=2","-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
                         &format!("{}@{}", user, host), dropin_cmd]).output().await;
                     let applied = dropin_result.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).contains("APPLIED")).unwrap_or(false);
@@ -5990,7 +6041,7 @@ print('ok')
                 let ts_out = tokio::process::Command::new("ssh").args([
                     "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                     &format!("{}@{}", user, host),
-                    r#"tailscale status --self --json 2>/dev/null | grep -o '"Online":[a-z]*' | head -1 | cut -d: -f2 || echo ?"#
+                    r#"tailscale status --self --json 2>/dev/null | grep -o '"Online": *[a-z]*' | head -1 | cut -d: -f2 || echo ?"#
                 ]).output().await;
                 let ts_online = ts_out
                     .as_ref()
