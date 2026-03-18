@@ -3385,15 +3385,10 @@ PY"#, escaped_model);
         self.diag_active = true;
         self.diag_task_running = true;
         self.diag_auto_fix = false;
-        self.diag_title = Some(format!("⬆  Bulk Update — {} agent{}", count, if count == 1 { "" } else { "s" }));
+        self.diag_title = Some("⬆  Bulk Update".into());
         self.diag_start = Some(Instant::now());
         self.diag_overlay_scroll = 0;
-        self.diag_steps = vec![DiagStep {
-            label: format!("Updating {} agent{} to {}...", count, if count == 1 { "" } else { "s" },
-                if latest.is_empty() { "latest".to_string() } else { latest.clone() }),
-            status: DiagStatus::Running,
-            detail: String::new(),
-        }];
+        self.diag_steps = vec![];
         let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
         self.diag_rx = Some(rx);
         let self_ip = self.self_ip.clone();
@@ -3405,9 +3400,9 @@ PY"#, escaped_model);
             // Resolve latest version if not known yet
             let latest = if latest.is_empty() {
                 let _ = tx.send(DiagStep {
-                    label: "Checking latest OpenClaw version...".into(),
+                    label: "Latest version".into(),
                     status: DiagStatus::Running,
-                    detail: String::new(),
+                    detail: "checking npm...".into(),
                 });
                 debug_log("bulk_update: latest version unknown, fetching from npm...");
                 let ver = tokio::process::Command::new("npm")
@@ -3420,21 +3415,26 @@ PY"#, escaped_model);
                 if ver.is_empty() {
                     debug_log("bulk_update: npm version check FAILED");
                     let _ = tx.send(DiagStep {
-                        label: "✗ Could not determine latest version".into(),
+                        label: "Latest version".into(),
                         status: DiagStatus::Fail,
-                        detail: "npm view openclaw version failed".into(),
+                        detail: "npm check failed".into(),
                     });
-                    let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: String::new() });
+                    let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Fail, detail: "Could not determine latest version".into() });
                     return;
                 }
                 debug_log(&format!("bulk_update: resolved latest = {}", ver));
                 let _ = tx.send(DiagStep {
-                    label: format!("✓ Latest version: {}", ver),
+                    label: "Latest version".into(),
                     status: DiagStatus::Pass,
-                    detail: String::new(),
+                    detail: ver.clone(),
                 });
                 ver
             } else {
+                let _ = tx.send(DiagStep {
+                    label: "Latest version".into(),
+                    status: DiagStatus::Pass,
+                    detail: latest.clone(),
+                });
                 latest
             };
 
@@ -3445,14 +3445,18 @@ PY"#, escaped_model);
             if targets.is_empty() {
                 debug_log("bulk_update: all agents already on latest after re-filter");
                 let _ = tx.send(DiagStep {
-                    label: "✓ All agents already up to date".into(),
+                    label: "DONE".into(),
                     status: DiagStatus::Pass,
-                    detail: latest,
+                    detail: "All agents already up to date".into(),
                 });
-                let _ = tx.send(DiagStep { label: "DONE".into(), status: DiagStatus::Pass, detail: String::new() });
                 return;
             }
             debug_log(&format!("bulk_update: {} agents need update to {}", targets.len(), latest));
+            let _ = tx.send(DiagStep {
+                label: "Agents to update".into(),
+                status: DiagStatus::Pass,
+                detail: format!("{} outdated", targets.len()),
+            });
 
             // Run updates in parallel batches of 5
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(5));
