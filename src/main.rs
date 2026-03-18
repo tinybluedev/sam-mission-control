@@ -8479,7 +8479,7 @@ fn render_dashboard(frame: &mut Frame, app: &mut App) {
         },
         if !app.interrupted_ops.is_empty() {
             Span::styled(
-                format!("  ⚠ {} interrupted op(s)", app.interrupted_ops.len()),
+                format!("  ⚠ {} interrupted op(s) [X clears]", app.interrupted_ops.len()),
                 Style::default().fg(t.status_busy).bold(),
             )
         } else {
@@ -14444,6 +14444,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                                 KeyCode::Char('x') => {
                                                     app.screen = Screen::SpawnManager
+                                                }
+                                                KeyCode::Char('X') => {
+                                                    // Clear interrupted ops
+                                                    if !app.interrupted_ops.is_empty() {
+                                                        if let Some(pool) = &app.db_pool {
+                                                            let pool = pool.clone();
+                                                            tokio::spawn(async move {
+                                                                use mysql_async::prelude::*;
+                                                                let mut conn = pool.get_conn().await.ok();
+                                                                if let Some(ref mut c) = conn {
+                                                                    let _ = c.query_drop(
+                                                                        "UPDATE mc_operations SET status='cleared' WHERE status='interrupted'"
+                                                                    ).await;
+                                                                }
+                                                            });
+                                                        }
+                                                        let count = app.interrupted_ops.len();
+                                                        app.interrupted_ops.clear();
+                                                        app.toast(&format!("Cleared {} interrupted op(s)", count));
+                                                        debug_log(&format!("action: cleared {} interrupted ops", count));
+                                                    }
                                                 }
                                                 KeyCode::Char('t') => {
                                                     app.task_filter_agent = None;

@@ -962,11 +962,18 @@ pub async fn record_fleet_doctor_run(pool: &Pool, status: &str, output: &str) ->
 /// Returns the number of rows updated.
 pub async fn mark_stale_operations_interrupted(pool: &Pool) -> Result<u64, mysql_async::Error> {
     let mut conn = pool.get_conn().await?;
+    // Mark running ops older than 5 min as interrupted
     conn.exec_drop(
         "UPDATE mc_operations SET status='interrupted' WHERE status='running' AND started_at < NOW() - INTERVAL 5 MINUTE",
         (),
     ).await?;
-    Ok(conn.affected_rows())
+    let marked = conn.affected_rows();
+    // Auto-clear interrupted ops older than 24 hours (not actionable anymore)
+    conn.exec_drop(
+        "UPDATE mc_operations SET status='cleared' WHERE status='interrupted' AND started_at < NOW() - INTERVAL 24 HOUR",
+        (),
+    ).await?;
+    Ok(marked)
 }
 
 /// Load all operations with `status='interrupted'`, most recent first (up to 20).
