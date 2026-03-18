@@ -3040,11 +3040,7 @@ PY"#, escaped_model);
         self.diag_title = Some(format!("⬆️  Update — {}", name));
         self.diag_start = Some(Instant::now());
         self.diag_overlay_scroll = 0;
-        self.diag_steps = vec![DiagStep {
-            label: format!("Updating OpenClaw on {}...", name),
-            status: DiagStatus::Running,
-            detail: String::new(),
-        }];
+        self.diag_steps = vec![];
 
         let (tx, rx) = mpsc::unbounded_channel::<DiagStep>();
         self.diag_rx = Some(rx);
