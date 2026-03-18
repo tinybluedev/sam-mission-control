@@ -168,6 +168,13 @@ pub enum Commands {
         #[arg(short, long)]
         agent: Option<String>,
     },
+    /// Scan Tailscale mesh for OpenClaw agents not yet in fleet.toml
+    Scan,
+    /// Remove an agent from fleet.toml
+    Remove {
+        /// Agent name to remove
+        agent: String,
+    },
     /// Run scheduled-operations executor without launching TUI
     Daemon,
     /// Tail the debug log (use with --debug on the TUI instance)

@@ -63,6 +63,23 @@ impl AgentConfig {
 /// 1. $SAM_FLEET_CONFIG env var
 /// 2. ./fleet.toml (current directory)
 /// 3. ~/.config/sam/fleet.toml
+pub fn fleet_config_path() -> PathBuf {
+    let paths: Vec<PathBuf> = vec![
+        std::env::var("SAM_FLEET_CONFIG").ok().map(PathBuf::from),
+        Some(PathBuf::from("fleet.toml")),
+        dirs_next().map(|d| d.join("fleet.toml")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for path in &paths {
+        if path.exists() {
+            return path.clone();
+        }
+    }
+    dirs_next().map(|d| d.join("fleet.toml")).unwrap_or_else(|| PathBuf::from("fleet.toml"))
+}
+
 pub fn load_fleet_config() -> Result<FleetConfig, String> {
     let paths: Vec<PathBuf> = vec![
         std::env::var("SAM_FLEET_CONFIG").ok().map(PathBuf::from),

@@ -12265,6 +12265,195 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 // ---- Main ----
 
+/// Scan Tailscale mesh for OpenClaw agents not in fleet.toml
+async fn run_scan() -> Result<(), Box<dyn std::error::Error>> {
+    let fleet_config = config::load_fleet_config().unwrap_or_else(|_| config::FleetConfig { agent: vec![] });
+    let known_names: std::collections::HashSet<String> = fleet_config.agent
+        .iter()
+        .map(|a| a.name.clone())
+        .collect();
+
+    // Get Tailscale peers
+    println!("Scanning Tailscale mesh for OpenClaw agents...\n");
+    let ts_out = tokio::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+        .await;
+    let ts_json: serde_json::Value = match ts_out {
+        Ok(o) if o.status.success() => {
+            serde_json::from_slice(&o.stdout).unwrap_or_default()
+        }
+        _ => {
+            eprintln!("Failed to run 'tailscale status --json'");
+            return Ok(());
+        }
+    };
+
+    let mut discovered = Vec::new();
+    if let Some(peers) = ts_json.get("Peer").and_then(|v| v.as_object()) {
+        for (_key, peer) in peers {
+            let hostname = peer.get("HostName").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let online = peer.get("Online").and_then(|v| v.as_bool()).unwrap_or(false);
+            if hostname.is_empty() || hostname == "localhost" { continue; }
+            // Extract IPv4 from AllowedIPs
+            let ip = peer.get("AllowedIPs").and_then(|v| v.as_array())
+                .and_then(|arr| arr.iter()
+                    .filter_map(|ip| ip.as_str())
+                    .find(|ip| ip.contains('.'))
+                    .map(|ip| ip.split('/').next().unwrap_or(ip).to_string()))
+                .unwrap_or_default();
+            let os = peer.get("OS").and_then(|v| v.as_str()).unwrap_or("?");
+
+            // Check if already known
+            let name_lower = hostname.to_lowercase().replace(' ', "-");
+            if known_names.contains(&name_lower) {
+                continue;
+            }
+            if !online { continue; }
+
+            // Probe for OpenClaw
+            let users = ["papasmurf", "nick", "charizard", &name_lower];
+            let mut oc_version = String::new();
+            let mut working_user = String::new();
+            for user in &users {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    tokio::process::Command::new("ssh")
+                        .args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                            &format!("{}@{}", user, ip),
+                            "export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH; openclaw --version 2>/dev/null || echo ?"])
+                        .output()
+                ).await;
+                if let Ok(Ok(o)) = result {
+                    if o.status.success() {
+                        let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if raw != "?" && !raw.is_empty() {
+                            let ver = if raw.starts_with("OpenClaw ") {
+                                raw.split_whitespace().nth(1).unwrap_or(&raw).to_string()
+                            } else { raw };
+                            oc_version = ver;
+                            working_user = user.to_string();
+                            break;
+                        }
+                    }
+                }
+            }
+            discovered.push((hostname, ip, os.to_string(), online, oc_version, working_user));
+        }
+    }
+
+    if discovered.is_empty() {
+        println!("No new OpenClaw agents found on the Tailscale mesh.");
+        println!("All {} known agents are already in fleet.toml.", known_names.len());
+        return Ok(());
+    }
+
+    println!("{:<20} {:<15} {:<12} {:<12} {}", "Hostname", "IP", "OS", "OC Version", "SSH User");
+    println!("{}", "─".repeat(75));
+    for (hostname, ip, os, _online, oc_ver, user) in &discovered {
+        let ver_display = if oc_ver.is_empty() { "not found" } else { oc_ver };
+        let user_display = if user.is_empty() { "?" } else { user };
+        println!("{:<20} {:<15} {:<12} {:<12} {}", hostname, ip, os, ver_display, user_display);
+    }
+
+    let with_oc: Vec<_> = discovered.iter().filter(|(_, _, _, _, ver, _)| !ver.is_empty()).collect();
+    if !with_oc.is_empty() {
+        println!("\n{} agent(s) with OpenClaw found. Add to fleet.toml with:", with_oc.len());
+        for (hostname, ip, _, _, _, user) in &with_oc {
+            let name = hostname.to_lowercase().replace(' ', "-");
+            let is_mac = hostname.to_lowercase().contains("apple") || hostname.to_lowercase().contains("mac");
+            let location = if is_mac { "Mobile" } else { "Home" };
+            println!("\n  [[agent]]");
+            println!("  name = \"{}\"", name);
+            println!("  display = \"{}\"", hostname);
+            println!("  emoji = \"🖥️\"");
+            println!("  location = \"{}\"", location);
+            println!("  ssh_user = \"{}\"", user);
+            println!("  # host = {} (auto-detected from Tailscale)", ip);
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove an agent from fleet.toml
+fn run_remove(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = config::fleet_config_path();
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("Cannot read fleet.toml: {}", e))?;
+
+    // Find the agent block: [[agent]] followed by name = "agent_name"
+    let lines: Vec<&str> = content.lines().collect();
+    let mut start = None;
+    let mut end = None;
+    let target = agent.to_lowercase();
+
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() == "[[agent]]" {
+            // Check if next non-empty line has matching name
+            for j in (i + 1)..lines.len() {
+                let l = lines[j].trim();
+                if l.is_empty() { continue; }
+                if l.starts_with("name") {
+                    if let Some(val) = l.split('=').nth(1) {
+                        let val = val.trim().trim_matches('"').to_lowercase();
+                        if val == target {
+                            start = Some(i);
+                            // Find end — next [[agent]] or end of file
+                            for k in (i + 1)..lines.len() {
+                                if lines[k].trim() == "[[agent]]" {
+                                    end = Some(k);
+                                    break;
+                                }
+                            }
+                            if end.is_none() { end = Some(lines.len()); }
+                            break;
+                        }
+                    }
+                }
+                break; // only check first non-empty line after [[agent]]
+            }
+        }
+        if start.is_some() { break; }
+    }
+
+    match start {
+        Some(s) => {
+            let e = end.unwrap_or(lines.len());
+            let mut new_lines: Vec<&str> = Vec::new();
+            new_lines.extend_from_slice(&lines[..s]);
+            // Skip trailing blank lines between removed block and next block
+            let mut skip_start = e;
+            while skip_start < lines.len() && lines[skip_start].trim().is_empty() {
+                skip_start += 1;
+            }
+            // But if next line is [[agent]], keep one blank line for readability
+            if skip_start < lines.len() && lines[skip_start].trim() == "[[agent]]" && skip_start > e {
+                new_lines.push("");
+            }
+            new_lines.extend_from_slice(&lines[skip_start..]);
+            let new_content = new_lines.join("\n");
+            std::fs::write(&config_path, new_content)?;
+            println!("Removed '{}' from fleet.toml", agent);
+            println!("Restart SAM to apply changes.");
+        }
+        None => {
+            eprintln!("Agent '{}' not found in fleet.toml", agent);
+            eprintln!("Available agents:");
+            for line in &lines {
+                let l = line.trim();
+                if l.starts_with("name") {
+                    if let Some(val) = l.split('=').nth(1) {
+                        eprintln!("  - {}", val.trim().trim_matches('"'));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = cli::Cli::parse();
@@ -12371,6 +12560,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             return Ok(());
+        }
+        Some(cli::Commands::Scan) => {
+            return run_scan().await;
+        }
+        Some(cli::Commands::Remove { agent }) => {
+            return run_remove(&agent);
         }
         Some(cli::Commands::Daemon) => {
             if !db::mysql_enabled() {
