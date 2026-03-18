@@ -3491,19 +3491,21 @@ PY"#, escaped_model);
                            OC_PREFIX=$(echo \"$OC_REAL\" | sed 's|/lib/node_modules/openclaw/.*||; s|/bin/openclaw||'); \
                            echo \"DETECTED_PREFIX:$OC_PREFIX\"; \
                            if echo \"$OC_PREFIX\" | grep -qE '^(/home/|/Users/)'; then \
-                             npm install -g --prefix \"$OC_PREFIX\" openclaw@latest 2>&1 | tail -3; \
+                             npm install -g --prefix \"$OC_PREFIX\" openclaw@latest 2>&1; \
                            else \
-                             sudo npm install -g --prefix \"$OC_PREFIX\" openclaw@latest 2>&1 | tail -3; \
+                             sudo npm install -g --prefix \"$OC_PREFIX\" openclaw@latest 2>&1; \
                            fi; \
                          else \
                            echo \"DETECTED_PREFIX:FALLBACK\"; \
-                           sudo npm install -g openclaw@latest 2>&1 | tail -3; \
-                         fi",
+                           sudo npm install -g openclaw@latest 2>&1; \
+                         fi; \
+                         echo \"VERIFY_VERSION:$(openclaw --version 2>/dev/null || echo UNKNOWN)\"",
                         pfx = pfx
                     );
                     let timeouts = [90u64, 120, 180]; // escalating timeouts per attempt
                     let mut install_ok = false;
                     let mut last_reason = String::new();
+                    let mut verified_version = String::new();
                     for (attempt, &timeout_secs) in timeouts.iter().enumerate() {
                         let attempt_label = if attempt == 0 {
                             format!("installing {} → {}", old_ver, latest)
@@ -3515,30 +3517,81 @@ PY"#, escaped_model);
                             status: DiagStatus::Running,
                             detail: attempt_label,
                         });
-                        let install_out = if host == "localhost" || host == self_ip {
-                            tokio::process::Command::new("bash").args(["-c", &install_cmd]).output().await.ok()
+
+                        // Stream output line-by-line so the overlay shows real npm progress
+                        let mut child = if host == "localhost" || host == self_ip {
+                            tokio::process::Command::new("bash")
+                                .args(["-c", &install_cmd])
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::piped())
+                                .spawn()
                         } else {
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(timeout_secs),
-                                tokio::process::Command::new("ssh")
-                                    .args(["-o","ConnectTimeout=10","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
-                                        &format!("{}@{}", ssh_user, host), &install_cmd])
-                                    .output()
-                            ).await.ok().and_then(|r| r.ok())
+                            tokio::process::Command::new("ssh")
+                                .args(["-o","ConnectTimeout=10","-o","StrictHostKeyChecking=no","-o","BatchMode=yes",
+                                    &format!("{}@{}", ssh_user, host), &install_cmd])
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::piped())
+                                .spawn()
                         };
-                        if install_out.as_ref().map(|o| o.status.success()).unwrap_or(false) {
-                            install_ok = true;
-                            break;
+                        match child {
+                            Ok(ref mut proc) => {
+                                use tokio::io::{AsyncBufReadExt, BufReader};
+                                let stdout = proc.stdout.take();
+                                let mut lines_collected: Vec<String> = Vec::new();
+                                if let Some(out) = stdout {
+                                    let mut reader = BufReader::new(out).lines();
+                                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+                                    loop {
+                                        let read_result = tokio::time::timeout_at(deadline, reader.next_line()).await;
+                                        match read_result {
+                                            Ok(Ok(Some(line))) => {
+                                                debug_log(&format!("bulk_update: {} | {}", db_name, line));
+                                                // Check for version verification line
+                                                if let Some(ver) = line.strip_prefix("VERIFY_VERSION:") {
+                                                    verified_version = ver.trim().to_string();
+                                                }
+                                                let display_line = if line.len() > 100 { format!("{}...", &line[..97]) } else { line.clone() };
+                                                let _ = tx.send(DiagStep {
+                                                    label: db_name.clone(),
+                                                    status: DiagStatus::Running,
+                                                    detail: display_line,
+                                                });
+                                                lines_collected.push(line);
+                                            }
+                                            Ok(Ok(None)) => break, // EOF
+                                            Ok(Err(e)) => {
+                                                last_reason = format!("read error: {}", e);
+                                                break;
+                                            }
+                                            Err(_) => {
+                                                last_reason = format!("SSH timeout ({}s)", timeout_secs);
+                                                let _ = proc.kill().await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                let status = tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    proc.wait()
+                                ).await;
+                                let exit_ok = status.ok().and_then(|r| r.ok()).map(|s| s.success()).unwrap_or(false);
+                                // Verify the version actually changed
+                                let version_confirmed = !verified_version.is_empty() && verified_version.contains(&latest);
+                                if exit_ok && version_confirmed {
+                                    install_ok = true;
+                                    break;
+                                } else if exit_ok && !version_confirmed {
+                                    last_reason = format!("install exited OK but version is '{}', expected '{}'", verified_version, latest);
+                                    debug_log(&format!("bulk_update: {} VERSION MISMATCH: {}", db_name, last_reason));
+                                } else if !exit_ok && last_reason.is_empty() {
+                                    last_reason = lines_collected.last().cloned().unwrap_or_else(|| "install failed".into());
+                                }
+                            }
+                            Err(e) => {
+                                last_reason = format!("spawn error: {}", e);
+                            }
                         }
-                        last_reason = install_out.as_ref()
-                            .map(|o| {
-                                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                                let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                                if !stderr.is_empty() { stderr.chars().take(80).collect() }
-                                else if !stdout.is_empty() { stdout.chars().take(80).collect() }
-                                else { "install failed".to_string() }
-                            })
-                            .unwrap_or_else(|| format!("SSH timeout ({}s)", timeout_secs));
                         debug_log(&format!("bulk_update: {} attempt {} failed: {}", db_name, attempt + 1, last_reason));
                         if attempt < timeouts.len() - 1 {
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
