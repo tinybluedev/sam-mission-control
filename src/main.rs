@@ -15139,7 +15139,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if is_done {
                         // Mark task as no longer running (overlay stays open for user to read)
                         app.diag_task_running = false;
-                        if app.diag_title.as_deref().map(|t| t.starts_with("🌐 Gateway")).unwrap_or(false) {
+                        let is_update = app.diag_title.as_deref().map(|t| {
+                            t.starts_with("🌐 Gateway") || t.contains("Update")
+                        }).unwrap_or(false);
+                        if is_update {
+                            // Force a full probe cycle to refresh versions immediately
+                            app.refresh_cycle = 4; // next cycle will be 5 → triggers full probe
                             refresh_after_done = true;
                         }
                     }
