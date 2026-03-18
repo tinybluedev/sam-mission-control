@@ -340,6 +340,7 @@ struct ProbeResult {
     gateway_status: GatewayStatus,
     gateway_pid: Option<i32>,
     ts_online: Option<bool>,
+    uptime_seconds: Option<i64>,
 }
 
 // ── UI Helpers ──────────────────────────────────────
@@ -6951,7 +6952,7 @@ PY",
             let full = self.refresh_cycle % 5 == 0; // full probe every 5th cycle
             let ts_online = ts_map.get(&host).copied();
             tokio::spawn(async move {
-                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx, hw_cpu_model, hw_ram_total_mb, hw_disk_layout) =
+                let (status, os, kern, oc, lat, cpu, ram, disk, act, ctx, hw_cpu_model, hw_ram_total_mb, hw_disk_layout, uptime_secs) =
                     probe_agent(&host, &user, jump_host.as_deref(), jump_user.as_deref(), &sip, full, ts_online).await;
                 let _ = tx.send(ProbeResult {
                     index: i,
@@ -6972,6 +6973,7 @@ PY",
                     gateway_pid: None,
                     mem_free_mb: None,
                     swap_mb: None,
+                    uptime_seconds: uptime_secs,
                     ts_online,
                 });
             });
@@ -7003,6 +7005,10 @@ PY",
                     self.agents[r.index].cpu_pct = r.cpu_pct;
                     self.agents[r.index].ram_pct = r.ram_pct;
                     self.agents[r.index].disk_pct = r.disk_pct;
+                    if let Some(up) = r.uptime_seconds {
+                        self.agents[r.index].uptime_seconds = up;
+                        self.agents[r.index].last_probe_at = Some(std::time::Instant::now());
+                    }
                     if !r.hw_cpu_model.is_empty() {
                         self.agents[r.index].hw_cpu_model = r.hw_cpu_model;
                     }
@@ -7366,6 +7372,7 @@ async fn probe_agent(
     String,
     Option<i64>,
     String,
+    Option<i64>, // uptime_seconds
 ) {
     let start = Instant::now();
     // Tailscale short-circuit: if Tailscale reports offline, skip SSH entirely
@@ -7375,7 +7382,7 @@ async fn probe_agent(
             AgentStatus::Offline,
             String::new(), String::new(), String::new(),
             None, None, None, None, String::new(), None,
-            String::new(), None, String::new(),
+            String::new(), None, String::new(), None,
         );
     }
     // Fast probe: SSH connectivity + version check
@@ -7432,6 +7439,7 @@ async fn probe_agent(
                     String::new(),
                     None,
                     String::new(),
+                    None,
                 )
             },
             _ => {
@@ -7450,6 +7458,7 @@ async fn probe_agent(
                 String::new(),
                 None,
                 String::new(),
+                None,
             )
             },
         };
@@ -7550,6 +7559,9 @@ async fn probe_agent(
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
         let ms = start.elapsed().as_millis() as u32;
+        let local_uptime = std::fs::read_to_string("/proc/uptime").ok()
+            .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
+            .map(|v| v as i64);
         return (
             AgentStatus::Online,
             os,
@@ -7564,10 +7576,11 @@ async fn probe_agent(
             hw_cpu_model,
             hw_ram_total_mb,
             hw_disk_layout,
+            local_uptime,
         );
     }
     let tgt = format!("{}@{}", user, host);
-    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(python3 -c "import json; paths=['/home/papasmurf/.npm-global/lib/node_modules/openclaw/package.json','/home/nick/.npm-global/lib/node_modules/openclaw/package.json','/usr/lib/node_modules/openclaw/package.json','/usr/local/lib/node_modules/openclaw/package.json']; [print(json.load(open(p)).get('version','?')) or exit() for p in paths if __import__('os').path.exists(p)]" 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); CPU_MODEL=$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/^ *//' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo ?); RAM_TOTAL_MB=$(free -m 2>/dev/null | awk '/Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f", $1/1024/1024}' || echo ?); DISK_LAYOUT=$(lsblk -rno NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | head -6 | tr '\n' ';' || df -h 2>/dev/null | awk 'NR==1 || /^\/dev\//' | head -6 | tr '\n' ';' || echo ?); GWPID=$(pgrep -f 'openclaw.*gateway' 2>/dev/null | head -1 || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; echo "CPU_MODEL:$CPU_MODEL"; echo "RAM_TOTAL_MB:$RAM_TOTAL_MB"; echo "DISK_LAYOUT:$DISK_LAYOUT"; echo "GWPID:$GWPID"; GW_PORT=$(cat ~/.openclaw/openclaw.json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('gateway',{}).get('port',18789))" 2>/dev/null || echo 18789); GW_UP=$(curl -sf --max-time 2 "http://localhost:${GW_PORT}" >/dev/null 2>&1 && echo up || echo down); ACT=$([ "$GW_UP" = "up" ] && echo "gateway:up" || echo "offline"); echo "ACT:$ACT"; echo "CTX:?""#;
+    let script = r#"export PATH=/opt/homebrew/bin:/usr/local/bin:/home/papasmurf/.npm-global/bin:/home/nick/.npm-global/bin:$PATH; OS=$(. /etc/os-release 2>/dev/null && echo "$NAME $VERSION_ID" || (sw_vers -productName 2>/dev/null; sw_vers -productVersion 2>/dev/null) || echo ?); KERN=$(uname -r); OC=$(python3 -c "import json; paths=['/home/papasmurf/.npm-global/lib/node_modules/openclaw/package.json','/home/nick/.npm-global/lib/node_modules/openclaw/package.json','/usr/lib/node_modules/openclaw/package.json','/usr/local/lib/node_modules/openclaw/package.json']; [print(json.load(open(p)).get('version','?')) or exit() for p in paths if __import__('os').path.exists(p)]" 2>/dev/null || echo ?); CPU=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2+$4}' || echo ?); RAM=$(free 2>/dev/null | awk '/Mem:/{printf "%.1f", $3/$2*100}' || vm_stat 2>/dev/null | awk '/Pages active/{a=$NF} /Pages wired/{w=$NF} /Pages free/{f=$NF} END{if(a+w+f>0) printf "%.1f",(a+w)/(a+w+f)*100; else print "?"}'); DISK=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}' || echo ?); CPU_MODEL=$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/^ *//' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo ?); RAM_TOTAL_MB=$(free -m 2>/dev/null | awk '/Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f", $1/1024/1024}' || echo ?); DISK_LAYOUT=$(lsblk -rno NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | head -6 | tr '\n' ';' || df -h 2>/dev/null | awk 'NR==1 || /^\/dev\//' | head -6 | tr '\n' ';' || echo ?); GWPID=$(pgrep -f 'openclaw.*gateway' 2>/dev/null | head -1 || echo ?); UPSEC=$(awk '{printf "%.0f", $1}' /proc/uptime 2>/dev/null || python3 -c "import subprocess,time;r=subprocess.run(['sysctl','-n','kern.boottime'],capture_output=True,text=True);t=int(r.stdout.split()[3].rstrip(','));print(int(time.time()-t))" 2>/dev/null || echo ?); echo "OS:$OS"; echo "KERN:$KERN"; echo "OC:$OC"; echo "CPU:$CPU"; echo "RAM:$RAM"; echo "DISK:$DISK"; echo "CPU_MODEL:$CPU_MODEL"; echo "RAM_TOTAL_MB:$RAM_TOTAL_MB"; echo "DISK_LAYOUT:$DISK_LAYOUT"; echo "GWPID:$GWPID"; echo "UPSEC:$UPSEC"; GW_PORT=$(cat ~/.openclaw/openclaw.json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('gateway',{}).get('port',18789))" 2>/dev/null || echo 18789); GW_UP=$(curl -sf --max-time 2 "http://localhost:${GW_PORT}" >/dev/null 2>&1 && echo up || echo down); ACT=$([ "$GW_UP" = "up" ] && echo "gateway:up" || echo "offline"); echo "ACT:$ACT"; echo "CTX:?""#;
     let mut ssh_args: Vec<String> = vec![
         "-o".to_string(), "ConnectTimeout=2".to_string(),
         "-o".to_string(), "BatchMode=yes".to_string(),
@@ -7608,6 +7621,7 @@ async fn probe_agent(
                 String::new(),
                 None,
                 String::new(),
+                None,
             );
         }
     };
@@ -7624,6 +7638,7 @@ async fn probe_agent(
                     oc = v.trim().into();
                 }
             }
+            let mut uptime_secs: Option<i64> = None;
             let (mut cpu, mut ram, mut disk, mut act, mut ctx, mut hw_cpu_model, mut hw_ram_total_mb, mut hw_disk_layout) =
                 (None, None, None, String::new(), None, String::new(), None, String::new());
             for l in s.lines() {
@@ -7643,6 +7658,8 @@ async fn probe_agent(
                     hw_ram_total_mb = v.trim().parse::<i64>().ok();
                 } else if let Some(v) = l.strip_prefix("DISK_LAYOUT:") {
                     hw_disk_layout = v.trim().to_string();
+                } else if let Some(v) = l.strip_prefix("UPSEC:") {
+                    uptime_secs = v.trim().parse::<i64>().ok();
                 }
             }
             let ms = start.elapsed().as_millis() as u32;
@@ -7660,6 +7677,7 @@ async fn probe_agent(
                 hw_cpu_model,
                 hw_ram_total_mb,
                 hw_disk_layout,
+                uptime_secs,
             )
         }
         _ => (
@@ -7676,6 +7694,7 @@ async fn probe_agent(
             String::new(),
             None,
             String::new(),
+            None,
         ),
     }
 }
@@ -8730,7 +8749,7 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
     let show_activity = area.width > 100;
     let hcells_vec: Vec<&str> = if show_resources {
         vec![
-            "  ", "Agent", "IP", "Location", "Status", "Health", "Ping", "Activity", "Ctx%", "CPU",
+            "  ", "Agent", "IP", "Location", "Status", "Health", "Ping", "Uptime", "Activity", "Ctx%", "CPU",
             "RAM", "Disk", "Version",
         ]
     } else if show_activity {
@@ -8819,13 +8838,19 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
                 );
                 if show_latency {
                     cells.push(Cell::from(lat_str).style(Style::default().fg(lat_color)));
-                    if !show_resources {
-                        // Uptime only in non-resource views (resource view has no Uptime column)
-                        cells.push(
-                            Cell::from(format_uptime(a.uptime_seconds))
-                                .style(Style::default().fg(t.text_dim)),
-                        );
-                    }
+                    // Live uptime: base + elapsed since last probe
+                    let live_uptime = if a.uptime_seconds > 0 {
+                        let elapsed = a.last_probe_at
+                            .map(|t| t.elapsed().as_secs() as i64)
+                            .unwrap_or(0);
+                        a.uptime_seconds + elapsed
+                    } else {
+                        a.uptime_seconds
+                    };
+                    cells.push(
+                        Cell::from(format_uptime(live_uptime))
+                            .style(Style::default().fg(t.text_dim)),
+                    );
                 }
                 if show_activity && !show_resources {
                     let act_display = if a.activity.is_empty() || a.activity == "idle" {
@@ -8903,19 +8928,20 @@ fn render_fleet_table(frame: &mut Frame, app: &mut App, area: Rect, active: bool
 
     let widths = if show_resources {
         vec![
-            Constraint::Length(5),
-            Constraint::Length(14),
-            Constraint::Length(13),
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Length(10),
-            Constraint::Length(5),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Min(10),
+            Constraint::Length(5),   // cursor+emoji
+            Constraint::Length(14),  // Agent
+            Constraint::Length(13),  // IP
+            Constraint::Length(8),   // Location
+            Constraint::Length(12),  // Status
+            Constraint::Length(8),   // Health
+            Constraint::Length(7),   // Ping
+            Constraint::Length(10),  // Uptime
+            Constraint::Length(10),  // Activity
+            Constraint::Length(5),   // Ctx%
+            Constraint::Length(6),   // CPU
+            Constraint::Length(6),   // RAM
+            Constraint::Length(6),   // Disk
+            Constraint::Min(10),    // Version
         ]
     } else if show_activity {
         vec![
