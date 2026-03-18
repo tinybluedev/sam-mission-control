@@ -1103,7 +1103,8 @@ impl App {
                         emoji: cfg.map(|c| c.emoji().to_string()).unwrap_or_else(|| {
                             os_emoji(da.os_info.as_deref().unwrap_or("")).to_string()
                         }),
-                        host: da.tailscale_ip.unwrap_or("?".into()),
+                        host: cfg.and_then(|c| c.host.clone())
+                            .unwrap_or_else(|| da.tailscale_ip.unwrap_or("?".into())),
                         location: cfg
                             .map(|c| c.location().to_string())
                             .unwrap_or_else(|| "?".into()),
@@ -13492,6 +13493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             emoji: Some(app.wizard.emoji.clone()),
                                             location: Some(app.wizard.location_str().to_string()),
                                             ssh_user: Some(app.wizard.ssh_user.clone()),
+                                            host: None,
                                             jump_host: None,
                                             jump_user: None,
                                         });
@@ -13539,6 +13541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         emoji: Some(app.wizard.emoji.clone()),
                                         location: Some(app.wizard.location_str().to_string()),
                                         ssh_user: Some(app.wizard.ssh_user.clone()),
+                                        host: None,
                                         jump_host: None,
                                         jump_user: None,
                                     });
@@ -15556,6 +15559,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 emoji: Some(pending.emoji.clone()),
                 location: Some(pending.location.clone()),
                 ssh_user: Some(pending.ssh_user.clone()),
+                host: None,
                 jump_host: None,
                 jump_user: None,
             });

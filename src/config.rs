@@ -27,6 +27,7 @@ pub struct AgentConfig {
     pub emoji: Option<String>,
     pub location: Option<String>,
     pub ssh_user: Option<String>,
+    pub host: Option<String>,  // override Tailscale IP with LAN IP or hostname
     pub jump_host: Option<String>,
     pub jump_user: Option<String>,
 }
@@ -147,6 +148,7 @@ mod tests {
             emoji: None,
             location: None,
             ssh_user: None,
+            host: None,
             jump_host: None,
             jump_user: None,
         }
@@ -177,6 +179,7 @@ mod tests {
             emoji: None,
             location: None,
             ssh_user: Some("ubuntu".into()),
+            host: None,
             jump_host: Some("bastion.internal".into()),
             jump_user: None,
         };
@@ -192,6 +195,7 @@ mod tests {
             emoji: None,
             location: None,
             ssh_user: Some("ubuntu".into()),
+            host: None,
             jump_host: None,
             jump_user: Some("bastion-user".into()),
         };
