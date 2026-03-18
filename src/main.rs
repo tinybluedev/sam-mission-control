@@ -3483,21 +3483,22 @@ PY"#, escaped_model);
                     // If the binary is at /opt/homebrew/bin/openclaw -> ../lib/node_modules/openclaw/...,
                     // we install with --prefix /opt/homebrew, not blindly sudo npm install -g.
                     // Falls back to sudo npm install -g if detection fails.
+                    let pipefail = "set -o pipefail 2>/dev/null; ";
                     let install_cmd = format!(
-                        "{pfx}\
+                        "{pipefail}{pfx}\
                          OC_BIN=$(which openclaw 2>/dev/null); \
                          OC_REAL=$(readlink -f \"$OC_BIN\" 2>/dev/null || realpath \"$OC_BIN\" 2>/dev/null || echo \"\"); \
                          if [ -n \"$OC_REAL\" ]; then \
                            OC_PREFIX=$(echo \"$OC_REAL\" | sed 's|/lib/node_modules/openclaw/.*||; s|/bin/openclaw||'); \
                            echo \"DETECTED_PREFIX:$OC_PREFIX\"; \
                            if echo \"$OC_PREFIX\" | grep -qE '^(/home/|/Users/)'; then \
-                             npm install -g --prefix \"$OC_PREFIX\" openclaw@latest 2>&1; \
+                             npm install -g --prefix \"$OC_PREFIX\" openclaw@latest 2>&1 | awk '{{print; fflush()}}'; \
                            else \
-                             sudo npm install -g --prefix \"$OC_PREFIX\" openclaw@latest 2>&1; \
+                             sudo npm install -g --prefix \"$OC_PREFIX\" openclaw@latest 2>&1 | awk '{{print; fflush()}}'; \
                            fi; \
                          else \
                            echo \"DETECTED_PREFIX:FALLBACK\"; \
-                           sudo npm install -g openclaw@latest 2>&1; \
+                           sudo npm install -g openclaw@latest 2>&1 | awk '{{print; fflush()}}'; \
                          fi; \
                          echo \"VERIFY_VERSION:$(openclaw --version 2>/dev/null || echo UNKNOWN)\"",
                         pfx = pfx
