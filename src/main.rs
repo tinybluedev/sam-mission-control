@@ -3452,11 +3452,15 @@ PY"#, escaped_model);
                 return;
             }
             debug_log(&format!("bulk_update: {} agents need update to {}", targets.len(), latest));
-            let _ = tx.send(DiagStep {
-                label: "Agents to update".into(),
-                status: DiagStatus::Pass,
-                detail: format!("{} outdated", targets.len()),
-            });
+
+            // Show all agents immediately as "queued" so the user sees the full list
+            for (name, _, _, _, old_ver) in &targets {
+                let _ = tx.send(DiagStep {
+                    label: name.clone(),
+                    status: DiagStatus::Skipped,
+                    detail: format!("{} → queued", old_ver),
+                });
+            }
 
             // Run updates in parallel batches of 5
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(5));
